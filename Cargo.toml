@@ -1,6 +1,6 @@
 [package]
 name = "llm-dict"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.82"
 description = "Диктовка через LLM: горячая клавиша, распознавание речи в облаке, вставка под курсором"
@@ -24,7 +24,6 @@ chrono = { version = "0.4", features = ["serde"] }
 directories = "6"
 open = "5"
 log = "0.4"
-env_logger = "0.11"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.25"

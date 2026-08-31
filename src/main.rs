@@ -11,6 +11,7 @@ mod engine;
 mod history;
 mod hotkey;
 mod insert;
+mod logging;
 mod macos;
 mod permissions;
 mod providers;
@@ -19,7 +20,7 @@ mod updater;
 use std::sync::Arc;
 
 fn main() -> eframe::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    logging::init();
 
     let cfg = config::Config::load();
     let show_in_dock = cfg.general.show_in_dock;

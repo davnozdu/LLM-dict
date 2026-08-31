@@ -59,6 +59,7 @@ pub struct App {
     update_checked: bool,
     duplicates: Vec<String>,
     duplicates_checked: Instant,
+    key_synced: bool,
 }
 
 enum UpdateState {
@@ -99,6 +100,7 @@ impl App {
             update_checked: false,
             duplicates: Vec::new(),
             duplicates_checked: Instant::now() - Duration::from_secs(60),
+            key_synced: false,
         }
     }
 
@@ -220,6 +222,19 @@ impl App {
         self.capture_preview.clear();
         let _ = self.shared.take_captured();
         self.shared.hotkey_state.set_capturing(on);
+    }
+
+    /// Ключ читается фоном, а поле ввода заполняется при создании окна —
+    /// то есть заведомо раньше. Без досыла поле осталось бы пустым, и первое
+    /// же «Сохранить» стёрло бы настоящий ключ.
+    fn poll_api_key(&mut self) {
+        if self.key_synced || !self.shared.key_loaded() {
+            return;
+        }
+        self.key_synced = true;
+        if self.api_key_input.is_empty() {
+            self.api_key_input = self.shared.api_key_snapshot();
+        }
     }
 
     fn poll_capture(&mut self) {
@@ -378,6 +393,7 @@ impl eframe::App for App {
         self.ensure_tray();
         self.sync_tray();
         self.poll_model_check();
+        self.poll_api_key();
         self.poll_capture();
         self.poll_update();
         self.refresh_verdict();
@@ -487,13 +503,10 @@ impl App {
         ui.add_space(4.0);
 
         if matches!(stage, Stage::Idle) {
-            let hint = match self.cfg.general.hotkey_mode {
-                HotKeyMode::Hold => "Удерживайте",
-                HotKeyMode::Toggle => "Нажмите",
-            };
             ui.label(format!(
-                "{hint} {} и говорите. Текст встанет туда, где стоит курсор.",
-                self.cfg.general.hotkey.label()
+                "{} — {}. Текст встанет туда, где стоит курсор.",
+                self.cfg.general.hotkey.label(),
+                engine::hotkey_mode_hint(self.cfg.general.hotkey_mode)
             ));
         }
 
@@ -704,19 +717,18 @@ impl App {
                 }
             }
 
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.selectable_value(
-                    &mut self.cfg.general.hotkey_mode,
-                    HotKeyMode::Hold,
-                    "Удержание",
-                );
-                ui.selectable_value(
-                    &mut self.cfg.general.hotkey_mode,
-                    HotKeyMode::Toggle,
-                    "Нажатие / повторное нажатие",
-                );
-            });
+            ui.add_space(8.0);
+            ui.label("Как срабатывает:");
+            ui.radio_value(
+                &mut self.cfg.general.hotkey_mode,
+                HotKeyMode::Hold,
+                "Push to Talk — держите клавишу, пока говорите",
+            );
+            ui.radio_value(
+                &mut self.cfg.general.hotkey_mode,
+                HotKeyMode::Toggle,
+                "Переключатель — нажали, говорите, нажали ещё раз",
+            );
             ui.add_space(4.0);
             ui.checkbox(
                 &mut self.cfg.general.swallow_hotkey,
@@ -853,10 +865,24 @@ impl App {
             self.ui_update_block(ui);
 
             ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("Диагностика").strong());
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui.button("Открыть журнал").clicked() {
+                    let _ = open::that(crate::logging::log_path());
+                }
+                if ui.button("Показать папку настроек").clicked() {
+                    let _ = open::that(crate::config::config_dir());
+                }
+            });
+            ui.add_space(8.0);
             ui.weak(format!(
                 "Настройки: {}",
                 crate::config::config_path().display()
             ));
+            ui.weak(format!("Журнал: {}", crate::logging::log_path().display()));
             ui.add_space(12.0);
         });
     }

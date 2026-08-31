@@ -5,7 +5,7 @@
 //! переход на локальные модели не требует изменений в коде.
 
 use crate::config::{LlmConfig, PostMode, SttConfig};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use serde::Deserialize;
 use std::time::Duration;
 
@@ -30,12 +30,38 @@ struct ApiErrorBody {
     message: String,
 }
 
-fn explain(status: reqwest::StatusCode, body: &str) -> anyhow::Error {
-    if let Ok(e) = serde_json::from_str::<ApiError>(body) {
-        return anyhow!("{}: {}", status.as_u16(), e.error.message);
+fn explain(status: reqwest::StatusCode, body: &str, base_url: &str) -> anyhow::Error {
+    let detail = serde_json::from_str::<ApiError>(body)
+        .map(|e| e.error.message)
+        .unwrap_or_else(|_| body.chars().take(300).collect());
+
+    // Голый код ответа ничего не подсказывает. Чаще всего 401 означает не
+    // «ключ сломан», а «ключ от другого сервиса»: адрес и ключ настраиваются
+    // порознь, и их легко развести.
+    let hint = match status.as_u16() {
+        401 | 403 => format!(
+            "\nКлюч не принят. Проверьте, что он выдан тем же сервисом, \
+             что стоит в адресе API ({base_url}). Ключи Groq начинаются с gsk_."
+        ),
+        404 => "\nАдрес API или название модели не найдены — проверьте оба поля.".to_string(),
+        429 => "\nПревышен лимит запросов, попробуйте позже.".to_string(),
+        _ => String::new(),
+    };
+    anyhow!("{}: {}{}", status.as_u16(), detail, hint)
+}
+
+/// Без ключа запрос уходил без заголовка авторизации, и сервис отвечал
+/// «неверный ключ» — сообщение, по которому не догадаешься, что ключа просто нет.
+fn require_key(api_key: &str, base_url: &str) -> Result<()> {
+    if api_key.trim().is_empty() && !is_local(base_url) {
+        bail!("не задан API-ключ: откройте «Настройки» и вставьте его");
     }
-    let short: String = body.chars().take(300).collect();
-    anyhow!("{}: {}", status.as_u16(), short)
+    Ok(())
+}
+
+/// Локальным серверам (whisper.cpp, Ollama, LM Studio) ключ не нужен.
+fn is_local(base_url: &str) -> bool {
+    base_url.contains("localhost") || base_url.contains("127.0.0.1") || base_url.contains("0.0.0.0")
 }
 
 /// Распознавание речи: POST /audio/transcriptions (multipart).
@@ -70,7 +96,7 @@ pub fn transcribe(cfg: &SttConfig, api_key: &str, wav: Vec<u8>) -> Result<String
     let status = resp.status();
     let body = resp.text()?;
     if !status.is_success() {
-        return Err(explain(status, &body));
+        return Err(explain(status, &body, &cfg.base_url));
     }
     let parsed: TranscriptionResponse =
         serde_json::from_str(&body).map_err(|e| anyhow!("неожиданный ответ распознавания: {e}"))?;
@@ -113,6 +139,7 @@ pub fn post_process(cfg: &LlmConfig, api_key: &str, text: &str) -> Result<String
     if matches!(cfg.mode, PostMode::Raw) || text.trim().is_empty() {
         return Ok(text.to_string());
     }
+    require_key(api_key, &cfg.base_url)?;
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     let payload = serde_json::json!({
         "model": cfg.model,
@@ -132,7 +159,7 @@ pub fn post_process(cfg: &LlmConfig, api_key: &str, text: &str) -> Result<String
     let status = resp.status();
     let body = resp.text()?;
     if !status.is_success() {
-        return Err(explain(status, &body));
+        return Err(explain(status, &body, &cfg.base_url));
     }
     let parsed: ChatResponse =
         serde_json::from_str(&body).map_err(|e| anyhow!("неожиданный ответ модели: {e}"))?;
@@ -165,7 +192,7 @@ pub fn list_models(base_url: &str, api_key: &str) -> Result<Vec<String>> {
     let status = resp.status();
     let body = resp.text()?;
     if !status.is_success() {
-        return Err(explain(status, &body));
+        return Err(explain(status, &body, base_url));
     }
     let parsed: ModelList =
         serde_json::from_str(&body).map_err(|e| anyhow!("неожиданный ответ /models: {e}"))?;

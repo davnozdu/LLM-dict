@@ -171,7 +171,6 @@ pub fn spawn(shared: Arc<Shared>) -> Sender<HotKeyEvent> {
 
 fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
     let mut recording: Option<audio::Recording> = None;
-    let mut started_at: Option<Instant> = None;
 
     while let Ok(event) = rx.recv() {
         match event {
@@ -183,7 +182,6 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
                 match audio::start(shared.level.clone()) {
                     Ok(rec) => {
                         recording = Some(rec);
-                        started_at = Some(Instant::now());
                         shared.hotkey_state.set_recording(true);
                         shared.set_stage(Stage::Recording);
                         shared.set_error(None);
@@ -210,7 +208,6 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
                 };
                 shared.hotkey_state.set_recording(false);
                 let samples = rec.finish();
-                let elapsed = started_at.take().map(|t| t.elapsed());
                 let cfg = shared.config_snapshot();
 
                 if audio::duration_secs(&samples) < MIN_DURATION_SECS {
@@ -221,8 +218,9 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
                     insert::play_sound("Pop");
                 }
                 let started = Instant::now();
+                let spoken = audio::duration_secs(&samples);
                 let result = process(&shared, &cfg, samples);
-                record_result(&shared, &cfg, result, started, elapsed);
+                record_result(&shared, &cfg, result, started, spoken);
                 shared.set_stage(Stage::Idle);
             }
         }
@@ -234,6 +232,23 @@ struct Outcome {
     final_text: String,
     duration_secs: f32,
     clipboard_before: Option<String>,
+}
+
+/// Ошибку тоже надо записать с реальной длительностью речи: иначе в истории
+/// у неудачных попыток стоит ноль, и не понять, писался ли звук вообще.
+fn error_entry(cfg: &Config, msg: String, duration_secs: f32, latency_ms: u64) -> history::Entry {
+    history::Entry {
+        at: chrono::Local::now(),
+        duration_secs,
+        raw_text: String::new(),
+        final_text: String::new(),
+        mode: cfg.llm.mode.label().to_string(),
+        stt_model: cfg.stt.model.clone(),
+        llm_model: None,
+        latency_ms,
+        clipboard_before: None,
+        error: Some(msg),
+    }
 }
 
 fn process(shared: &Arc<Shared>, cfg: &Config, samples: Vec<f32>) -> anyhow::Result<Outcome> {
@@ -270,7 +285,7 @@ fn record_result(
     cfg: &Config,
     result: anyhow::Result<Outcome>,
     started: Instant,
-    _elapsed: Option<std::time::Duration>,
+    spoken_secs: f32,
 ) {
     let latency_ms = started.elapsed().as_millis() as u64;
     let entry = match result {
@@ -296,18 +311,7 @@ fn record_result(
             if cfg.general.play_sounds {
                 insert::play_sound("Basso");
             }
-            history::Entry {
-                at: chrono::Local::now(),
-                duration_secs: 0.0,
-                raw_text: String::new(),
-                final_text: String::new(),
-                mode: cfg.llm.mode.label().to_string(),
-                stt_model: cfg.stt.model.clone(),
-                llm_model: None,
-                latency_ms,
-                clipboard_before: None,
-                error: Some(msg),
-            }
+            error_entry(cfg, msg, spoken_secs, latency_ms)
         }
     };
 
@@ -334,7 +338,14 @@ pub fn missing_permissions() -> Vec<&'static str> {
 
 pub fn hotkey_mode_label(mode: HotKeyMode) -> &'static str {
     match mode {
-        HotKeyMode::Hold => "Удержание",
-        HotKeyMode::Toggle => "Нажатие / повторное нажатие",
+        HotKeyMode::Hold => "Push to Talk",
+        HotKeyMode::Toggle => "Переключатель",
+    }
+}
+
+pub fn hotkey_mode_hint(mode: HotKeyMode) -> &'static str {
+    match mode {
+        HotKeyMode::Hold => "держите клавишу, пока говорите — отпустили, и текст пошёл",
+        HotKeyMode::Toggle => "нажали и отпустили, говорите, нажали ещё раз — текст пошёл",
     }
 }
