@@ -33,6 +33,9 @@ jobs:
           cargo fmt --check || echo "форматирование не по канону — не блокирую сборку"
           cargo clippy --all-targets -- -D warnings
 
+      - name: Тесты
+        run: cargo test --locked
+
       - name: Сборка
         run: cargo build --release --locked
 

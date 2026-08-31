@@ -591,7 +591,12 @@ impl eframe::App for App {
 
         self.apply_config();
 
-        if self.shared.stage().is_busy() || self.model_check.is_some() {
+        // Во время набора сочетания опрос должен успевать за пальцами: при
+        // 500 мс между кадрами третья клавиша не попадала в превью, и казалось,
+        // что приложение читает только две.
+        if self.capturing {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        } else if self.shared.stage().is_busy() || self.model_check.is_some() {
             ctx.request_repaint_after(Duration::from_millis(60));
         } else {
             ctx.request_repaint_after(Duration::from_millis(500));
@@ -766,7 +771,11 @@ impl App {
                 let shown = if self.capture_preview.is_empty() {
                     "нажмите клавиши…".to_string()
                 } else {
-                    Binding::new(self.capture_preview.clone()).label()
+                    format!(
+                        "{}  ({})",
+                        Binding::new(self.capture_preview.clone()).label(),
+                        self.capture_preview.len()
+                    )
                 };
                 ui.horizontal(|ui| {
                     ui.add_sized(
@@ -1266,9 +1275,13 @@ impl App {
 
                 ui.push_id(id, |ui| {
                     ui.horizontal(|ui| {
-                        let enabled = self.cfg.actions[pos].enabled;
-                        let mut e = enabled;
-                        if ui.checkbox(&mut e, "").changed() {
+                        // Галочка без подписи читалась как непонятный квадратик.
+                        let mut e = self.cfg.actions[pos].enabled;
+                        let response = ui.checkbox(&mut e, "вкл").on_hover_text(
+                            "Выключенное действие не срабатывает по своему сочетанию \
+                                 и не занимает его",
+                        );
+                        if response.changed() {
                             self.cfg.actions[pos].enabled = e;
                         }
                         let name = self.cfg.actions[pos].name.clone();
@@ -1336,7 +1349,11 @@ impl App {
                 let shown = if self.capture_preview.is_empty() {
                     "нажмите клавиши…".to_string()
                 } else {
-                    Binding::new(self.capture_preview.clone()).label()
+                    format!(
+                        "{}  ({})",
+                        Binding::new(self.capture_preview.clone()).label(),
+                        self.capture_preview.len()
+                    )
                 };
                 ui.colored_label(egui::Color32::from_rgb(90, 140, 240), shown);
                 if ui

@@ -11,6 +11,8 @@ pub enum Provider {
     #[default]
     Groq,
     Ollama,
+    /// Ollama на их серверах: тот же протокол, но с ключом и большими моделями.
+    OllamaCloud,
     Gemini,
     DeepSeek,
     /// Свой адрес: локальный сервер или что-то ещё OpenAI-совместимое.
@@ -22,6 +24,7 @@ impl Provider {
         match self {
             Provider::Groq => "Groq",
             Provider::Ollama => "Ollama (локально)",
+            Provider::OllamaCloud => "Ollama Cloud",
             Provider::Gemini => "Gemini",
             Provider::DeepSeek => "DeepSeek",
             Provider::Custom => "Свой адрес",
@@ -32,6 +35,7 @@ impl Provider {
         match self {
             Provider::Groq => "https://api.groq.com/openai/v1",
             Provider::Ollama => "http://127.0.0.1:11434/v1",
+            Provider::OllamaCloud => "https://ollama.com/v1",
             Provider::Gemini => "https://generativelanguage.googleapis.com/v1beta/openai",
             Provider::DeepSeek => "https://api.deepseek.com/v1",
             Provider::Custom => "",
@@ -48,6 +52,7 @@ impl Provider {
         match self {
             Provider::Groq => "groq_api_key",
             Provider::Ollama => "ollama_api_key",
+            Provider::OllamaCloud => "ollama_cloud_api_key",
             Provider::Gemini => "gemini_api_key",
             Provider::DeepSeek => "deepseek_api_key",
             Provider::Custom => "custom_api_key",
@@ -58,6 +63,7 @@ impl Provider {
     pub fn key_url(self) -> Option<&'static str> {
         match self {
             Provider::Groq => Some("https://console.groq.com/keys"),
+            Provider::OllamaCloud => Some("https://ollama.com/settings/keys"),
             Provider::Gemini => Some("https://aistudio.google.com/apikey"),
             Provider::DeepSeek => Some("https://platform.deepseek.com/api_keys"),
             Provider::Ollama | Provider::Custom => None,
@@ -68,15 +74,17 @@ impl Provider {
         match self {
             Provider::Groq => "openai/gpt-oss-120b",
             Provider::Ollama => "llama3.2",
+            Provider::OllamaCloud => "gpt-oss:120b",
             Provider::Gemini => "gemini-2.5-flash",
             Provider::DeepSeek => "deepseek-chat",
             Provider::Custom => "",
         }
     }
 
-    pub const ALL: [Provider; 5] = [
+    pub const ALL: [Provider; 6] = [
         Provider::Groq,
         Provider::Ollama,
+        Provider::OllamaCloud,
         Provider::Gemini,
         Provider::DeepSeek,
         Provider::Custom,

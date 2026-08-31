@@ -95,6 +95,41 @@ impl HotKeyState {
     }
 }
 
+/// Набор сочетания: копит самый полный вариант из тех, что пользователь
+/// удерживал. Вынесено из замыкания тапа, чтобы поведение можно было проверить
+/// тестами — именно здесь терялась третья клавиша.
+#[derive(Default)]
+pub struct Capture {
+    best: Vec<u16>,
+}
+
+impl Capture {
+    pub fn reset(&mut self) {
+        self.best.clear();
+    }
+
+    /// Возвращает набор, который надо показать пользователю, если он изменился
+    /// или его стоит подтвердить повторно.
+    pub fn update(&mut self, held: &[u16], is_down: bool) -> Option<Vec<u16>> {
+        if held.is_empty() {
+            // Всё отпущено. Набранное не стираем — повторяем его, чтобы окно
+            // наверняка получило полный вариант, а не огрызок от
+            // неодновременного отпускания клавиш.
+            return (!self.best.is_empty()).then(|| self.best.clone());
+        }
+        // Первое нажатие после полного отпускания начинает набор заново: иначе
+        // нельзя было бы сменить сочетание из трёх клавиш на сочетание из двух.
+        if is_down && held.len() == 1 {
+            self.best.clear();
+        }
+        if held.len() >= self.best.len() {
+            self.best = held.to_vec();
+            return Some(self.best.clone());
+        }
+        None
+    }
+}
+
 /// Разбирает событие в «код клавиши + нажата ли она».
 /// `None` — событие не про клавишу, которую мы умеем отслеживать.
 fn decode(event_type: CGEventType, event: &core_graphics::event::CGEvent) -> Option<(u16, bool)> {
@@ -120,9 +155,7 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
         // Множество зажатых клавиш. Тап отдаёт события по одной, а нам нужно
         // знать, зажато ли сочетание целиком.
         let pressed: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
-        // Самый полный набор за время набора сочетания: пользователь отпускает
-        // клавиши не одновременно, и без этого мы поймали бы огрызок.
-        let capture_best: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+        let capture: Mutex<Capture> = Mutex::new(Capture::default());
 
         let cb_state = state.clone();
         let cb_tx = tx.clone();
@@ -163,17 +196,13 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
                 };
 
                 if cb_state.is_capturing() {
-                    let mut best = capture_best.lock().unwrap();
-                    if held.len() >= best.len() && !held.is_empty() {
-                        *best = held.clone();
-                        let _ = cb_tx.send(HotKeyEvent::Captured(best.clone()));
-                    } else if held.is_empty() {
-                        // Все клавиши отпущены — набор закончен.
-                        best.clear();
+                    if let Some(keys) = capture.lock().unwrap().update(&held, is_down) {
+                        log::info!("набрано сочетание: {keys:?}");
+                        let _ = cb_tx.send(HotKeyEvent::Captured(keys));
                     }
                     return CallbackResult::Keep;
                 }
-                capture_best.lock().unwrap().clear();
+                capture.lock().unwrap().reset();
 
                 let binding = cb_state.binding.lock().unwrap().clone();
                 let actions = cb_state.actions.lock().unwrap().clone();
@@ -266,4 +295,56 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
         CFRunLoop::run_current();
         true
     })
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::Capture;
+
+    /// Три клавиши, нажатые по очереди, должны дойти все.
+    #[test]
+    fn ловит_три_клавиши() {
+        let mut c = Capture::default();
+        assert_eq!(c.update(&[54], true), Some(vec![54]));
+        assert_eq!(c.update(&[54, 60], true), Some(vec![54, 60]));
+        assert_eq!(c.update(&[14, 54, 60], true), Some(vec![14, 54, 60]));
+    }
+
+    /// Клавиши отпускаются вразнобой — итог не должен рассыпаться.
+    #[test]
+    fn отпускание_не_обрезает_набор() {
+        let mut c = Capture::default();
+        c.update(&[54], true);
+        c.update(&[54, 60], true);
+        c.update(&[14, 54, 60], true);
+
+        assert_eq!(c.update(&[54, 60], false), None);
+        assert_eq!(c.update(&[54], false), None);
+        // Финальное подтверждение полного набора.
+        assert_eq!(c.update(&[], false), Some(vec![14, 54, 60]));
+    }
+
+    /// После полного отпускания новый набор начинается с нуля,
+    /// иначе с трёх клавиш нельзя было бы вернуться к двум.
+    #[test]
+    fn новый_набор_может_быть_короче() {
+        let mut c = Capture::default();
+        c.update(&[54], true);
+        c.update(&[54, 60], true);
+        c.update(&[14, 54, 60], true);
+        c.update(&[], false);
+
+        assert_eq!(c.update(&[61], true), Some(vec![61]));
+        assert_eq!(c.update(&[17, 61], true), Some(vec![17, 61]));
+        assert_eq!(c.update(&[], false), Some(vec![17, 61]));
+    }
+
+    #[test]
+    fn сброс_очищает_набор() {
+        let mut c = Capture::default();
+        c.update(&[54, 60], true);
+        c.reset();
+        assert_eq!(c.update(&[], false), None);
+    }
 }

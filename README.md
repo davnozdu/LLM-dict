@@ -108,9 +108,10 @@ Parakeet локально обгоняет облако — на коротки�
 | Gemini | `generativelanguage.googleapis.com/v1beta/openai` | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
 | DeepSeek | `api.deepseek.com/v1` | [platform.deepseek.com](https://platform.deepseek.com/api_keys) |
 | Ollama | `127.0.0.1:11434/v1` | не нужен |
+| Ollama Cloud | `ollama.com/v1` | [ollama.com/settings/keys](https://ollama.com/settings/keys) |
 | Свой адрес | любой OpenAI-совместимый | по обстоятельствам |
 
-Все четыре говорят на OpenAI-совместимом протоколе, поэтому код один на всех — у Gemini для этого есть отдельный совместимый эндпоинт. Ключи хранятся в связке ключей по одному на поставщика.
+Все они говорят на OpenAI-совместимом протоколе, поэтому код один на всех — у Gemini для этого есть отдельный совместимый эндпоинт. Ключи хранятся в связке ключей по одному на поставщика.
 
 Кнопка **«Считать модели»** запрашивает у поставщика список и превращает поле модели в выпадающий список — не нужно помнить точные названия.
 
