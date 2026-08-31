@@ -297,7 +297,6 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
     })
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::Capture;

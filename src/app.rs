@@ -540,7 +540,7 @@ impl eframe::App for App {
                 let label = if perms_ok {
                     "Права"
                 } else {
-                    "Права ⚠"
+                    "Права — нужны"
                 };
                 ui.selectable_value(&mut self.tab, Tab::Permissions, label);
             });
@@ -560,7 +560,11 @@ impl eframe::App for App {
                     Stage::PostProcessing => egui::Color32::from_rgb(90, 140, 240),
                     Stage::Inserting => egui::Color32::from_rgb(60, 190, 110),
                 };
-                ui.colored_label(dot, "●");
+                // Кружок рисуем, а не пишем символом: подходящего глифа может
+                // не оказаться в шрифте, и вместо него вылезет пустой квадрат.
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 4.0, dot);
                 ui.label(stage.label());
                 ui.separator();
                 ui.label(format!(
@@ -819,14 +823,20 @@ impl App {
                     conflicts::Verdict::Free => {
                         ui.colored_label(
                             egui::Color32::from_rgb(60, 160, 90),
-                            "✔ сочетание свободно",
+                            "Сочетание свободно",
                         );
                     }
                     conflicts::Verdict::Taken(why) => {
-                        ui.colored_label(egui::Color32::from_rgb(220, 80, 80), format!("✖ {why}"));
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 80, 80),
+                            format!("Занято — {why}"),
+                        );
                     }
                     conflicts::Verdict::Risky(why) => {
-                        ui.colored_label(egui::Color32::from_rgb(220, 130, 40), format!("⚠ {why}"));
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 130, 40),
+                            format!("Осторожно — {why}"),
+                        );
                     }
                 }
             }
@@ -1255,7 +1265,7 @@ impl App {
         );
         ui.add_space(8.0);
 
-        if ui.button("＋ Новое действие").clicked() {
+        if ui.button("+  Новое действие").clicked() {
             let action = TextAction::default();
             self.editing_action = Some(action.id.clone());
             self.cfg.actions.push(action);
@@ -1386,7 +1396,7 @@ impl App {
             if own == self.cfg.general.hotkey {
                 ui.colored_label(
                     egui::Color32::from_rgb(220, 80, 80),
-                    "✖ совпадает с сочетанием диктовки",
+                    "Занято — это сочетание уже стоит на диктовке",
                 );
             } else if let Some(other) = self
                 .cfg
@@ -1397,21 +1407,27 @@ impl App {
             {
                 ui.colored_label(
                     egui::Color32::from_rgb(220, 80, 80),
-                    format!("✖ совпадает с действием «{}»", other.1.name),
+                    format!("Занято — это сочетание уже у действия «{}»", other.1.name),
                 );
             } else {
                 match conflicts::check(&own) {
                     conflicts::Verdict::Free => {
                         ui.colored_label(
                             egui::Color32::from_rgb(60, 160, 90),
-                            "✔ сочетание свободно",
+                            "Сочетание свободно",
                         );
                     }
                     conflicts::Verdict::Taken(why) => {
-                        ui.colored_label(egui::Color32::from_rgb(220, 80, 80), format!("✖ {why}"));
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 80, 80),
+                            format!("Занято — {why}"),
+                        );
                     }
                     conflicts::Verdict::Risky(why) => {
-                        ui.colored_label(egui::Color32::from_rgb(220, 130, 40), format!("⚠ {why}"));
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 130, 40),
+                            format!("Осторожно — {why}"),
+                        );
                     }
                 }
             }
@@ -1810,12 +1826,13 @@ impl App {
 
 fn perm_row(ui: &mut egui::Ui, name: &str, status: permissions::Status, hint: &str) {
     ui.horizontal(|ui| {
-        let (color, mark) = if status.is_ok() {
-            (egui::Color32::from_rgb(60, 160, 90), "✔")
+        let color = if status.is_ok() {
+            egui::Color32::from_rgb(60, 160, 90)
         } else {
-            (egui::Color32::from_rgb(220, 130, 40), "✖")
+            egui::Color32::from_rgb(220, 130, 40)
         };
-        ui.colored_label(color, mark);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+        ui.painter().circle_filled(rect.center(), 4.0, color);
         ui.label(egui::RichText::new(name).strong());
         ui.weak(format!("— {}", status.label()));
     });

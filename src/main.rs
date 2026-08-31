@@ -9,6 +9,7 @@ mod binding;
 mod config;
 mod conflicts;
 mod engine;
+mod fonts;
 mod history;
 mod hotkey;
 mod insert;
@@ -124,7 +125,8 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "LLM-dict",
         options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
+            fonts::install(&cc.egui_ctx);
             macos::set_dock_visible(show_in_dock);
             Ok(Box::new(app::App::new(Arc::clone(&shared))))
         }),
