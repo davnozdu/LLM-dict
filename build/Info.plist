@@ -10,6 +10,8 @@
     <string>com.davnozdu.llm-dict</string>
     <key>CFBundleExecutable</key>
     <string>llm-dict</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>

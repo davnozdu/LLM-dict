@@ -21,9 +21,6 @@ chmod +x "$APP/Contents/MacOS/llm-dict"
 
 sed "s/__VERSION__/$VERSION/g" "$ROOT/build/Info.plist" > "$APP/Contents/Info.plist"
 
-if [[ -f "$ROOT/build/AppIcon.icns" ]]; then
-    cp "$ROOT/build/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
-    /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string AppIcon" "$APP/Contents/Info.plist" 2>/dev/null || true
-fi
+cp "$ROOT/build/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 
 echo "собрано: $APP"
