@@ -2,6 +2,7 @@
 //! API-ключ в конфиг НЕ пишется — он живёт в Keychain (см. `secrets`).
 
 use crate::binding::Binding;
+use crate::models::Engine;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -50,22 +51,37 @@ impl PostMode {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SttConfig {
-    /// OpenAI-совместимый эндпоинт. Для локальной модели поменять на http://localhost:...
+    /// Чем распознавать по умолчанию.
+    pub engine: Engine,
+    /// На что переключиться, если основной движок отказал.
+    /// `None` — не переключаться, показать ошибку.
+    pub fallback: Option<Engine>,
+    /// OpenAI-совместимый эндпоинт. Для локального сервера поменять на http://localhost:...
     pub base_url: String,
     pub model: String,
     /// Пустая строка — автоопределение.
     pub language: String,
     /// Подсказка для whisper: имена, термины, стиль пунктуации.
     pub prompt: String,
+    /// Выбранная модель для каждого локального движка.
+    pub whisper_model: String,
+    pub parakeet_model: String,
+    /// Загружать локальную модель при запуске, не дожидаясь первой диктовки.
+    pub preload_local: bool,
 }
 
 impl Default for SttConfig {
     fn default() -> Self {
         Self {
+            engine: Engine::Cloud,
+            fallback: None,
             base_url: "https://api.groq.com/openai/v1".into(),
             model: "whisper-large-v3-turbo".into(),
             language: String::new(),
             prompt: String::new(),
+            whisper_model: "whisper-large-v3-turbo-q5".into(),
+            parakeet_model: "parakeet-tdt-0.6b-v3-int8".into(),
+            preload_local: true,
         }
     }
 }

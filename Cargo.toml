@@ -1,6 +1,6 @@
 [package]
 name = "llm-dict"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.82"
 description = "Диктовка через LLM: горячая клавиша, распознавание речи в облаке, вставка под курсором"
@@ -24,6 +24,12 @@ chrono = { version = "0.4", features = ["serde"] }
 directories = "6"
 open = "5"
 log = "0.4"
+
+# Локальное распознавание. whisper.cpp собирается статически, с вшитыми
+# Metal-шейдерами; onnxruntime для parakeet тоже линкуется статически —
+# отдельных библиотек в бандл класть не нужно.
+whisper-rs = { version = "0.16", features = ["metal", "log_backend"] }
+parakeet-rs = "0.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.25"

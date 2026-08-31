@@ -22,6 +22,9 @@ pub struct Entry {
     /// Что лежало в буфере обмена до вставки — чтобы можно было вернуть вручную.
     pub clipboard_before: Option<String>,
     pub error: Option<String>,
+    /// Какой движок распознал. Важно, когда сработал откат на запасной.
+    #[serde(default)]
+    pub engine: Option<String>,
 }
 
 impl Entry {

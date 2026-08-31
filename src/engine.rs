@@ -6,8 +6,10 @@ use crate::config::{Config, HotKeyMode, PostMode};
 use crate::history;
 use crate::hotkey::{self, HotKeyEvent, HotKeyState};
 use crate::insert;
+use crate::models::Engine;
 use crate::permissions;
 use crate::providers;
+use crate::stt::{self, LocalEngines};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -17,6 +19,8 @@ use std::time::Instant;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     Idle,
+    /// Локальная модель грузится в память — это секунды, и об этом надо сказать.
+    LoadingModel,
     Recording,
     Transcribing,
     PostProcessing,
@@ -27,6 +31,7 @@ impl Stage {
     pub fn label(self) -> &'static str {
         match self {
             Stage::Idle => "Готов",
+            Stage::LoadingModel => "Загрузка модели",
             Stage::Recording => "Идёт запись",
             Stage::Transcribing => "Распознавание",
             Stage::PostProcessing => "Обработка моделью",
@@ -171,6 +176,23 @@ pub fn spawn(shared: Arc<Shared>) -> Sender<HotKeyEvent> {
 
 fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
     let mut recording: Option<audio::Recording> = None;
+    // Модель живёт здесь: загрузка занимает секунды, повторять её на каждую
+    // фразу бессмысленно. Владеет ей только этот поток.
+    let mut local = LocalEngines::default();
+
+    {
+        let cfg = shared.config_snapshot();
+        if cfg.stt.preload_local && cfg.stt.engine.is_local() {
+            let id = match cfg.stt.engine {
+                Engine::Whisper => cfg.stt.whisper_model.clone(),
+                Engine::Parakeet => cfg.stt.parakeet_model.clone(),
+                Engine::Cloud => String::new(),
+            };
+            shared.set_stage(Stage::LoadingModel);
+            local.preload(cfg.stt.engine, &id);
+            shared.set_stage(Stage::Idle);
+        }
+    }
 
     while let Ok(event) = rx.recv() {
         match event {
@@ -219,7 +241,7 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
                 }
                 let started = Instant::now();
                 let spoken = audio::duration_secs(&samples);
-                let result = process(&shared, &cfg, samples);
+                let result = process(&shared, &mut local, &cfg, samples);
                 record_result(&shared, &cfg, result, started, spoken);
                 shared.set_stage(Stage::Idle);
             }
@@ -232,6 +254,7 @@ struct Outcome {
     final_text: String,
     duration_secs: f32,
     clipboard_before: Option<String>,
+    engine: Engine,
 }
 
 /// Ошибку тоже надо записать с реальной длительностью речи: иначе в истории
@@ -248,16 +271,56 @@ fn error_entry(cfg: &Config, msg: String, duration_secs: f32, latency_ms: u64) -
         latency_ms,
         clipboard_before: None,
         error: Some(msg),
+        engine: Some(cfg.stt.engine.label().to_string()),
     }
 }
 
-fn process(shared: &Arc<Shared>, cfg: &Config, samples: Vec<f32>) -> anyhow::Result<Outcome> {
+/// Распознаёт основным движком, а при отказе — запасным, если он задан.
+/// Возвращает текст и движок, который его выдал.
+fn recognize(
+    shared: &Arc<Shared>,
+    local: &mut LocalEngines,
+    cfg: &Config,
+    samples: &[f32],
+) -> anyhow::Result<(String, Engine)> {
+    let key = shared.api_key_snapshot();
+    let primary = cfg.stt.engine;
+
+    match stt::transcribe(local, cfg, &key, primary, samples) {
+        Ok(text) => Ok((text, primary)),
+        Err(e) => {
+            let Some(fallback) = cfg.stt.fallback.filter(|f| *f != primary) else {
+                return Err(e);
+            };
+            log::warn!(
+                "{} не справился ({e}), пробую {}",
+                primary.label(),
+                fallback.label()
+            );
+            shared.set_error(Some(format!(
+                "{} не отвечает, переключаюсь на {}",
+                primary.label(),
+                fallback.label()
+            )));
+            let text = stt::transcribe(local, cfg, &key, fallback, samples).map_err(|second| {
+                anyhow::anyhow!("{}: {e}\n{}: {second}", primary.label(), fallback.label())
+            })?;
+            Ok((text, fallback))
+        }
+    }
+}
+
+fn process(
+    shared: &Arc<Shared>,
+    local: &mut LocalEngines,
+    cfg: &Config,
+    samples: Vec<f32>,
+) -> anyhow::Result<Outcome> {
     let duration_secs = audio::duration_secs(&samples);
-    let wav = audio::to_wav(&samples)?;
     let key = shared.api_key_snapshot();
 
     shared.set_stage(Stage::Transcribing);
-    let raw_text = providers::transcribe(&cfg.stt, &key, wav)?;
+    let (raw_text, used_engine) = recognize(shared, local, cfg, &samples)?;
     if raw_text.trim().is_empty() {
         anyhow::bail!("распознавание вернуло пустой текст — тишина или слишком тихий микрофон");
     }
@@ -277,6 +340,7 @@ fn process(shared: &Arc<Shared>, cfg: &Config, samples: Vec<f32>) -> anyhow::Res
         final_text,
         duration_secs,
         clipboard_before,
+        engine: used_engine,
     })
 }
 
@@ -303,6 +367,7 @@ fn record_result(
                 latency_ms,
                 clipboard_before: out.clipboard_before,
                 error: None,
+                engine: Some(out.engine.label().to_string()),
             }
         }
         Err(e) => {

@@ -26,6 +26,13 @@ struct FileLogger {
 
 impl log::Log for FileLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
+        // whisper.cpp и ggml на каждом запуске выводят десятки строк про
+        // устройство и параметры модели. В журнале от них толку нет, а полезное
+        // они топят, поэтому пропускаем только предупреждения и ошибки.
+        let target = metadata.target();
+        if target.starts_with("whisper") || target.starts_with("ggml") {
+            return metadata.level() <= log::Level::Warn;
+        }
         metadata.level() <= self.level
     }
 

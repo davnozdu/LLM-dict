@@ -208,3 +208,29 @@ pub fn to_wav(samples: &[f32]) -> Result<Vec<u8>> {
 pub fn duration_secs(samples: &[f32]) -> f32 {
     samples.len() as f32 / TARGET_RATE as f32
 }
+
+/// Читает WAV и приводит к 16 кГц моно — для режима замера.
+pub fn read_wav(path: &str) -> Result<Vec<f32>> {
+    let mut reader = hound::WavReader::open(path)?;
+    let spec = reader.spec();
+
+    let raw: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => reader.samples::<f32>().map_while(Result::ok).collect(),
+        hound::SampleFormat::Int => {
+            let scale = 1.0 / (1i64 << (spec.bits_per_sample - 1)) as f32;
+            reader
+                .samples::<i32>()
+                .map_while(Result::ok)
+                .map(|s| s as f32 * scale)
+                .collect()
+        }
+    };
+
+    if spec.sample_rate == TARGET_RATE && spec.channels == 1 {
+        return Ok(raw);
+    }
+    let mut dm = Downmix::new(spec.sample_rate, spec.channels);
+    let mut out = Vec::new();
+    dm.push(&raw, &mut out);
+    Ok(out)
+}

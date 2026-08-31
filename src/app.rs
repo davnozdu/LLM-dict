@@ -5,6 +5,7 @@ use crate::config::{secrets, Config, HotKeyMode, PostMode};
 use crate::engine::{self, Shared, Stage};
 use crate::history;
 use crate::insert;
+use crate::models::{self, Engine};
 use crate::permissions;
 use crate::{autostart, conflicts, macos, providers, updater};
 
@@ -60,6 +61,14 @@ pub struct App {
     duplicates: Vec<String>,
     duplicates_checked: Instant,
     key_synced: bool,
+    /// Идущая загрузка модели: её id, прогресс и канал с результатом.
+    download: Option<Download>,
+}
+
+struct Download {
+    model_id: String,
+    progress: Arc<models::Progress>,
+    result: Receiver<Result<(), String>>,
 }
 
 enum UpdateState {
@@ -101,6 +110,7 @@ impl App {
             duplicates: Vec::new(),
             duplicates_checked: Instant::now() - Duration::from_secs(60),
             key_synced: false,
+            download: None,
         }
     }
 
@@ -128,6 +138,7 @@ impl App {
         const S: usize = 22;
         let (r, g, b) = match stage {
             Stage::Idle => (140u8, 140u8, 140u8),
+            Stage::LoadingModel => (150, 120, 200),
             Stage::Recording => (230, 60, 60),
             Stage::Transcribing => (230, 160, 40),
             Stage::PostProcessing => (90, 140, 240),
@@ -237,6 +248,37 @@ impl App {
         }
     }
 
+    fn poll_download(&mut self) {
+        let Some(dl) = &self.download else { return };
+        match dl.result.try_recv() {
+            Ok(Ok(())) => {
+                let id = dl.model_id.clone();
+                self.toast(format!("Модель {id} скачана"));
+                self.download = None;
+            }
+            Ok(Err(e)) => {
+                self.toast(format!("Загрузка не удалась: {e}"));
+                self.download = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.download = None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    fn start_download(&mut self, spec: &'static models::ModelSpec) {
+        let progress = Arc::new(models::Progress::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = progress.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(models::download(spec, p).map_err(|e| e.to_string()));
+        });
+        self.download = Some(Download {
+            model_id: spec.id.to_string(),
+            progress,
+            result: rx,
+        });
+    }
+
     fn poll_capture(&mut self) {
         if !self.capturing {
             return;
@@ -316,6 +358,7 @@ impl App {
                 .with_has_shadow(false),
             move |ctx, _class| {
                 let (dot, text) = match stage {
+                    Stage::LoadingModel => (egui::Color32::from_rgb(150, 120, 200), "гружу модель"),
                     Stage::Recording => (egui::Color32::from_rgb(235, 70, 70), "слушаю"),
                     Stage::Transcribing => (egui::Color32::from_rgb(235, 165, 45), "распознаю"),
                     Stage::PostProcessing => (egui::Color32::from_rgb(95, 145, 245), "обрабатываю"),
@@ -394,6 +437,7 @@ impl eframe::App for App {
         self.sync_tray();
         self.poll_model_check();
         self.poll_api_key();
+        self.poll_download();
         self.poll_capture();
         self.poll_update();
         self.refresh_verdict();
@@ -453,6 +497,7 @@ impl eframe::App for App {
                 let stage = self.shared.stage();
                 let dot = match stage {
                     Stage::Idle => egui::Color32::from_gray(140),
+                    Stage::LoadingModel => egui::Color32::from_rgb(150, 120, 200),
                     Stage::Recording => egui::Color32::from_rgb(230, 60, 60),
                     Stage::Transcribing => egui::Color32::from_rgb(230, 160, 40),
                     Stage::PostProcessing => egui::Color32::from_rgb(90, 140, 240),
@@ -466,6 +511,8 @@ impl eframe::App for App {
                     self.cfg.general.hotkey.label(),
                     engine::hotkey_mode_label(self.cfg.general.hotkey_mode)
                 ));
+                ui.separator();
+                ui.label(self.cfg.stt.engine.label());
                 if let Some((msg, at)) = &self.toast {
                     if at.elapsed() < Duration::from_secs(4) {
                         ui.separator();
@@ -749,6 +796,57 @@ impl App {
             ui.add_space(6.0);
             ui.label(egui::RichText::new("Распознавание речи").strong());
             ui.add_space(4.0);
+
+            ui.label("Движок по умолчанию:");
+            for e in Engine::ALL {
+                ui.radio_value(&mut self.cfg.stt.engine, e, e.label());
+            }
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("Если откажет:");
+                egui::ComboBox::from_id_salt("fallback")
+                    .width(200.0)
+                    .selected_text(match self.cfg.stt.fallback {
+                        None => "ничего, показать ошибку".to_string(),
+                        Some(e) => format!("перейти на {}", e.label()),
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.cfg.stt.fallback,
+                            None,
+                            "ничего, показать ошибку",
+                        );
+                        for e in Engine::ALL {
+                            if e == self.cfg.stt.engine {
+                                continue;
+                            }
+                            ui.selectable_value(
+                                &mut self.cfg.stt.fallback,
+                                Some(e),
+                                format!("перейти на {}", e.label()),
+                            );
+                        }
+                    });
+            });
+            ui.weak(
+                "Откат срабатывает молча: пропала сеть, кончился лимит, протух ключ — \
+                 диктовка всё равно доводится до конца.",
+            );
+
+            ui.add_space(10.0);
+            labeled(ui, "Язык", |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.cfg.stt.language)
+                        .desired_width(120.0)
+                        .hint_text("авто"),
+                );
+                ui.weak("код вида ru, en; пусто — определять самому");
+            });
+
+            // --- облако ---
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new("Облако").weak());
             labeled(ui, "Адрес API", |ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.cfg.stt.base_url).desired_width(320.0));
             });
@@ -761,14 +859,6 @@ impl App {
                     "whisper",
                 );
             });
-            labeled(ui, "Язык", |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.cfg.stt.language)
-                        .desired_width(120.0)
-                        .hint_text("авто"),
-                );
-                ui.weak("код вида ru, en; пусто — определять самому");
-            });
             labeled(ui, "Подсказка", |ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.cfg.stt.prompt)
@@ -776,6 +866,21 @@ impl App {
                         .hint_text("имена и термины, которые часто путает"),
                 );
             });
+
+            // --- локальные модели ---
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new("Локальные модели").weak());
+            ui.add_space(4.0);
+            self.ui_local_models(ui);
+            ui.add_space(4.0);
+            ui.checkbox(
+                &mut self.cfg.stt.preload_local,
+                "Загружать локальную модель при запуске",
+            );
+            ui.weak(
+                "Загрузка занимает несколько секунд. Без неё первая диктовка после \
+                 запуска будет заметно дольше остальных.",
+            );
 
             ui.add_space(12.0);
             ui.separator();
@@ -885,6 +990,95 @@ impl App {
             ui.weak(format!("Журнал: {}", crate::logging::log_path().display()));
             ui.add_space(12.0);
         });
+    }
+
+    /// Список локальных моделей: что скачано, что качается, что можно удалить.
+    fn ui_local_models(&mut self, ui: &mut egui::Ui) {
+        let mut to_download: Option<&'static models::ModelSpec> = None;
+        let mut to_remove: Option<&'static models::ModelSpec> = None;
+        let mut cancel = false;
+
+        for spec in models::CATALOG.iter() {
+            let installed = spec.is_installed();
+            let downloading = self
+                .download
+                .as_ref()
+                .is_some_and(|d| d.model_id == spec.id);
+
+            // Радиокнопка выбирает модель внутри своего движка, а не движок.
+            let selected = match spec.engine {
+                Engine::Whisper => self.cfg.stt.whisper_model == spec.id,
+                Engine::Parakeet => self.cfg.stt.parakeet_model == spec.id,
+                Engine::Cloud => false,
+            };
+
+            ui.push_id(spec.id, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.radio(selected, spec.title).clicked() {
+                        match spec.engine {
+                            Engine::Whisper => self.cfg.stt.whisper_model = spec.id.to_string(),
+                            Engine::Parakeet => self.cfg.stt.parakeet_model = spec.id.to_string(),
+                            Engine::Cloud => {}
+                        }
+                    }
+                    ui.weak(models::human_size(spec.total_size()));
+                    if installed {
+                        ui.colored_label(egui::Color32::from_rgb(60, 160, 90), "скачана");
+                    }
+                });
+                ui.weak(spec.note);
+
+                if downloading {
+                    let p = self.download.as_ref().map(|d| d.progress.clone());
+                    if let Some(p) = p {
+                        let done = p.downloaded.load(Ordering::Relaxed);
+                        let total = p.total.load(Ordering::Relaxed);
+                        ui.add(
+                            egui::ProgressBar::new(p.fraction())
+                                .desired_width(320.0)
+                                .text(format!(
+                                    "{} из {}",
+                                    models::human_size(done),
+                                    models::human_size(total)
+                                )),
+                        );
+                        if ui.small_button("Отменить").clicked() {
+                            p.cancel();
+                            cancel = true;
+                        }
+                    }
+                } else {
+                    ui.horizontal(|ui| {
+                        if !installed && ui.small_button("Скачать").clicked() {
+                            to_download = Some(spec);
+                        }
+                        if installed && ui.small_button("Удалить").clicked() {
+                            to_remove = Some(spec);
+                        }
+                    });
+                }
+                ui.add_space(6.0);
+            });
+        }
+
+        if let Some(spec) = to_download {
+            if self.download.is_some() {
+                self.toast("Дождитесь окончания текущей загрузки");
+            } else {
+                self.start_download(spec);
+            }
+        }
+        if let Some(spec) = to_remove {
+            match spec.remove() {
+                Ok(()) => self.toast(format!("Модель {} удалена", spec.title)),
+                Err(e) => self.toast(format!("Не удалить: {e}")),
+            }
+        }
+        if cancel {
+            self.toast("Загрузка отменена");
+        }
+
+        ui.weak(format!("Папка моделей: {}", models::models_dir().display()));
     }
 
     fn ui_update_block(&mut self, ui: &mut egui::Ui) {
@@ -1004,6 +1198,10 @@ impl App {
                         ui.weak("·");
                         ui.weak(&e.mode);
                         ui.weak("·");
+                        if let Some(engine) = &e.engine {
+                            ui.weak(engine);
+                            ui.weak("·");
+                        }
                         ui.weak(format!("{:.1} с речи", e.duration_secs));
                         ui.weak("·");
                         ui.weak(format!("{} мс", e.latency_ms));
