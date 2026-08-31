@@ -22,6 +22,8 @@ extern "C" {
 #[link(name = "AVFoundation", kind = "framework")]
 extern "C" {}
 
+const BUNDLE_ID: &str = "com.davnozdu.llm-dict";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     Granted,
@@ -101,6 +103,64 @@ pub fn prompt_microphone() {
             completionHandler: &*handler,
         ];
     }
+}
+
+/// Стирает записи TCC для нашего идентификатора.
+///
+/// macOS помнит выданный доступ вместе с подписью приложения. Когда подпись
+/// сменилась — а при ad-hoc сборках она меняется каждый раз — в списке
+/// остаётся запись от прежней сборки: тумблер выглядит включённым, но к
+/// текущему процессу отношения не имеет и переключение ничего не даёт.
+/// Сброс убирает старые записи, после чего доступ выдаётся заново уже начисто.
+pub fn reset_accessibility() -> Result<(), String> {
+    let out = std::process::Command::new("/usr/bin/tccutil")
+        .args(["reset", "Accessibility", BUNDLE_ID])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+pub fn reset_microphone() -> Result<(), String> {
+    let out = std::process::Command::new("/usr/bin/tccutil")
+        .args(["reset", "Microphone", BUNDLE_ID])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// Другие копии приложения с тем же идентификатором.
+///
+/// Два бандла с одинаковым CFBundleIdentifier, но разной подписью — верный
+/// способ получить «доступ выдан, но не работает»: система заводит на них
+/// отдельные записи, а пользователь видит один пункт в списке.
+pub fn duplicate_bundles() -> Vec<String> {
+    let out = std::process::Command::new("/usr/bin/mdfind")
+        .arg(format!("kMDItemCFBundleIdentifier == '{BUNDLE_ID}'"))
+        .output();
+    let Ok(out) = out else { return Vec::new() };
+    let current = std::env::current_exe()
+        .ok()
+        .and_then(|p| {
+            p.parent()
+                .and_then(|p| p.parent())
+                .and_then(|p| p.parent())
+                .map(|p| p.to_path_buf())
+        })
+        .unwrap_or_default();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter(|l| std::path::Path::new(l) != current)
+        .map(|l| l.to_string())
+        .collect()
 }
 
 pub fn open_accessibility_settings() {

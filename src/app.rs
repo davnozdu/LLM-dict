@@ -57,6 +57,8 @@ pub struct App {
     verdict_for: Binding,
     update: UpdateState,
     update_checked: bool,
+    duplicates: Vec<String>,
+    duplicates_checked: Instant,
 }
 
 enum UpdateState {
@@ -95,6 +97,8 @@ impl App {
             verdict_for: Binding::new(Vec::new()),
             update: UpdateState::Idle,
             update_checked: false,
+            duplicates: Vec::new(),
+            duplicates_checked: Instant::now() - Duration::from_secs(60),
         }
     }
 
@@ -541,6 +545,12 @@ impl App {
                 "Слежение за клавишей не запущено — перезапустите приложение.",
             );
             ui.add_space(6.0);
+        } else if self.shared.hotkey_state.is_disabled_by_system() {
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 130, 40),
+                "Система отключила слежение за клавишей — перезапустите приложение.",
+            );
+            ui.add_space(6.0);
         }
 
         if self.api_key_input.trim().is_empty() && self.shared.key_loaded() {
@@ -707,7 +717,20 @@ impl App {
                     "Нажатие / повторное нажатие",
                 );
             });
-            ui.weak("Клавиши только прослушиваются, их обычное действие сохраняется.");
+            ui.add_space(4.0);
+            ui.checkbox(
+                &mut self.cfg.general.swallow_hotkey,
+                "Перехватывать клавишу — не давать сработать её обычному действию",
+            );
+            if self.cfg.general.swallow_hotkey {
+                ui.weak(
+                    "Событие клавиши не уходит дальше в систему, пока приложение работает. \
+                     Так можно занять 🌐 или другую уже назначенную клавишу. Перехватывается \
+                     только то, что входит в сочетание — остальная клавиатура не затрагивается.",
+                );
+            } else {
+                ui.weak("Клавиши только прослушиваются, их обычное действие сохраняется.");
+            }
 
             ui.add_space(12.0);
             ui.separator();
@@ -1062,7 +1085,25 @@ impl App {
             if ui.button("Открыть настройки").clicked() {
                 permissions::open_accessibility_settings();
             }
+            if ui.button("Сбросить и выдать заново").clicked() {
+                match permissions::reset_accessibility() {
+                    Ok(()) => {
+                        self.toast("Запись сброшена — выдайте доступ заново");
+                        permissions::prompt_accessibility();
+                    }
+                    Err(e) => self.toast(format!("tccutil: {e}")),
+                }
+            }
         });
+        if !ax.is_ok() {
+            ui.add_space(2.0);
+            ui.weak(
+                "Если в Системных настройках тумблер выглядит включённым, а здесь \
+                 написано «запрещён» — там осталась запись от прежней сборки с другой \
+                 подписью. Нажмите «Сбросить и выдать заново», затем перезапустите \
+                 приложение.",
+            );
+        }
 
         ui.add_space(12.0);
         perm_row(ui, "Микрофон", mic, "нужен для записи речи");
@@ -1073,20 +1114,51 @@ impl App {
             if ui.button("Открыть настройки").clicked() {
                 permissions::open_microphone_settings();
             }
+            if ui.button("Сбросить").clicked() {
+                match permissions::reset_microphone() {
+                    Ok(()) => self.toast("Запись сброшена"),
+                    Err(e) => self.toast(format!("tccutil: {e}")),
+                }
+            }
         });
+
+        // Дубликаты ищем не каждый кадр: mdfind — это запуск процесса.
+        if self.duplicates_checked.elapsed() > Duration::from_secs(30) {
+            self.duplicates = permissions::duplicate_bundles();
+            self.duplicates_checked = Instant::now();
+        }
+        if !self.duplicates.is_empty() {
+            ui.add_space(14.0);
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 130, 40),
+                "Найдены другие копии приложения",
+            );
+            ui.weak(
+                "У них тот же идентификатор, но другая подпись. macOS заводит на них \
+                 отдельные записи разрешений, а в списке показывает один пункт — \
+                 отсюда «доступ выдан, но не работает». Оставьте одну копию.",
+            );
+            for path in &self.duplicates {
+                ui.weak(format!("• {path}"));
+            }
+        }
 
         ui.add_space(16.0);
         ui.separator();
         ui.add_space(6.0);
         ui.weak(
             "После выдачи «Универсального доступа» приложение нужно перезапустить: \
-             macOS выдаёт разрешение уже запущенному процессу не сразу.",
+             macOS не отдаёт разрешение уже запущенному процессу.",
         );
         ui.add_space(4.0);
-        ui.weak(
-            "Сборка подписана самоподписанным сертификатом. Если после обновления \
-             разрешение слетело — удалите старую запись в списке и добавьте заново.",
-        );
+        ui.weak(format!(
+            "Запущено из: {}",
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent()?.parent()?.parent().map(|p| p.to_path_buf()))
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "неизвестно".into())
+        ));
     }
 }
 

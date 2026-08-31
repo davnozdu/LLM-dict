@@ -74,6 +74,36 @@ fn common_app_shortcut(main_key: u16, mask: u64) -> Option<&'static str> {
     })
 }
 
+/// На что назначена клавиша 🌐 в настройках клавиатуры.
+enum FnUsage {
+    /// «Ничего не делать» — клавиша свободна.
+    Nothing,
+    Assigned(&'static str),
+    /// Ключ не записан, действует умолчание системы.
+    Unknown,
+}
+
+/// AppleFnUsageType: 0 — ничего, 1 — смена источника ввода,
+/// 2 — панель эмодзи, 3 — диктовка Apple.
+fn fn_key_usage() -> FnUsage {
+    let out = std::process::Command::new("/usr/bin/defaults")
+        .args(["read", "com.apple.HIToolbox", "AppleFnUsageType"])
+        .output();
+    let Ok(out) = out else {
+        return FnUsage::Unknown;
+    };
+    if !out.status.success() {
+        return FnUsage::Unknown;
+    }
+    match String::from_utf8_lossy(&out.stdout).trim().parse::<i32>() {
+        Ok(0) => FnUsage::Nothing,
+        Ok(1) => FnUsage::Assigned("смену источника ввода"),
+        Ok(2) => FnUsage::Assigned("панель эмодзи и символов"),
+        Ok(3) => FnUsage::Assigned("диктовку Apple"),
+        _ => FnUsage::Unknown,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     /// Ничего похожего не нашлось.
@@ -143,11 +173,23 @@ pub fn check(b: &Binding) -> Verdict {
         return Verdict::Taken("сочетание не задано".into());
     }
 
-    // Fn один — это глобус: смена языка ввода или панель эмодзи.
+    // Fn — это глобус. Занята она или нет, зависит от того, что на неё
+    // назначено в настройках клавиатуры, а не от самого факта её наличия.
     if b.keys == vec![binding::K_FN] {
-        return Verdict::Taken(
-            "Fn занята системой: переключение источника ввода и панель эмодзи".into(),
-        );
+        return match fn_key_usage() {
+            FnUsage::Nothing => Verdict::Free,
+            FnUsage::Unknown => Verdict::Risky(
+                "по умолчанию Fn (🌐) переключает источник ввода. Чтобы освободить её, \
+                 выберите «Ничего не делать» в Системных настройках → Клавиатура → \
+                 «При нажатии 🌐». Либо включите перехват клавиши ниже."
+                    .into(),
+            ),
+            FnUsage::Assigned(what) => Verdict::Risky(format!(
+                "Fn (🌐) сейчас назначена на «{what}». Освободить: Системные настройки → \
+                 Клавиатура → «При нажатии 🌐» → «Ничего не делать». Либо включите \
+                 перехват клавиши ниже."
+            )),
+        };
     }
     if b.keys == vec![binding::K_CAPS_LOCK] {
         return Verdict::Taken("Caps Lock переключает раскладку".into());

@@ -64,6 +64,7 @@ impl Shared {
             config.general.hotkey.clone(),
             config.general.hotkey_mode,
         ));
+        hotkey_state.set_swallow(config.general.swallow_hotkey);
         let limit = config.general.history_limit;
         let shared = Arc::new(Self {
             config: RwLock::new(config),
@@ -135,6 +136,7 @@ impl Shared {
         let cfg = self.config.read().unwrap();
         self.hotkey_state.set_binding(cfg.general.hotkey.clone());
         self.hotkey_state.set_mode(cfg.general.hotkey_mode);
+        self.hotkey_state.set_swallow(cfg.general.swallow_hotkey);
     }
 }
 

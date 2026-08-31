@@ -111,6 +111,12 @@ pub struct GeneralConfig {
     pub show_overlay: bool,
     /// Проверять обновления при запуске.
     pub check_updates: bool,
+    /// Не пропускать события выбранной клавиши дальше в систему.
+    ///
+    /// Нужно, когда клавиша уже чем-то занята — например 🌐 переключает
+    /// источник ввода. С перехватом её обычное действие не срабатывает,
+    /// пока приложение работает.
+    pub swallow_hotkey: bool,
     /// Хранить ключ прямо в файле настроек, минуя Keychain.
     ///
     /// ACL записи в связке ключей привязан к подписи приложения, поэтому при
@@ -131,6 +137,7 @@ impl Default for GeneralConfig {
             history_limit: 200,
             show_overlay: true,
             check_updates: true,
+            swallow_hotkey: false,
             key_in_config: false,
         }
     }

@@ -33,6 +33,11 @@ pub struct HotKeyState {
     recording: AtomicBool,
     /// Режим набора сочетания: события уходят в UI, диктовка не запускается.
     capturing: AtomicBool,
+    /// Проглатывать события клавиш сочетания, не пропуская их в систему.
+    swallow: AtomicBool,
+    /// Система отключила тап — обычно за слишком долгий обработчик.
+    /// Дальше горячая клавиша молча не работает, поэтому это надо показать.
+    disabled_by_system: AtomicBool,
 }
 
 impl HotKeyState {
@@ -42,6 +47,8 @@ impl HotKeyState {
             mode: AtomicU8::new(0),
             recording: AtomicBool::new(false),
             capturing: AtomicBool::new(false),
+            swallow: AtomicBool::new(false),
+            disabled_by_system: AtomicBool::new(false),
         };
         s.set_mode(mode);
         s
@@ -66,6 +73,14 @@ impl HotKeyState {
 
     pub fn is_capturing(&self) -> bool {
         self.capturing.load(Ordering::Relaxed)
+    }
+
+    pub fn set_swallow(&self, v: bool) {
+        self.swallow.store(v, Ordering::Relaxed);
+    }
+
+    pub fn is_disabled_by_system(&self) -> bool {
+        self.disabled_by_system.load(Ordering::Relaxed)
     }
 }
 
@@ -104,13 +119,24 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
         let tap = CGEventTap::new(
             CGEventTapLocation::Session,
             CGEventTapPlacement::HeadInsertEventTap,
-            CGEventTapOptions::ListenOnly,
+            // Default, а не ListenOnly: только так можно проглотить событие,
+            // когда включён перехват. Без перехвата всё возвращается как есть.
+            CGEventTapOptions::Default,
             vec![
                 CGEventType::FlagsChanged,
                 CGEventType::KeyDown,
                 CGEventType::KeyUp,
             ],
             move |_proxy, event_type, event| {
+                if matches!(
+                    event_type,
+                    CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
+                ) {
+                    log::error!("система отключила event tap: {event_type:?}");
+                    cb_state.disabled_by_system.store(true, Ordering::Relaxed);
+                    return CallbackResult::Keep;
+                }
+
                 let Some((code, is_down)) = decode(event_type, event) else {
                     return CallbackResult::Keep;
                 };
@@ -143,6 +169,11 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
                     return CallbackResult::Keep;
                 }
                 let active = binding.keys.iter().all(|k| held.contains(k));
+
+                // Клавиша из сочетания — кандидат на проглатывание. Отбрасываем
+                // только её события, все остальные идут дальше нетронутыми.
+                let swallow =
+                    cb_state.swallow.load(Ordering::Relaxed) && binding.keys.contains(&code);
                 let recording = cb_state.recording.load(Ordering::Relaxed);
                 let toggle = cb_state.mode.load(Ordering::Relaxed) == 1;
 
@@ -161,7 +192,11 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
                     let _ = cb_tx.send(HotKeyEvent::StopRecording);
                 }
 
-                CallbackResult::Keep
+                if swallow {
+                    CallbackResult::Drop
+                } else {
+                    CallbackResult::Keep
+                }
             },
         );
 
