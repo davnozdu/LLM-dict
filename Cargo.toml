@@ -1,6 +1,6 @@
 [package]
 name = "llm-dict"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.82"
 description = "Диктовка через LLM: горячая клавиша, распознавание речи в облаке, вставка под курсором"
@@ -36,7 +36,7 @@ core-graphics = "0.25"
 core-foundation = "0.10"
 objc2 = "0.6"
 block2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSString"] }
+objc2-foundation = { version = "0.3", features = ["NSString", "NSGeometry"] }
 
 [profile.release]
 opt-level = 2

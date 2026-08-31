@@ -65,6 +65,7 @@ pub struct App {
     duplicates: Vec<String>,
     duplicates_checked: Instant,
     key_synced: bool,
+    overlay: crate::overlay::Overlay,
     /// Идущая загрузка модели: её id, прогресс и канал с результатом.
     download: Option<Download>,
     /// Какое действие сейчас раскрыто в редакторе.
@@ -127,6 +128,7 @@ impl App {
             duplicates: Vec::new(),
             duplicates_checked: Instant::now() - Duration::from_secs(60),
             key_synced: false,
+            overlay: crate::overlay::Overlay::new(),
             download: None,
             editing_action: None,
             capturing_action: None,
@@ -352,102 +354,39 @@ impl App {
     /// Маленькая плашка у курсора: видно, что диктовка идёт, даже когда окно
     /// приложения закрыто. Окно не активируется и не перехватывает мышь,
     /// иначе оно уводило бы фокус из программы, куда мы собираемся вставлять.
-    fn draw_overlay(&self, ctx: &egui::Context) {
+    /// Плашка у курсора. Живёт в `logic`, а не в `ui`: пока главное окно
+    /// скрыто, eframe не выполняет кадры интерфейса, и плашка на окне egui
+    /// оставалась бы на экране навсегда.
+    fn update_overlay(&mut self, ctx: &egui::Context) {
         if !self.cfg.general.show_overlay {
+            self.overlay.hide();
             return;
         }
-        let stage = self.shared.stage();
-        let notice = self.shared.notice();
 
-        // Плашка нужна и во время работы, и чтобы сказать, что результат готов:
-        // окно приложения обычно закрыто, а системные уведомления требуют
-        // отдельного разрешения и теряются в центре уведомлений.
-        let (dot, text, show_level) = match (&notice, stage) {
-            (Some(msg), _) => (egui::Color32::from_rgb(60, 190, 110), msg.clone(), false),
-            (None, Stage::Recording) => (
-                egui::Color32::from_rgb(235, 70, 70),
-                "слушаю".to_string(),
-                true,
-            ),
-            (None, Stage::LoadingModel) => (
-                egui::Color32::from_rgb(150, 120, 200),
-                "гружу модель".to_string(),
-                false,
-            ),
-            (None, Stage::Transcribing) => (
-                egui::Color32::from_rgb(235, 165, 45),
-                "распознаю".to_string(),
-                false,
-            ),
-            (None, Stage::PostProcessing) | (None, Stage::ActionRunning) => (
-                egui::Color32::from_rgb(95, 145, 245),
-                "обрабатываю".to_string(),
-                false,
-            ),
-            (None, Stage::Inserting) => (
-                egui::Color32::from_rgb(65, 195, 115),
-                "вставляю".to_string(),
-                false,
-            ),
-            (None, Stage::Idle) => return,
+        let stage = self.shared.stage();
+        let notice = self.shared.notice_with_fade();
+
+        let (text, fade) = match (notice, stage) {
+            (Some((msg, fade)), _) => (msg, fade),
+            (None, Stage::Recording) => ("Слушаю…".to_string(), 1.0),
+            (None, Stage::LoadingModel) => ("Загружаю модель…".to_string(), 1.0),
+            (None, Stage::Transcribing) => ("Распознаю…".to_string(), 1.0),
+            (None, Stage::PostProcessing) | (None, Stage::ActionRunning) => {
+                ("Обрабатываю…".to_string(), 1.0)
+            }
+            (None, Stage::Inserting) => ("Вставляю…".to_string(), 1.0),
+            (None, Stage::Idle) => {
+                self.overlay.hide();
+                return;
+            }
         };
 
-        let Some((mx, my)) = macos::cursor_position() else {
+        let Some(pos) = macos::cursor_position() else {
             return;
         };
-        // Ширина по длине надписи: «перевод в буфере» не должен обрезаться.
-        let width = (text.chars().count() as f32 * 7.5 + 56.0).clamp(120.0, 420.0);
-        let size = egui::vec2(width, 34.0);
-        let pos = egui::pos2(mx - size.x / 2.0, my - size.y - 22.0);
-        let level = self.shared.level.get();
-
-        ctx.show_viewport_deferred(
-            egui::ViewportId::from_hash_of("llm_dict_overlay"),
-            egui::ViewportBuilder::default()
-                .with_title("LLM-dict")
-                .with_inner_size(size)
-                .with_position(pos)
-                .with_decorations(false)
-                .with_transparent(true)
-                .with_resizable(false)
-                .with_always_on_top()
-                .with_mouse_passthrough(true)
-                .with_taskbar(false)
-                .with_active(false)
-                .with_has_shadow(false),
-            move |ctx, _class| {
-                let frame = egui::Frame::NONE
-                    .fill(egui::Color32::from_rgba_unmultiplied(28, 28, 32, 235))
-                    .corner_radius(egui::CornerRadius::same(17))
-                    .inner_margin(egui::Margin::symmetric(12, 8));
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        frame.show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                // Кружок пульсирует в такт громкости — сразу
-                                // видно, что микрофон действительно слышит.
-                                let pulse = if show_level {
-                                    4.0 + level.clamp(0.0, 1.0) * 4.0
-                                } else {
-                                    5.0
-                                };
-                                let (rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(pulse * 2.0 + 4.0, pulse * 2.0 + 4.0),
-                                    egui::Sense::hover(),
-                                );
-                                ui.painter().circle_filled(rect.center(), pulse, dot);
-                                ui.label(
-                                    egui::RichText::new(&text)
-                                        .color(egui::Color32::from_gray(235))
-                                        .size(13.0),
-                                );
-                            });
-                        });
-                    });
-                ctx.request_repaint_after(Duration::from_millis(60));
-            },
-        );
+        // Полупрозрачная и гаснущая — просили ненавязчивую.
+        self.overlay.show(&text, pos, 0.88 * fade);
+        ctx.request_repaint_after(Duration::from_millis(80));
     }
 
     /// Ключ уходит туда, куда указано настройками, а из другого места
@@ -485,30 +424,12 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        let ctx = &ctx;
+    /// Выполняется и когда окно скрыто — значит сюда идёт всё, что должно
+    /// работать в фоне: значок в панели и плашка у курсора.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ensure_tray();
         self.sync_tray();
-        self.poll_model_check();
-        self.poll_api_key();
-        self.poll_download();
-        self.poll_capture();
-        self.poll_update();
-        self.refresh_verdict();
-        self.draw_overlay(ctx);
-
-        // Проверка обновлений один раз за запуск, чтобы не дёргать GitHub.
-        if self.cfg.general.check_updates && !self.update_checked {
-            self.update_checked = true;
-            self.start_update_check();
-        }
-
-        // Разрешения опрашиваем раз в секунду: вызовы дешёвые, но не бесплатные.
-        if self.perms_checked.elapsed() > Duration::from_secs(1) {
-            self.perms = (permissions::accessibility(), permissions::microphone());
-            self.perms_checked = Instant::now();
-        }
+        self.update_overlay(ctx);
 
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             match event.id.as_ref() {
@@ -520,6 +441,29 @@ impl eframe::App for App {
                 MENU_QUIT => std::process::exit(0),
                 _ => {}
             }
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
+        self.poll_model_check();
+        self.poll_api_key();
+        self.poll_download();
+        self.poll_capture();
+        self.poll_update();
+        self.refresh_verdict();
+
+        // Проверка обновлений один раз за запуск, чтобы не дёргать GitHub.
+        if self.cfg.general.check_updates && !self.update_checked {
+            self.update_checked = true;
+            self.start_update_check();
+        }
+
+        // Разрешения опрашиваем раз в секунду: вызовы дешёвые, но не бесплатные.
+        if self.perms_checked.elapsed() > Duration::from_secs(1) {
+            self.perms = (permissions::accessibility(), permissions::microphone());
+            self.perms_checked = Instant::now();
         }
 
         // Закрытие окна прячет его, а не завершает приложение.
@@ -1075,6 +1019,9 @@ impl App {
                 if ui.button("Показать папку настроек").clicked() {
                     let _ = open::that(crate::config::config_dir());
                 }
+                if ui.button("Проверить плашку").clicked() {
+                    self.shared.notify("Так выглядит плашка у курсора");
+                }
             });
             ui.add_space(8.0);
             ui.weak(format!(
@@ -1203,7 +1150,7 @@ impl App {
             .provider_keys
             .get(&provider)
             .cloned()
-            .unwrap_or_else(|| endpoint.api_key());
+            .unwrap_or_else(|| endpoint.api_key(&self.cfg));
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(providers::list_models(&base_url, &key).map_err(|e| e.to_string()));
@@ -1218,9 +1165,8 @@ impl App {
             ui.weak("Ollama работает локально, ключ не нужен.");
             return;
         }
-        let entry = self.provider_keys.entry(provider).or_insert_with(|| {
-            crate::config::secrets::get(provider.key_account()).unwrap_or_default()
-        });
+        let stored = self.cfg.key_for(provider.key_account());
+        let entry = self.provider_keys.entry(provider).or_insert(stored);
         let mut value = entry.clone();
         let hint = if value.is_empty() {
             "не задан"
@@ -1241,9 +1187,10 @@ impl App {
 
         ui.horizontal(|ui| {
             if ui.button("Сохранить ключ").clicked() {
-                match crate::config::secrets::set(provider.key_account(), value.trim()) {
+                let account = provider.key_account();
+                match self.cfg.set_key_for(account, value.trim()) {
                     Ok(()) => self.toast(format!("Ключ {} сохранён", provider.label())),
-                    Err(e) => self.toast(format!("Keychain: {e}")),
+                    Err(e) => self.toast(format!("Не сохранить ключ: {e}")),
                 }
             }
             if let Some(url) = provider.key_url() {
@@ -1802,6 +1749,61 @@ impl App {
             );
             for path in &self.duplicates {
                 ui.weak(format!("• {path}"));
+            }
+        }
+
+        ui.add_space(16.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Что видит приложение").strong());
+        ui.add_space(4.0);
+
+        let (held, events) = self.shared.hotkey_state.diagnostics();
+        if events == 0 {
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 80, 80),
+                "Ни одного события клавиатуры не получено — слежение не работает. \
+                 Выдайте «Универсальный доступ» и перезапустите приложение.",
+            );
+        } else {
+            let shown = if held.is_empty() {
+                "ничего не зажато".to_string()
+            } else {
+                format!(
+                    "{}  ({} шт.)",
+                    held.iter()
+                        .map(|k| crate::binding::key_label(*k))
+                        .collect::<Vec<_>>()
+                        .join(" + "),
+                    held.len()
+                )
+            };
+            ui.horizontal(|ui| {
+                ui.label("Сейчас зажато:");
+                ui.colored_label(egui::Color32::from_rgb(90, 140, 240), shown);
+            });
+            ui.weak(format!(
+                "Событий получено: {events}. Зажмите нужные клавиши — если здесь \
+                 они не появляются, до приложения они не доходят."
+            ));
+        }
+
+        ui.add_space(10.0);
+        ui.label(egui::RichText::new("Проверка захвата выделенного").strong());
+        ui.weak(
+            "Выделите текст в любой программе, вернитесь сюда и нажмите кнопку. \
+             Так видно, доходит ли выделение до приложения.",
+        );
+        if ui.button("Прочитать выделенное").clicked() {
+            match crate::insert::copy_selection() {
+                Ok((text, _)) => {
+                    let preview: String = text.chars().take(120).collect();
+                    self.toast(format!(
+                        "Прочитано {} симв.: {preview}",
+                        text.chars().count()
+                    ));
+                }
+                Err(e) => self.toast(format!("Не прочитать: {e}")),
             }
         }
 

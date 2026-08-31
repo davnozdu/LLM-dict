@@ -61,23 +61,34 @@ fn press_cmd(keycode: u16) -> Result<()> {
 /// он сам решает, что положить туда в итоге.
 pub fn copy_selection() -> Result<(String, Option<String>)> {
     let previous = read_clipboard();
-    let before = pasteboard_change_count();
 
-    press_cmd(KEYCODE_C)?;
+    // Две попытки: первая может уйти в момент, когда программа-получатель ещё
+    // разбирается с отпущенными модификаторами и копирование пропускает.
+    for attempt in 0..2 {
+        let before = pasteboard_change_count();
+        press_cmd(KEYCODE_C)?;
 
-    // Пастборд обновляется асинхронно: ждём, пока счётчик сдвинется.
-    let deadline = std::time::Instant::now() + Duration::from_millis(600);
-    while std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-        if pasteboard_change_count() != before {
-            let text = read_clipboard().unwrap_or_default();
-            if text.trim().is_empty() {
-                anyhow::bail!("выделенный текст пустой");
+        // Пастборд обновляется асинхронно: ждём, пока счётчик сдвинется.
+        let deadline = std::time::Instant::now() + Duration::from_millis(700);
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            if pasteboard_change_count() != before {
+                let text = read_clipboard().unwrap_or_default();
+                if text.trim().is_empty() {
+                    anyhow::bail!("выделенный текст пустой");
+                }
+                return Ok((text, previous));
             }
-            return Ok((text, previous));
         }
+        log::warn!(
+            "копирование выделенного не сработало, попытка {}",
+            attempt + 1
+        );
     }
-    anyhow::bail!("не удалось получить выделенный текст — выделите его перед нажатием")
+    anyhow::bail!(
+        "не удалось получить выделенный текст. Проверьте, что текст выделен, \
+         а приложению выдан «Универсальный доступ»"
+    )
 }
 
 fn press_cmd_v() -> Result<()> {

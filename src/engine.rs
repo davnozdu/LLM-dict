@@ -14,7 +14,7 @@ use crate::stt::{self, LocalEngines};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
@@ -65,6 +65,10 @@ pub struct Shared {
     /// Короткое сообщение поверх экрана: что действие отработало.
     /// Показывается у курсора, потому что окно обычно закрыто.
     notice: Mutex<Option<(String, std::time::Instant)>>,
+    /// Разбудить интерфейс. Пока главное окно скрыто, eframe не выполняет
+    /// кадры сам, а плашку у курсора рисовать всё равно надо.
+    #[allow(clippy::type_complexity)]
+    wake: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// Растёт при каждом изменении, чтобы трей перерисовал иконку.
     pub dirty: AtomicBool,
 }
@@ -98,6 +102,7 @@ impl Shared {
             key_loaded: AtomicBool::new(false),
             captured: Mutex::new(None),
             notice: Mutex::new(None),
+            wake: Mutex::new(None),
             dirty: AtomicBool::new(true),
         });
 
@@ -121,18 +126,29 @@ impl Shared {
         self.key_loaded.load(Ordering::Relaxed)
     }
 
+    pub fn set_wake(&self, f: Box<dyn Fn() + Send + Sync>) {
+        *self.wake.lock().unwrap() = Some(f);
+    }
+
+    fn wake_ui(&self) {
+        if let Some(f) = self.wake.lock().unwrap().as_ref() {
+            f();
+        }
+    }
+
     pub fn notify(&self, text: impl Into<String>) {
         *self.notice.lock().unwrap() = Some((text.into(), std::time::Instant::now()));
         self.dirty.store(true, Ordering::Relaxed);
+        self.wake_ui();
     }
 
-    /// Сообщение, если оно ещё не устарело.
-    pub fn notice(&self) -> Option<String> {
+    /// Сообщение и сколько ему осталось жить, от 1 до 0 — для плавного гашения.
+    pub fn notice_with_fade(&self) -> Option<(String, f32)> {
         let guard = self.notice.lock().unwrap();
-        guard
-            .as_ref()
-            .filter(|(_, at)| at.elapsed() < std::time::Duration::from_secs(4))
-            .map(|(text, _)| text.clone())
+        let (text, at) = guard.as_ref()?;
+        let left = NOTICE_LIFETIME.checked_sub(at.elapsed())?;
+        let fade = (left.as_secs_f32() / 0.3).min(1.0);
+        Some((text.clone(), fade))
     }
 
     /// Забирает набранное в настройках сочетание, если оно появилось.
@@ -147,6 +163,7 @@ impl Shared {
     fn set_stage(&self, s: Stage) {
         *self.stage.lock().unwrap() = s;
         self.dirty.store(true, Ordering::Relaxed);
+        self.wake_ui();
     }
 
     fn set_error(&self, e: Option<String>) {
@@ -180,6 +197,10 @@ impl Shared {
         );
     }
 }
+
+/// Сколько живёт сообщение о готовности. Секунда — чтобы заметить и не
+/// раздражаться: плашка висит поверх всего.
+pub const NOTICE_LIFETIME: std::time::Duration = std::time::Duration::from_millis(1000);
 
 /// Слишком короткое нажатие — это промах по клавише, а не диктовка.
 const MIN_DURATION_SECS: f32 = 0.35;
@@ -460,10 +481,28 @@ fn run_action(shared: &Arc<Shared>, id: &str) {
             insert::play_sound("Tink");
         }
 
+        // Дождаться, пока клавиши сочетания отпустят.
+        //
+        // Копирование выделенного изображается нажатием ⌘C. Если послать его,
+        // пока пользователь ещё держит, скажем, ⌘⌥C, программа-получатель
+        // увидит ⌘⌥C, а не ⌘C, ничего не скопирует — и действие тихо упрётся
+        // в таймаут.
+        let wait_until = Instant::now() + Duration::from_millis(1500);
+        while Instant::now() < wait_until {
+            if shared.hotkey_state.diagnostics().0.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Небольшая пауза сверх этого: система обрабатывает отпускание
+        // модификаторов не мгновенно.
+        std::thread::sleep(Duration::from_millis(60));
+
         let started = Instant::now();
         let outcome = (|| -> anyhow::Result<(String, Option<String>)> {
             let (selection, previous) = insert::copy_selection()?;
-            let result = providers::run_prompt(&action.endpoint, &action.prompt, &selection)?;
+            let key = action.endpoint.api_key(&cfg);
+            let result = providers::run_prompt(&action.endpoint, &key, &action.prompt, &selection)?;
 
             match action.output {
                 crate::actions::Output::Replace => {

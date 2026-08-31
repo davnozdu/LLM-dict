@@ -12,7 +12,7 @@ use core_graphics::event::{
     CallbackResult, EventField,
 };
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
@@ -41,6 +41,12 @@ pub struct HotKeyState {
     capturing: AtomicBool,
     /// Проглатывать события клавиш сочетания, не пропуская их в систему.
     swallow: AtomicBool,
+    /// Клавиши, зажатые прямо сейчас. Нужны, чтобы показать в настройках,
+    /// что именно доходит до приложения: без этого «не срабатывает» не
+    /// отличить от «не доходит».
+    held_now: Mutex<Vec<u16>>,
+    /// Событий от клавиатуры получено всего. Ноль означает, что тап молчит.
+    events_seen: AtomicU64,
     /// Система отключила тап — обычно за слишком долгий обработчик.
     /// Дальше горячая клавиша молча не работает, поэтому это надо показать.
     disabled_by_system: AtomicBool,
@@ -55,6 +61,8 @@ impl HotKeyState {
             recording: AtomicBool::new(false),
             capturing: AtomicBool::new(false),
             swallow: AtomicBool::new(false),
+            held_now: Mutex::new(Vec::new()),
+            events_seen: AtomicU64::new(0),
             disabled_by_system: AtomicBool::new(false),
         };
         s.set_mode(mode);
@@ -88,6 +96,14 @@ impl HotKeyState {
 
     pub fn set_swallow(&self, v: bool) {
         self.swallow.store(v, Ordering::Relaxed);
+    }
+
+    /// Что зажато сейчас и сколько событий тап видел за всё время.
+    pub fn diagnostics(&self) -> (Vec<u16>, u64) {
+        (
+            self.held_now.lock().unwrap().clone(),
+            self.events_seen.load(Ordering::Relaxed),
+        )
     }
 
     pub fn is_disabled_by_system(&self) -> bool {
@@ -130,6 +146,85 @@ impl Capture {
     }
 }
 
+/// Решает, что делать по текущему набору зажатых клавиш.
+///
+/// Вынесено из замыкания тапа отдельно от него: без разрешения
+/// «Универсальный доступ» тап не поднимается, и проверить решения вручную
+/// нельзя. Здесь же они проверяются тестами.
+#[derive(Default)]
+pub struct Matcher {
+    /// Действие, уже сработавшее на текущем удержании. KeyDown у обычных
+    /// клавиш автоповторяется, и без этого действие запускалось бы очередью.
+    fired: Option<String>,
+}
+
+impl Matcher {
+    pub fn decide(
+        &mut self,
+        held: &[u16],
+        is_down: bool,
+        dictation: &Binding,
+        actions: &[(String, Binding)],
+        recording: bool,
+        toggle: bool,
+    ) -> Vec<HotKeyEvent> {
+        let matches = |b: &Binding| !b.is_empty() && b.keys.iter().all(|k| held.contains(k));
+
+        // Сочетания могут вкладываться друг в друга: правый ⌘ под диктовку и
+        // правый ⌘ + T под перевод. Побеждает самое длинное подходящее —
+        // иначе действие никогда бы не сработало.
+        let dictation_len = if matches(dictation) {
+            dictation.keys.len()
+        } else {
+            0
+        };
+        let best_action = actions
+            .iter()
+            .filter(|(_, b)| matches(b))
+            .max_by_key(|(_, b)| b.keys.len());
+        let action_len = best_action.map(|(_, b)| b.keys.len()).unwrap_or(0);
+
+        let mut out = Vec::new();
+
+        if action_len > 0 && action_len >= dictation_len {
+            if is_down {
+                if let Some((id, _)) = best_action {
+                    if self.fired.as_deref() != Some(id.as_str()) {
+                        // Диктовка успела начаться по более короткому сочетанию —
+                        // выбрасываем запись, пользователь метил в действие.
+                        if recording {
+                            out.push(HotKeyEvent::CancelRecording);
+                        }
+                        self.fired = Some(id.clone());
+                        out.push(HotKeyEvent::Action(id.clone()));
+                    }
+                }
+            }
+            return out;
+        }
+
+        // Сочетание разобрано — следующее нажатие сработает снова.
+        self.fired = None;
+
+        let active = dictation_len > 0;
+        if toggle {
+            // В Toggle реагируем только на момент сборки сочетания.
+            if active && is_down {
+                out.push(if recording {
+                    HotKeyEvent::StopRecording
+                } else {
+                    HotKeyEvent::StartRecording
+                });
+            }
+        } else if active && !recording {
+            out.push(HotKeyEvent::StartRecording);
+        } else if !active && recording {
+            out.push(HotKeyEvent::StopRecording);
+        }
+        out
+    }
+}
+
 /// Разбирает событие в «код клавиши + нажата ли она».
 /// `None` — событие не про клавишу, которую мы умеем отслеживать.
 fn decode(event_type: CGEventType, event: &core_graphics::event::CGEvent) -> Option<(u16, bool)> {
@@ -156,6 +251,7 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
         // знать, зажато ли сочетание целиком.
         let pressed: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
         let capture: Mutex<Capture> = Mutex::new(Capture::default());
+        let matcher: Mutex<Matcher> = Mutex::new(Matcher::default());
 
         let cb_state = state.clone();
         let cb_tx = tx.clone();
@@ -194,6 +290,8 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
                     }
                     set.iter().copied().collect()
                 };
+                cb_state.events_seen.fetch_add(1, Ordering::Relaxed);
+                *cb_state.held_now.lock().unwrap() = held.clone();
 
                 if cb_state.is_capturing() {
                     if let Some(keys) = capture.lock().unwrap().update(&held, is_down) {
@@ -207,25 +305,8 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
                 let binding = cb_state.binding.lock().unwrap().clone();
                 let actions = cb_state.actions.lock().unwrap().clone();
 
-                let matches =
-                    |b: &Binding| !b.is_empty() && b.keys.iter().all(|k| held.contains(k));
-
-                // Сочетания могут вкладываться друг в друга: правый ⌘ под
-                // диктовку и правый ⌘ + T под перевод. Побеждает самое длинное
-                // подходящее — иначе действие никогда бы не сработало.
-                let dictation_len = if matches(&binding) {
-                    binding.keys.len()
-                } else {
-                    0
-                };
-                let best_action = actions
-                    .iter()
-                    .filter(|(_, b)| matches(b))
-                    .max_by_key(|(_, b)| b.keys.len());
-                let action_len = best_action.map(|(_, b)| b.keys.len()).unwrap_or(0);
-
-                // Клавиша из любого нашего сочетания — кандидат на проглатывание.
-                // Остальная клавиатура не затрагивается.
+                // Клавиша из любого нашего сочетания — кандидат на
+                // проглатывание. Остальная клавиатура не затрагивается.
                 let swallow = cb_state.swallow.load(Ordering::Relaxed)
                     && (binding.keys.contains(&code)
                         || actions.iter().any(|(_, b)| b.keys.contains(&code)));
@@ -233,33 +314,15 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
                 let recording = cb_state.recording.load(Ordering::Relaxed);
                 let toggle = cb_state.mode.load(Ordering::Relaxed) == 1;
 
-                if action_len > 0 && action_len >= dictation_len {
-                    if is_down {
-                        // Диктовка успела начаться по более короткому сочетанию —
-                        // выбрасываем запись, пользователь метил в действие.
-                        if recording {
-                            let _ = cb_tx.send(HotKeyEvent::CancelRecording);
-                        }
-                        if let Some((id, _)) = best_action {
-                            let _ = cb_tx.send(HotKeyEvent::Action(id.clone()));
-                        }
+                let events = matcher
+                    .lock()
+                    .unwrap()
+                    .decide(&held, is_down, &binding, &actions, recording, toggle);
+                for event in events {
+                    if let HotKeyEvent::Action(id) = &event {
+                        log::info!("сработало действие {id}");
                     }
-                } else {
-                    let active = dictation_len > 0;
-                    if toggle {
-                        // В Toggle реагируем только на момент сборки сочетания.
-                        if active && is_down {
-                            let _ = cb_tx.send(if recording {
-                                HotKeyEvent::StopRecording
-                            } else {
-                                HotKeyEvent::StartRecording
-                            });
-                        }
-                    } else if active && !recording {
-                        let _ = cb_tx.send(HotKeyEvent::StartRecording);
-                    } else if !active && recording {
-                        let _ = cb_tx.send(HotKeyEvent::StopRecording);
-                    }
+                    let _ = cb_tx.send(event);
                 }
 
                 if swallow {
@@ -299,7 +362,137 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
 
 #[cfg(test)]
 mod tests {
-    use super::Capture;
+    use super::{Binding, Capture, HotKeyEvent, Matcher};
+
+    const L_CMD: u16 = 55;
+    const L_OPT: u16 = 58;
+    const R_CMD: u16 = 54;
+    const KEY_C: u16 = 8;
+    const SPACE: u16 = 49;
+
+    fn actions(pairs: &[(&str, &[u16])]) -> Vec<(String, Binding)> {
+        pairs
+            .iter()
+            .map(|(id, keys)| (id.to_string(), Binding::new(keys.to_vec())))
+            .collect()
+    }
+
+    /// ⌘ + ⌥ + C — сочетание из трёх клавиш, оканчивающееся обычной.
+    /// Именно на нём приложение молчало.
+    #[test]
+    fn действие_из_трёх_клавиш_срабатывает() {
+        let mut m = Matcher::default();
+        let dict = Binding::new(vec![R_CMD]);
+        let acts = actions(&[("перевод", &[L_CMD, L_OPT, KEY_C])]);
+
+        assert!(m
+            .decide(&[L_CMD], true, &dict, &acts, false, false)
+            .is_empty());
+        assert!(m
+            .decide(&[L_CMD, L_OPT], true, &dict, &acts, false, false)
+            .is_empty());
+        assert_eq!(
+            m.decide(&[KEY_C, L_CMD, L_OPT], true, &dict, &acts, false, false),
+            vec![HotKeyEvent::Action("перевод".into())]
+        );
+    }
+
+    /// ⌥ + пробел — второе сочетание, на котором ничего не происходило.
+    #[test]
+    fn действие_из_двух_клавиш_срабатывает() {
+        let mut m = Matcher::default();
+        let dict = Binding::new(vec![R_CMD]);
+        let acts = actions(&[("правка", &[L_OPT, SPACE])]);
+
+        assert!(m
+            .decide(&[L_OPT], true, &dict, &acts, false, false)
+            .is_empty());
+        assert_eq!(
+            m.decide(&[L_OPT, SPACE], true, &dict, &acts, false, false),
+            vec![HotKeyEvent::Action("правка".into())]
+        );
+    }
+
+    /// Автоповтор KeyDown не должен запускать действие очередью.
+    #[test]
+    fn автоповтор_не_повторяет_действие() {
+        let mut m = Matcher::default();
+        let dict = Binding::new(vec![R_CMD]);
+        let acts = actions(&[("перевод", &[L_OPT, SPACE])]);
+
+        assert_eq!(
+            m.decide(&[L_OPT, SPACE], true, &dict, &acts, false, false)
+                .len(),
+            1
+        );
+        assert!(m
+            .decide(&[L_OPT, SPACE], true, &dict, &acts, false, false)
+            .is_empty());
+        assert!(m
+            .decide(&[L_OPT, SPACE], true, &dict, &acts, false, false)
+            .is_empty());
+
+        // Отпустили и нажали снова — срабатывает опять.
+        m.decide(&[], false, &dict, &acts, false, false);
+        assert_eq!(
+            m.decide(&[L_OPT, SPACE], true, &dict, &acts, false, false)
+                .len(),
+            1
+        );
+    }
+
+    /// Вложенные сочетания: правый ⌘ под диктовку, правый ⌘ + C под действие.
+    #[test]
+    fn длинное_сочетание_побеждает_короткое() {
+        let mut m = Matcher::default();
+        let dict = Binding::new(vec![R_CMD]);
+        let acts = actions(&[("перевод", &[R_CMD, KEY_C])]);
+
+        assert_eq!(
+            m.decide(&[R_CMD], true, &dict, &acts, false, false),
+            vec![HotKeyEvent::StartRecording]
+        );
+        // Запись уже идёт — её надо отменить, пользователь метил в действие.
+        assert_eq!(
+            m.decide(&[KEY_C, R_CMD], true, &dict, &acts, true, false),
+            vec![
+                HotKeyEvent::CancelRecording,
+                HotKeyEvent::Action("перевод".into())
+            ]
+        );
+    }
+
+    /// Диктовка удержанием продолжает работать как раньше.
+    #[test]
+    fn диктовка_удержанием_работает() {
+        let mut m = Matcher::default();
+        let dict = Binding::new(vec![R_CMD]);
+        let acts: Vec<(String, Binding)> = Vec::new();
+
+        assert_eq!(
+            m.decide(&[R_CMD], true, &dict, &acts, false, false),
+            vec![HotKeyEvent::StartRecording]
+        );
+        assert_eq!(
+            m.decide(&[], false, &dict, &acts, true, false),
+            vec![HotKeyEvent::StopRecording]
+        );
+    }
+
+    /// Посторонние клавиши не должны ничего запускать.
+    #[test]
+    fn чужие_клавиши_игнорируются() {
+        let mut m = Matcher::default();
+        let dict = Binding::new(vec![R_CMD]);
+        let acts = actions(&[("перевод", &[L_CMD, L_OPT, KEY_C])]);
+
+        assert!(m
+            .decide(&[L_CMD, KEY_C], true, &dict, &acts, false, false)
+            .is_empty());
+        assert!(m
+            .decide(&[SPACE], true, &dict, &acts, false, false)
+            .is_empty());
+    }
 
     /// Три клавиши, нажатые по очереди, должны дойти все.
     #[test]

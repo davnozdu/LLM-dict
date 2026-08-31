@@ -174,6 +174,10 @@ pub struct Config {
     /// Заполняется только при включённом `general.key_in_config`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub api_key: String,
+    /// Ключи поставщиков, когда они хранятся в файле, а не в связке ключей.
+    /// Ключ словаря — имя записи поставщика.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub provider_keys: std::collections::BTreeMap<String, String>,
 }
 
 /// Языки: 25 европейских из Parakeet TDT v3 плюс те, что часто нужны и
@@ -283,10 +287,45 @@ impl Config {
 impl Config {
     /// Читает ключ оттуда, куда его положили настройки.
     pub fn load_api_key(&self) -> String {
+        self.key_for("groq_api_key")
+    }
+
+    /// Ключ поставщика: из файла настроек или из связки ключей — смотря что
+    /// выбрано. Раньше действия ходили только в связку и не видели ключ,
+    /// положенный в файл.
+    pub fn key_for(&self, account: &str) -> String {
         if self.general.key_in_config {
-            self.api_key.clone()
+            if let Some(key) = self.provider_keys.get(account) {
+                return key.clone();
+            }
+            // Ключ Groq лежал в отдельном поле до появления словаря.
+            if account == "groq_api_key" {
+                return self.api_key.clone();
+            }
+            return String::new();
+        }
+        secrets::get(account).unwrap_or_default()
+    }
+
+    pub fn set_key_for(&mut self, account: &str, value: &str) -> anyhow::Result<()> {
+        if self.general.key_in_config {
+            let _ = secrets::set(account, "");
+            if value.is_empty() {
+                self.provider_keys.remove(account);
+            } else {
+                self.provider_keys
+                    .insert(account.to_string(), value.to_string());
+            }
+            if account == "groq_api_key" {
+                self.api_key = value.to_string();
+            }
+            Ok(())
         } else {
-            secrets::get("groq_api_key").unwrap_or_default()
+            self.provider_keys.remove(account);
+            if account == "groq_api_key" {
+                self.api_key.clear();
+            }
+            secrets::set(account, value)
         }
     }
 }

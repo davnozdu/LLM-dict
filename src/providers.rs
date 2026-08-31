@@ -177,6 +177,7 @@ pub fn post_process(cfg: &LlmConfig, api_key: &str, text: &str) -> Result<String
 /// Используется действиями над выделенным текстом.
 pub fn run_prompt(
     endpoint: &crate::provider::Endpoint,
+    api_key: &str,
     system_prompt: &str,
     text: &str,
 ) -> Result<String> {
@@ -190,8 +191,7 @@ pub fn run_prompt(
             endpoint.provider.label()
         );
     }
-    let api_key = endpoint.api_key();
-    require_key(&api_key, &base_url)?;
+    require_key(api_key, &base_url)?;
 
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let payload = serde_json::json!({
@@ -205,7 +205,7 @@ pub fn run_prompt(
 
     let mut req = client()?.post(&url).json(&payload);
     if !api_key.is_empty() {
-        req = req.bearer_auth(&api_key);
+        req = req.bearer_auth(api_key);
     }
     let resp = req.send()?;
     let status = resp.status();

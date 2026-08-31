@@ -16,6 +16,7 @@ mod insert;
 mod logging;
 mod macos;
 mod models;
+mod overlay;
 mod permissions;
 mod provider;
 mod providers;
@@ -93,12 +94,56 @@ fn run_bench(path: &str, language: Option<&str>) -> eframe::Result<()> {
     Ok(())
 }
 
+/// Прогоняет действие над заданным текстом, минуя горячие клавиши и буфер.
+///
+/// Отвечает на вопрос «дело в клавишах или в самом запросе к модели»: здесь
+/// не нужны ни разрешения, ни выделение — только поставщик, модель и ключ.
+fn run_action_test(name: &str, text: &str) -> eframe::Result<()> {
+    let cfg = config::Config::load().normalized();
+    let Some(action) = cfg
+        .actions
+        .iter()
+        .find(|a| a.name.eq_ignore_ascii_case(name) || a.id == name)
+    else {
+        eprintln!("не найдено действие «{name}». Есть такие:");
+        for a in &cfg.actions {
+            eprintln!("  — {}", a.name);
+        }
+        std::process::exit(1);
+    };
+
+    println!(
+        "Действие: {}\nПоставщик: {} ({})\nМодель: {}\n",
+        action.name,
+        action.endpoint.provider.label(),
+        action.endpoint.base_url(),
+        action.endpoint.model
+    );
+
+    let started = std::time::Instant::now();
+    let key = action.endpoint.api_key(&cfg);
+    match providers::run_prompt(&action.endpoint, &key, &action.prompt, text) {
+        Ok(result) => println!(
+            "Готово за {:.2} с:\n{result}",
+            started.elapsed().as_secs_f32()
+        ),
+        Err(e) => {
+            eprintln!("Ошибка: {e}");
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
 fn main() -> eframe::Result<()> {
     logging::init();
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 3 && args[1] == "--bench" {
         return run_bench(&args[2], args.get(3).map(|s| s.as_str()));
+    }
+    if args.len() >= 4 && args[1] == "--test-action" {
+        return run_action_test(&args[2], &args[3]);
     }
 
     let cfg = config::Config::load().normalized();
@@ -128,6 +173,10 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             fonts::install(&cc.egui_ctx);
             macos::set_dock_visible(show_in_dock);
+            // Рабочие потоки должны уметь разбудить интерфейс: пока окно
+            // скрыто, eframe сам кадры не выполняет, а плашку рисовать надо.
+            let ctx = cc.egui_ctx.clone();
+            shared.set_wake(Box::new(move || ctx.request_repaint()));
             Ok(Box::new(app::App::new(Arc::clone(&shared))))
         }),
     )

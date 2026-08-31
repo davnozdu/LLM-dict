@@ -120,11 +120,13 @@ impl Endpoint {
         }
     }
 
-    pub fn api_key(&self) -> String {
+    /// Ключ берётся через настройки: они знают, лежит он в связке ключей
+    /// или в файле.
+    pub fn api_key(&self, cfg: &crate::config::Config) -> String {
         if !self.provider.needs_key() {
             return String::new();
         }
-        crate::config::secrets::get(self.provider.key_account()).unwrap_or_default()
+        cfg.key_for(self.provider.key_account())
     }
 
     /// Сменить поставщика: адрес-переопределение и модель от прежнего
