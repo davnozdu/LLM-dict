@@ -27,7 +27,7 @@ use std::sync::Arc;
 /// оценками по описаниям моделей. Заодно это самая быстрая проверка, что
 /// движок вообще заводится, — без запуска интерфейса и микрофона.
 fn run_bench(path: &str, language: Option<&str>) -> eframe::Result<()> {
-    let mut cfg = config::Config::load();
+    let mut cfg = config::Config::load().normalized();
     if let Some(lang) = language {
         cfg.stt.language = lang.to_string();
     }
@@ -98,7 +98,7 @@ fn main() -> eframe::Result<()> {
         return run_bench(&args[2], args.get(3).map(|s| s.as_str()));
     }
 
-    let cfg = config::Config::load();
+    let cfg = config::Config::load().normalized();
     let show_in_dock = cfg.general.show_in_dock;
     let shared = engine::Shared::new(cfg);
 

@@ -80,8 +80,10 @@ pub fn transcribe(cfg: &SttConfig, api_key: &str, wav: Vec<u8>) -> Result<String
         .text("model", cfg.model.clone())
         .text("response_format", "json");
 
-    if !cfg.language.trim().is_empty() {
-        form = form.text("language", cfg.language.trim().to_string());
+    // «auto» — это отсутствие параметра: сервис определит язык сам.
+    let lang = crate::config::normalize_language(&cfg.language);
+    if lang != "auto" {
+        form = form.text("language", lang.to_string());
     }
     if !cfg.prompt.trim().is_empty() {
         form = form.text("prompt", cfg.prompt.trim().to_string());

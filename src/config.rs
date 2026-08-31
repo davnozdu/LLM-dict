@@ -59,7 +59,7 @@ pub struct SttConfig {
     /// OpenAI-совместимый эндпоинт. Для локального сервера поменять на http://localhost:...
     pub base_url: String,
     pub model: String,
-    /// Пустая строка — автоопределение.
+    /// Код языка или `auto`. Parakeet его игнорирует — он всегда определяет сам.
     pub language: String,
     /// Подсказка для whisper: имена, термины, стиль пунктуации.
     pub prompt: String,
@@ -77,7 +77,7 @@ impl Default for SttConfig {
             fallback: None,
             base_url: "https://api.groq.com/openai/v1".into(),
             model: "whisper-large-v3-turbo".into(),
-            language: String::new(),
+            language: "ru".into(),
             prompt: String::new(),
             whisper_model: "whisper-large-v3-turbo-q5".into(),
             parakeet_model: "parakeet-tdt-0.6b-v3-int8".into(),
@@ -170,6 +170,61 @@ pub struct Config {
     pub api_key: String,
 }
 
+/// Языки: 25 европейских из Parakeet TDT v3 плюс те, что часто нужны и
+/// поддерживаются Whisper с облаком. Первым идёт автоопределение.
+pub const LANGUAGES: &[(&str, &str)] = &[
+    ("auto", "Автоопределение"),
+    ("ru", "Русский"),
+    ("en", "English"),
+    ("uk", "Українська"),
+    ("de", "Deutsch"),
+    ("fr", "Français"),
+    ("es", "Español"),
+    ("it", "Italiano"),
+    ("pt", "Português"),
+    ("nl", "Nederlands"),
+    ("pl", "Polski"),
+    ("cs", "Čeština"),
+    ("sk", "Slovenčina"),
+    ("sl", "Slovenščina"),
+    ("hr", "Hrvatski"),
+    ("bg", "Български"),
+    ("ro", "Română"),
+    ("hu", "Magyar"),
+    ("el", "Ελληνικά"),
+    ("sv", "Svenska"),
+    ("da", "Dansk"),
+    ("fi", "Suomi"),
+    ("et", "Eesti"),
+    ("lv", "Latviešu"),
+    ("lt", "Lietuvių"),
+    ("mt", "Malti"),
+    ("tr", "Türkçe"),
+    ("he", "עברית"),
+    ("ar", "العربية"),
+    ("zh", "中文"),
+    ("ja", "日本語"),
+    ("ko", "한국어"),
+];
+
+pub fn language_name(code: &str) -> String {
+    LANGUAGES
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, name)| name.to_string())
+        .unwrap_or_else(|| format!("код «{code}»"))
+}
+
+/// Язык не задан — значит автоопределение. Пустую строку из старых конфигов
+/// приводим к явному `auto`, чтобы дальше был один вариант вместо двух.
+pub fn normalize_language(code: &str) -> &str {
+    if code.trim().is_empty() {
+        "auto"
+    } else {
+        code.trim()
+    }
+}
+
 pub fn config_dir() -> PathBuf {
     directories::ProjectDirs::from("com", "davnozdu", "LLM-dict")
         .map(|d| d.config_dir().to_path_buf())
@@ -196,6 +251,12 @@ impl Config {
             },
             Err(_) => Config::default(),
         }
+    }
+
+    /// Приводит поля к каноническому виду после чтения с диска.
+    pub fn normalized(mut self) -> Self {
+        self.stt.language = normalize_language(&self.stt.language).to_string();
+        self
     }
 
     pub fn save(&self) -> Result<()> {

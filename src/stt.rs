@@ -110,8 +110,7 @@ impl LocalEngines {
                 // Без явного языка whisper-rs декодирует как английский, а не
                 // определяет сам: русская речь превращалась в смесь латиницы
                 // с кириллицей, а короткие фразы — в пустую строку.
-                let lang = language.trim();
-                params.set_language(Some(if lang.is_empty() { "auto" } else { lang }));
+                params.set_language(Some(crate::config::normalize_language(language)));
 
                 state
                     .full(params, samples)

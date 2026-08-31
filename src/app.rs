@@ -835,14 +835,31 @@ impl App {
             );
 
             ui.add_space(10.0);
-            labeled(ui, "Язык", |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.cfg.stt.language)
-                        .desired_width(120.0)
-                        .hint_text("авто"),
-                );
-                ui.weak("код вида ru, en; пусто — определять самому");
+            labeled(ui, "Язык речи", |ui| {
+                egui::ComboBox::from_id_salt("stt_lang")
+                    .width(220.0)
+                    .selected_text(crate::config::language_name(&self.cfg.stt.language))
+                    .show_ui(ui, |ui| {
+                        for (code, name) in crate::config::LANGUAGES {
+                            ui.selectable_value(
+                                &mut self.cfg.stt.language,
+                                code.to_string(),
+                                *name,
+                            );
+                        }
+                    });
             });
+            if self.cfg.stt.engine == Engine::Parakeet {
+                ui.weak(
+                    "Parakeet определяет язык сам и выбор здесь не учитывает — \
+                     он влияет на облако и на Whisper.",
+                );
+            } else if self.cfg.stt.language == "auto" {
+                ui.weak(
+                    "Автоопределение стоит лишнего прохода по записи и иногда ошибается \
+                     на коротких фразах. Если язык всегда один, укажите его явно.",
+                );
+            }
 
             // --- облако ---
             ui.add_space(10.0);
