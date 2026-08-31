@@ -1,5 +1,6 @@
 //! Окно настроек, статуса и истории.
 
+use crate::actions::{Output, TextAction};
 use crate::binding::Binding;
 use crate::config::{secrets, Config, HotKeyMode, PostMode};
 use crate::engine::{self, Shared, Stage};
@@ -7,7 +8,9 @@ use crate::history;
 use crate::insert;
 use crate::models::{self, Engine};
 use crate::permissions;
+use crate::provider::{Endpoint, Provider};
 use crate::{autostart, conflicts, macos, providers, updater};
+use std::collections::HashMap;
 
 use eframe::egui;
 use std::sync::atomic::Ordering;
@@ -20,6 +23,7 @@ use tray_icon::{TrayIcon, TrayIconBuilder};
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Tab {
     Status,
+    Actions,
     Settings,
     History,
     Clipboard,
@@ -63,7 +67,20 @@ pub struct App {
     key_synced: bool,
     /// Идущая загрузка модели: её id, прогресс и канал с результатом.
     download: Option<Download>,
+    /// Какое действие сейчас раскрыто в редакторе.
+    editing_action: Option<String>,
+    /// Для какого действия набирается сочетание.
+    capturing_action: Option<String>,
+    /// Списки моделей, считанные с поставщиков.
+    provider_models: HashMap<Provider, Vec<String>>,
+    /// Идущее чтение списка моделей.
+    model_fetch: Option<ModelFetch>,
+    /// Ключи поставщиков в полях ввода.
+    provider_keys: HashMap<Provider, String>,
 }
+
+/// Идущее чтение списка моделей с одного поставщика.
+type ModelFetch = (Provider, Receiver<Result<Vec<String>, String>>);
 
 struct Download {
     model_id: String,
@@ -111,6 +128,11 @@ impl App {
             duplicates_checked: Instant::now() - Duration::from_secs(60),
             key_synced: false,
             download: None,
+            editing_action: None,
+            capturing_action: None,
+            provider_models: HashMap::new(),
+            model_fetch: None,
+            provider_keys: HashMap::new(),
         }
     }
 
@@ -139,6 +161,7 @@ impl App {
         let (r, g, b) = match stage {
             Stage::Idle => (140u8, 140u8, 140u8),
             Stage::LoadingModel => (150, 120, 200),
+            Stage::ActionRunning => (90, 140, 240),
             Stage::Recording => (230, 60, 60),
             Stage::Transcribing => (230, 160, 40),
             Stage::PostProcessing => (90, 140, 240),
@@ -330,20 +353,56 @@ impl App {
     /// приложения закрыто. Окно не активируется и не перехватывает мышь,
     /// иначе оно уводило бы фокус из программы, куда мы собираемся вставлять.
     fn draw_overlay(&self, ctx: &egui::Context) {
-        let stage = self.shared.stage();
-        if !self.cfg.general.show_overlay || !stage.is_busy() {
+        if !self.cfg.general.show_overlay {
             return;
         }
+        let stage = self.shared.stage();
+        let notice = self.shared.notice();
+
+        // Плашка нужна и во время работы, и чтобы сказать, что результат готов:
+        // окно приложения обычно закрыто, а системные уведомления требуют
+        // отдельного разрешения и теряются в центре уведомлений.
+        let (dot, text, show_level) = match (&notice, stage) {
+            (Some(msg), _) => (egui::Color32::from_rgb(60, 190, 110), msg.clone(), false),
+            (None, Stage::Recording) => (
+                egui::Color32::from_rgb(235, 70, 70),
+                "слушаю".to_string(),
+                true,
+            ),
+            (None, Stage::LoadingModel) => (
+                egui::Color32::from_rgb(150, 120, 200),
+                "гружу модель".to_string(),
+                false,
+            ),
+            (None, Stage::Transcribing) => (
+                egui::Color32::from_rgb(235, 165, 45),
+                "распознаю".to_string(),
+                false,
+            ),
+            (None, Stage::PostProcessing) | (None, Stage::ActionRunning) => (
+                egui::Color32::from_rgb(95, 145, 245),
+                "обрабатываю".to_string(),
+                false,
+            ),
+            (None, Stage::Inserting) => (
+                egui::Color32::from_rgb(65, 195, 115),
+                "вставляю".to_string(),
+                false,
+            ),
+            (None, Stage::Idle) => return,
+        };
+
         let Some((mx, my)) = macos::cursor_position() else {
             return;
         };
-        let size = egui::vec2(132.0, 34.0);
+        // Ширина по длине надписи: «перевод в буфере» не должен обрезаться.
+        let width = (text.chars().count() as f32 * 7.5 + 56.0).clamp(120.0, 420.0);
+        let size = egui::vec2(width, 34.0);
         let pos = egui::pos2(mx - size.x / 2.0, my - size.y - 22.0);
-
         let level = self.shared.level.get();
-        let id = egui::ViewportId::from_hash_of("llm_dict_overlay");
+
         ctx.show_viewport_deferred(
-            id,
+            egui::ViewportId::from_hash_of("llm_dict_overlay"),
             egui::ViewportBuilder::default()
                 .with_title("LLM-dict")
                 .with_inner_size(size)
@@ -357,14 +416,6 @@ impl App {
                 .with_active(false)
                 .with_has_shadow(false),
             move |ctx, _class| {
-                let (dot, text) = match stage {
-                    Stage::LoadingModel => (egui::Color32::from_rgb(150, 120, 200), "гружу модель"),
-                    Stage::Recording => (egui::Color32::from_rgb(235, 70, 70), "слушаю"),
-                    Stage::Transcribing => (egui::Color32::from_rgb(235, 165, 45), "распознаю"),
-                    Stage::PostProcessing => (egui::Color32::from_rgb(95, 145, 245), "обрабатываю"),
-                    Stage::Inserting => (egui::Color32::from_rgb(65, 195, 115), "вставляю"),
-                    Stage::Idle => (egui::Color32::GRAY, ""),
-                };
                 let frame = egui::Frame::NONE
                     .fill(egui::Color32::from_rgba_unmultiplied(28, 28, 32, 235))
                     .corner_radius(egui::CornerRadius::same(17))
@@ -376,21 +427,25 @@ impl App {
                             ui.horizontal(|ui| {
                                 // Кружок пульсирует в такт громкости — сразу
                                 // видно, что микрофон действительно слышит.
-                                let pulse = 4.0 + level.clamp(0.0, 1.0) * 4.0;
+                                let pulse = if show_level {
+                                    4.0 + level.clamp(0.0, 1.0) * 4.0
+                                } else {
+                                    5.0
+                                };
                                 let (rect, _) = ui.allocate_exact_size(
                                     egui::vec2(pulse * 2.0 + 4.0, pulse * 2.0 + 4.0),
                                     egui::Sense::hover(),
                                 );
                                 ui.painter().circle_filled(rect.center(), pulse, dot);
                                 ui.label(
-                                    egui::RichText::new(text)
+                                    egui::RichText::new(&text)
                                         .color(egui::Color32::from_gray(235))
                                         .size(13.0),
                                 );
                             });
                         });
                     });
-                ctx.request_repaint_after(Duration::from_millis(50));
+                ctx.request_repaint_after(Duration::from_millis(60));
             },
         );
     }
@@ -477,6 +532,7 @@ impl eframe::App for App {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Status, "Статус");
+                ui.selectable_value(&mut self.tab, Tab::Actions, "Действия");
                 ui.selectable_value(&mut self.tab, Tab::Settings, "Настройки");
                 ui.selectable_value(&mut self.tab, Tab::History, "История");
                 ui.selectable_value(&mut self.tab, Tab::Clipboard, "Буфер");
@@ -498,6 +554,7 @@ impl eframe::App for App {
                 let dot = match stage {
                     Stage::Idle => egui::Color32::from_gray(140),
                     Stage::LoadingModel => egui::Color32::from_rgb(150, 120, 200),
+                    Stage::ActionRunning => egui::Color32::from_rgb(90, 140, 240),
                     Stage::Recording => egui::Color32::from_rgb(230, 60, 60),
                     Stage::Transcribing => egui::Color32::from_rgb(230, 160, 40),
                     Stage::PostProcessing => egui::Color32::from_rgb(90, 140, 240),
@@ -525,6 +582,7 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
             Tab::Status => self.ui_status(ui),
+            Tab::Actions => self.ui_actions(ui),
             Tab::Settings => self.ui_settings(ui),
             Tab::History => self.ui_history(ui),
             Tab::Clipboard => self.ui_clipboard(ui),
@@ -1096,6 +1154,336 @@ impl App {
         }
 
         ui.weak(format!("Папка моделей: {}", models::models_dir().display()));
+    }
+
+    fn poll_model_fetch(&mut self) {
+        let Some((provider, rx)) = &self.model_fetch else {
+            return;
+        };
+        let provider = *provider;
+        match rx.try_recv() {
+            Ok(Ok(models)) => {
+                let n = models.len();
+                self.provider_models.insert(provider, models);
+                self.toast(format!("{}: моделей {n}", provider.label()));
+                self.model_fetch = None;
+            }
+            Ok(Err(e)) => {
+                self.toast(format!("{}: {e}", provider.label()));
+                self.model_fetch = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.model_fetch = None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    fn fetch_models(&mut self, endpoint: &Endpoint) {
+        let provider = endpoint.provider;
+        let base_url = endpoint.base_url();
+        let key = self
+            .provider_keys
+            .get(&provider)
+            .cloned()
+            .unwrap_or_else(|| endpoint.api_key());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(providers::list_models(&base_url, &key).map_err(|e| e.to_string()));
+        });
+        self.model_fetch = Some((provider, rx));
+        self.toast(format!("Читаю модели с {}…", provider.label()));
+    }
+
+    /// Ключ поставщика: поле, кнопка сохранения и ссылка, где его взять.
+    fn ui_provider_key(&mut self, ui: &mut egui::Ui, provider: Provider) {
+        if !provider.needs_key() {
+            ui.weak("Ollama работает локально, ключ не нужен.");
+            return;
+        }
+        let entry = self.provider_keys.entry(provider).or_insert_with(|| {
+            crate::config::secrets::get(provider.key_account()).unwrap_or_default()
+        });
+        let mut value = entry.clone();
+        let hint = if value.is_empty() {
+            "не задан"
+        } else {
+            ""
+        };
+
+        ui.horizontal(|ui| {
+            ui.label("Ключ:");
+            ui.add(
+                egui::TextEdit::singleline(&mut value)
+                    .password(true)
+                    .desired_width(260.0)
+                    .hint_text(hint),
+            );
+        });
+        self.provider_keys.insert(provider, value.clone());
+
+        ui.horizontal(|ui| {
+            if ui.button("Сохранить ключ").clicked() {
+                match crate::config::secrets::set(provider.key_account(), value.trim()) {
+                    Ok(()) => self.toast(format!("Ключ {} сохранён", provider.label())),
+                    Err(e) => self.toast(format!("Keychain: {e}")),
+                }
+            }
+            if let Some(url) = provider.key_url() {
+                if ui.button("Где взять").clicked() {
+                    let _ = open::that(url);
+                }
+            }
+        });
+    }
+
+    fn ui_actions(&mut self, ui: &mut egui::Ui) {
+        self.poll_model_fetch();
+
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Действия над выделенным текстом").strong());
+        ui.weak(
+            "Выделяете текст, нажимаете сочетание — результат ложится в буфер обмена, \
+             и у курсора появляется плашка «в буфере». Вставляете сами, ⌘V.",
+        );
+        ui.add_space(8.0);
+
+        if ui.button("＋ Новое действие").clicked() {
+            let action = TextAction::default();
+            self.editing_action = Some(action.id.clone());
+            self.cfg.actions.push(action);
+        }
+        ui.add_space(6.0);
+
+        let ids: Vec<String> = self.cfg.actions.iter().map(|a| a.id.clone()).collect();
+        let mut to_remove: Option<String> = None;
+        let mut to_move: Option<(usize, isize)> = None;
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for (index, id) in ids.iter().enumerate() {
+                let Some(pos) = self.cfg.actions.iter().position(|a| &a.id == id) else {
+                    continue;
+                };
+                let expanded = self.editing_action.as_deref() == Some(id.as_str());
+
+                ui.push_id(id, |ui| {
+                    ui.horizontal(|ui| {
+                        let enabled = self.cfg.actions[pos].enabled;
+                        let mut e = enabled;
+                        if ui.checkbox(&mut e, "").changed() {
+                            self.cfg.actions[pos].enabled = e;
+                        }
+                        let name = self.cfg.actions[pos].name.clone();
+                        let hotkey = self.cfg.actions[pos].hotkey.clone();
+                        let title = if hotkey.is_empty() {
+                            format!("{name}  —  сочетание не задано")
+                        } else {
+                            format!("{name}  —  {}", hotkey.label())
+                        };
+                        if ui.selectable_label(expanded, title).clicked() {
+                            self.editing_action = if expanded { None } else { Some(id.clone()) };
+                        }
+                        if index > 0 && ui.small_button("↑").clicked() {
+                            to_move = Some((pos, -1));
+                        }
+                        if index + 1 < ids.len() && ui.small_button("↓").clicked() {
+                            to_move = Some((pos, 1));
+                        }
+                        if ui.small_button("Удалить").clicked() {
+                            to_remove = Some(id.clone());
+                        }
+                    });
+
+                    if expanded {
+                        ui.add_space(4.0);
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            self.ui_action_editor(ui, pos);
+                        });
+                        ui.add_space(6.0);
+                    }
+                });
+            }
+        });
+
+        if let Some((pos, delta)) = to_move {
+            let target = (pos as isize + delta).clamp(0, self.cfg.actions.len() as isize - 1);
+            self.cfg.actions.swap(pos, target as usize);
+        }
+        if let Some(id) = to_remove {
+            self.cfg.actions.retain(|a| a.id != id);
+            if self.editing_action.as_deref() == Some(id.as_str()) {
+                self.editing_action = None;
+            }
+            if self.capturing_action.as_deref() == Some(id.as_str()) {
+                self.set_capturing(false);
+                self.capturing_action = None;
+            }
+        }
+    }
+
+    fn ui_action_editor(&mut self, ui: &mut egui::Ui, pos: usize) {
+        let id = self.cfg.actions[pos].id.clone();
+
+        labeled(ui, "Название", |ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.cfg.actions[pos].name).desired_width(280.0),
+            );
+        });
+
+        // --- сочетание клавиш ---
+        let capturing = self.capturing_action.as_deref() == Some(id.as_str());
+        ui.horizontal(|ui| {
+            ui.add_sized([130.0, 20.0], egui::Label::new("Сочетание"));
+            if capturing {
+                let shown = if self.capture_preview.is_empty() {
+                    "нажмите клавиши…".to_string()
+                } else {
+                    Binding::new(self.capture_preview.clone()).label()
+                };
+                ui.colored_label(egui::Color32::from_rgb(90, 140, 240), shown);
+                if ui
+                    .add_enabled(!self.capture_preview.is_empty(), egui::Button::new("ОК"))
+                    .clicked()
+                {
+                    self.cfg.actions[pos].hotkey = Binding::new(self.capture_preview.clone());
+                    self.set_capturing(false);
+                    self.capturing_action = None;
+                }
+                if ui.button("Отмена").clicked() {
+                    self.set_capturing(false);
+                    self.capturing_action = None;
+                }
+            } else {
+                ui.label(self.cfg.actions[pos].hotkey.label());
+                if ui.button("Задать").clicked() {
+                    self.set_capturing(true);
+                    self.capturing_action = Some(id.clone());
+                }
+                if !self.cfg.actions[pos].hotkey.is_empty() && ui.button("Убрать").clicked() {
+                    self.cfg.actions[pos].hotkey = Binding::new(Vec::new());
+                }
+            }
+        });
+
+        // Сочетание действия не должно совпадать с диктовкой и с другими действиями.
+        let own = self.cfg.actions[pos].hotkey.clone();
+        if !own.is_empty() {
+            if own == self.cfg.general.hotkey {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 80, 80),
+                    "✖ совпадает с сочетанием диктовки",
+                );
+            } else if let Some(other) = self
+                .cfg
+                .actions
+                .iter()
+                .enumerate()
+                .find(|(i, a)| *i != pos && a.hotkey == own && !a.hotkey.is_empty())
+            {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 80, 80),
+                    format!("✖ совпадает с действием «{}»", other.1.name),
+                );
+            } else {
+                match conflicts::check(&own) {
+                    conflicts::Verdict::Free => {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(60, 160, 90),
+                            "✔ сочетание свободно",
+                        );
+                    }
+                    conflicts::Verdict::Taken(why) => {
+                        ui.colored_label(egui::Color32::from_rgb(220, 80, 80), format!("✖ {why}"));
+                    }
+                    conflicts::Verdict::Risky(why) => {
+                        ui.colored_label(egui::Color32::from_rgb(220, 130, 40), format!("⚠ {why}"));
+                    }
+                }
+            }
+        }
+
+        // --- поставщик и модель ---
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.add_sized([130.0, 20.0], egui::Label::new("Поставщик"));
+            let mut provider = self.cfg.actions[pos].endpoint.provider;
+            egui::ComboBox::from_id_salt(format!("prov-{id}"))
+                .width(200.0)
+                .selected_text(provider.label())
+                .show_ui(ui, |ui| {
+                    for p in Provider::ALL {
+                        ui.selectable_value(&mut provider, p, p.label());
+                    }
+                });
+            self.cfg.actions[pos].endpoint.set_provider(provider);
+        });
+
+        let provider = self.cfg.actions[pos].endpoint.provider;
+        if provider == Provider::Custom
+            || !self.cfg.actions[pos].endpoint.base_url_override.is_empty()
+        {
+            labeled(ui, "Адрес API", |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(
+                        &mut self.cfg.actions[pos].endpoint.base_url_override,
+                    )
+                    .desired_width(320.0)
+                    .hint_text(provider.default_base_url()),
+                );
+            });
+        }
+
+        ui.horizontal(|ui| {
+            ui.add_sized([130.0, 20.0], egui::Label::new("Модель"));
+            let known = self
+                .provider_models
+                .get(&provider)
+                .cloned()
+                .unwrap_or_default();
+            if known.is_empty() {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.cfg.actions[pos].endpoint.model)
+                        .desired_width(240.0),
+                );
+            } else {
+                let current = self.cfg.actions[pos].endpoint.model.clone();
+                egui::ComboBox::from_id_salt(format!("model-{id}"))
+                    .width(240.0)
+                    .selected_text(current)
+                    .show_ui(ui, |ui| {
+                        for m in &known {
+                            ui.selectable_value(
+                                &mut self.cfg.actions[pos].endpoint.model,
+                                m.clone(),
+                                m,
+                            );
+                        }
+                    });
+            }
+            if ui.button("Считать модели").clicked() {
+                let endpoint = self.cfg.actions[pos].endpoint.clone();
+                self.fetch_models(&endpoint);
+            }
+        });
+
+        ui.add_space(4.0);
+        self.ui_provider_key(ui, provider);
+
+        // --- промпт и вывод ---
+        ui.add_space(8.0);
+        ui.label("Промпт:");
+        ui.add(
+            egui::TextEdit::multiline(&mut self.cfg.actions[pos].prompt)
+                .desired_rows(4)
+                .desired_width(f32::INFINITY),
+        );
+        ui.weak("Выделенный текст приходит модели отдельным сообщением, вставлять его в промпт не нужно.");
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.add_sized([130.0, 20.0], egui::Label::new("Результат"));
+            for o in [Output::Clipboard, Output::Replace] {
+                ui.selectable_value(&mut self.cfg.actions[pos].output, o, o.label());
+            }
+        });
     }
 
     fn ui_update_block(&mut self, ui: &mut egui::Ui) {

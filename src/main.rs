@@ -1,6 +1,7 @@
 // Скрывает окно консоли — приложение фоновое.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod actions;
 mod app;
 mod audio;
 mod autostart;
@@ -15,6 +16,7 @@ mod logging;
 mod macos;
 mod models;
 mod permissions;
+mod provider;
 mod providers;
 mod stt;
 mod updater;
@@ -99,6 +101,11 @@ fn main() -> eframe::Result<()> {
     }
 
     let cfg = config::Config::load().normalized();
+    // Набор действий по умолчанию создаётся в памяти — сохраняем сразу, иначе
+    // файл настроек расходится с тем, что видит пользователь.
+    if !config::config_path().exists() {
+        let _ = cfg.save();
+    }
     let show_in_dock = cfg.general.show_in_dock;
     let shared = engine::Shared::new(cfg);
 

@@ -20,6 +20,10 @@ use std::sync::{Arc, Mutex};
 pub enum HotKeyEvent {
     StartRecording,
     StopRecording,
+    /// Запись прервана более длинным сочетанием — выбросить, не распознавая.
+    CancelRecording,
+    /// Сработало действие над текстом; внутри его идентификатор.
+    Action(String),
     /// Пользователь набирает новое сочетание в настройках.
     Captured(Vec<u16>),
 }
@@ -27,6 +31,8 @@ pub enum HotKeyEvent {
 /// Настройки, которые поток тапа перечитывает на лету, без перезапуска.
 pub struct HotKeyState {
     binding: Mutex<Binding>,
+    /// Сочетания действий над текстом: идентификатор действия и его клавиши.
+    actions: Mutex<Vec<(String, Binding)>>,
     /// 0 = Hold, 1 = Toggle
     mode: AtomicU8,
     /// Идёт ли запись прямо сейчас.
@@ -44,6 +50,7 @@ impl HotKeyState {
     pub fn new(binding: Binding, mode: HotKeyMode) -> Self {
         let s = Self {
             binding: Mutex::new(binding),
+            actions: Mutex::new(Vec::new()),
             mode: AtomicU8::new(0),
             recording: AtomicBool::new(false),
             capturing: AtomicBool::new(false),
@@ -56,6 +63,10 @@ impl HotKeyState {
 
     pub fn set_binding(&self, b: Binding) {
         *self.binding.lock().unwrap() = b;
+    }
+
+    pub fn set_actions(&self, actions: Vec<(String, Binding)>) {
+        *self.actions.lock().unwrap() = actions;
     }
 
     pub fn set_mode(&self, mode: HotKeyMode) {
@@ -165,31 +176,61 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
                 capture_best.lock().unwrap().clear();
 
                 let binding = cb_state.binding.lock().unwrap().clone();
-                if binding.is_empty() {
-                    return CallbackResult::Keep;
-                }
-                let active = binding.keys.iter().all(|k| held.contains(k));
+                let actions = cb_state.actions.lock().unwrap().clone();
 
-                // Клавиша из сочетания — кандидат на проглатывание. Отбрасываем
-                // только её события, все остальные идут дальше нетронутыми.
-                let swallow =
-                    cb_state.swallow.load(Ordering::Relaxed) && binding.keys.contains(&code);
+                let matches =
+                    |b: &Binding| !b.is_empty() && b.keys.iter().all(|k| held.contains(k));
+
+                // Сочетания могут вкладываться друг в друга: правый ⌘ под
+                // диктовку и правый ⌘ + T под перевод. Побеждает самое длинное
+                // подходящее — иначе действие никогда бы не сработало.
+                let dictation_len = if matches(&binding) {
+                    binding.keys.len()
+                } else {
+                    0
+                };
+                let best_action = actions
+                    .iter()
+                    .filter(|(_, b)| matches(b))
+                    .max_by_key(|(_, b)| b.keys.len());
+                let action_len = best_action.map(|(_, b)| b.keys.len()).unwrap_or(0);
+
+                // Клавиша из любого нашего сочетания — кандидат на проглатывание.
+                // Остальная клавиатура не затрагивается.
+                let swallow = cb_state.swallow.load(Ordering::Relaxed)
+                    && (binding.keys.contains(&code)
+                        || actions.iter().any(|(_, b)| b.keys.contains(&code)));
+
                 let recording = cb_state.recording.load(Ordering::Relaxed);
                 let toggle = cb_state.mode.load(Ordering::Relaxed) == 1;
 
-                if toggle {
-                    // В Toggle реагируем только на момент сборки сочетания.
-                    if active && is_down {
-                        let _ = cb_tx.send(if recording {
-                            HotKeyEvent::StopRecording
-                        } else {
-                            HotKeyEvent::StartRecording
-                        });
+                if action_len > 0 && action_len >= dictation_len {
+                    if is_down {
+                        // Диктовка успела начаться по более короткому сочетанию —
+                        // выбрасываем запись, пользователь метил в действие.
+                        if recording {
+                            let _ = cb_tx.send(HotKeyEvent::CancelRecording);
+                        }
+                        if let Some((id, _)) = best_action {
+                            let _ = cb_tx.send(HotKeyEvent::Action(id.clone()));
+                        }
                     }
-                } else if active && !recording {
-                    let _ = cb_tx.send(HotKeyEvent::StartRecording);
-                } else if !active && recording {
-                    let _ = cb_tx.send(HotKeyEvent::StopRecording);
+                } else {
+                    let active = dictation_len > 0;
+                    if toggle {
+                        // В Toggle реагируем только на момент сборки сочетания.
+                        if active && is_down {
+                            let _ = cb_tx.send(if recording {
+                                HotKeyEvent::StopRecording
+                            } else {
+                                HotKeyEvent::StartRecording
+                            });
+                        }
+                    } else if active && !recording {
+                        let _ = cb_tx.send(HotKeyEvent::StartRecording);
+                    } else if !active && recording {
+                        let _ = cb_tx.send(HotKeyEvent::StopRecording);
+                    }
                 }
 
                 if swallow {

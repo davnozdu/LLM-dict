@@ -133,6 +133,9 @@ pub struct GeneralConfig {
     /// источник ввода. С перехватом её обычное действие не срабатывает,
     /// пока приложение работает.
     pub swallow_hotkey: bool,
+    /// Набор действий уже создавался: пустой список после этого — выбор
+    /// пользователя, а не первый запуск.
+    pub actions_initialised: bool,
     /// Хранить ключ прямо в файле настроек, минуя Keychain.
     ///
     /// ACL записи в связке ключей привязан к подписи приложения, поэтому при
@@ -154,6 +157,7 @@ impl Default for GeneralConfig {
             show_overlay: true,
             check_updates: true,
             swallow_hotkey: false,
+            actions_initialised: false,
             key_in_config: false,
         }
     }
@@ -165,6 +169,8 @@ pub struct Config {
     pub general: GeneralConfig,
     pub stt: SttConfig,
     pub llm: LlmConfig,
+    /// Действия над выделенным текстом со своими сочетаниями клавиш.
+    pub actions: Vec<crate::actions::TextAction>,
     /// Заполняется только при включённом `general.key_in_config`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub api_key: String,
@@ -256,6 +262,12 @@ impl Config {
     /// Приводит поля к каноническому виду после чтения с диска.
     pub fn normalized(mut self) -> Self {
         self.stt.language = normalize_language(&self.stt.language).to_string();
+        // Пустой список при первом запуске заполняем набором по умолчанию,
+        // а вот осознанно вычищенный трогать нельзя — отсюда флаг.
+        if self.actions.is_empty() && !self.general.actions_initialised {
+            self.actions = crate::actions::defaults();
+            self.general.actions_initialised = true;
+        }
         self
     }
 

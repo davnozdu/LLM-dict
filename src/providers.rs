@@ -173,6 +173,57 @@ pub fn post_process(cfg: &LlmConfig, api_key: &str, text: &str) -> Result<String
         .ok_or_else(|| anyhow!("модель вернула пустой ответ"))
 }
 
+/// Один запрос к модели: системный промпт плюс текст пользователя.
+/// Используется действиями над выделенным текстом.
+pub fn run_prompt(
+    endpoint: &crate::provider::Endpoint,
+    system_prompt: &str,
+    text: &str,
+) -> Result<String> {
+    if text.trim().is_empty() {
+        bail!("нечего обрабатывать: текст пустой");
+    }
+    let base_url = endpoint.base_url();
+    if base_url.trim().is_empty() {
+        bail!(
+            "не задан адрес API для поставщика {}",
+            endpoint.provider.label()
+        );
+    }
+    let api_key = endpoint.api_key();
+    require_key(&api_key, &base_url)?;
+
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let payload = serde_json::json!({
+        "model": endpoint.model,
+        "temperature": 0.0,
+        "messages": [
+            { "role": "system", "content": system_prompt },
+            { "role": "user", "content": text }
+        ]
+    });
+
+    let mut req = client()?.post(&url).json(&payload);
+    if !api_key.is_empty() {
+        req = req.bearer_auth(&api_key);
+    }
+    let resp = req.send()?;
+    let status = resp.status();
+    let body = resp.text()?;
+    if !status.is_success() {
+        return Err(explain(status, &body, &base_url));
+    }
+    let parsed: ChatResponse =
+        serde_json::from_str(&body).map_err(|e| anyhow!("неожиданный ответ модели: {e}"))?;
+    parsed
+        .choices
+        .into_iter()
+        .next()
+        .map(|c| c.message.content.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("модель вернула пустой ответ"))
+}
+
 #[derive(Deserialize)]
 struct ModelList {
     data: Vec<ModelEntry>,
