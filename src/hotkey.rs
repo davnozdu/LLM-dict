@@ -225,21 +225,79 @@ impl Matcher {
     }
 }
 
-/// Разбирает событие в «код клавиши + нажата ли она».
-/// `None` — событие не про клавишу, которую мы умеем отслеживать.
-fn decode(event_type: CGEventType, event: &core_graphics::event::CGEvent) -> Option<(u16, bool)> {
-    let code = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
-    match event_type {
-        CGEventType::FlagsChanged => {
-            let mask = binding::modifier_flag_mask(code);
-            if mask == 0 {
-                return None;
+/// Вид события клавиатуры. Отдельно от CGEventType, чтобы разбор можно было
+/// проверить тестами, не поднимая перехватчик.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawKind {
+    FlagsChanged,
+    KeyDown,
+    KeyUp,
+    Other,
+}
+
+/// Как событие меняет набор зажатых клавиш.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyUpdate {
+    /// Полное состояние модификаторов, вычисленное из флагов события.
+    Modifiers(Vec<u16>),
+    Down(u16),
+    Up(u16),
+    Ignore,
+}
+
+/// Состояние модификаторов берётся целиком из флагов события, а не копится
+/// по одному нажатию.
+///
+/// Так набор не рассыпается, если событие потерялось, и в него не попадает
+/// Caps Lock: он переключатель, и пока включён, его флаг выставлен постоянно —
+/// код клавиши навсегда застревал в наборе и приклеивался к любому сочетанию.
+pub fn classify(kind: RawKind, code: u16, flags: u64) -> KeyUpdate {
+    match kind {
+        RawKind::FlagsChanged => KeyUpdate::Modifiers(
+            binding::HOLDABLE_MODIFIERS
+                .iter()
+                .copied()
+                .filter(|m| flags & binding::modifier_flag_mask(*m) != 0)
+                .collect(),
+        ),
+        RawKind::KeyDown if !binding::is_modifier(code) => KeyUpdate::Down(code),
+        RawKind::KeyUp if !binding::is_modifier(code) => KeyUpdate::Up(code),
+        _ => KeyUpdate::Ignore,
+    }
+}
+
+/// Зажатые клавиши: модификаторы и всё остальное учитываются по-разному.
+#[derive(Default)]
+pub struct HeldKeys {
+    modifiers: Vec<u16>,
+    regular: BTreeSet<u16>,
+}
+
+impl HeldKeys {
+    /// Применяет событие. Возвращает набор зажатых клавиш и было ли это
+    /// нажатием, либо `None`, если событие нас не касается.
+    pub fn apply(&mut self, update: KeyUpdate) -> Option<(Vec<u16>, bool)> {
+        let is_down = match update {
+            KeyUpdate::Modifiers(mods) => {
+                let pressed = mods.len() > self.modifiers.len();
+                self.modifiers = mods;
+                pressed
             }
-            Some((code, (event.get_flags().bits() & mask) != 0))
-        }
-        CGEventType::KeyDown => Some((code, true)),
-        CGEventType::KeyUp => Some((code, false)),
-        _ => None,
+            KeyUpdate::Down(code) => {
+                self.regular.insert(code);
+                true
+            }
+            KeyUpdate::Up(code) => {
+                self.regular.remove(&code);
+                false
+            }
+            KeyUpdate::Ignore => return None,
+        };
+
+        let mut all: Vec<u16> = self.modifiers.clone();
+        all.extend(self.regular.iter().copied());
+        all.sort_unstable();
+        Some((all, is_down))
     }
 }
 
@@ -247,9 +305,9 @@ fn decode(event_type: CGEventType, event: &core_graphics::event::CGEvent) -> Opt
 /// (почти всегда — нет разрешения «Универсальный доступ»).
 pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::JoinHandle<bool> {
     std::thread::spawn(move || {
-        // Множество зажатых клавиш. Тап отдаёт события по одной, а нам нужно
-        // знать, зажато ли сочетание целиком.
-        let pressed: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
+        // Тап отдаёт события по одному, а нам нужно знать, зажато ли
+        // сочетание целиком.
+        let pressed: Mutex<HeldKeys> = Mutex::new(HeldKeys::default());
         let capture: Mutex<Capture> = Mutex::new(Capture::default());
         let matcher: Mutex<Matcher> = Mutex::new(Matcher::default());
 
@@ -277,18 +335,17 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
                     return CallbackResult::Keep;
                 }
 
-                let Some((code, is_down)) = decode(event_type, event) else {
-                    return CallbackResult::Keep;
+                let kind = match event_type {
+                    CGEventType::FlagsChanged => RawKind::FlagsChanged,
+                    CGEventType::KeyDown => RawKind::KeyDown,
+                    CGEventType::KeyUp => RawKind::KeyUp,
+                    _ => RawKind::Other,
                 };
+                let code = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+                let update = classify(kind, code, event.get_flags().bits());
 
-                let held: Vec<u16> = {
-                    let mut set = pressed.lock().unwrap();
-                    if is_down {
-                        set.insert(code);
-                    } else {
-                        set.remove(&code);
-                    }
-                    set.iter().copied().collect()
+                let Some((held, is_down)) = pressed.lock().unwrap().apply(update) else {
+                    return CallbackResult::Keep;
                 };
                 cb_state.events_seen.fetch_add(1, Ordering::Relaxed);
                 *cb_state.held_now.lock().unwrap() = held.clone();
@@ -362,8 +419,17 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
 
 #[cfg(test)]
 mod tests {
-    use super::{Binding, Capture, HotKeyEvent, Matcher};
+    use super::{classify, Binding, Capture, HeldKeys, HotKeyEvent, KeyUpdate, Matcher, RawKind};
+    use crate::binding as b;
 
+    /// Флаги события: device-dependent биты нужных модификаторов.
+    fn flags(codes: &[u16]) -> u64 {
+        codes.iter().map(|c| b::modifier_flag_mask(*c)).sum()
+    }
+
+    const CAPS_LOCK_FLAG: u64 = 0x0001_0000;
+
+    const CAPS: u16 = 57;
     const L_CMD: u16 = 55;
     const L_OPT: u16 = 58;
     const R_CMD: u16 = 54;
@@ -375,6 +441,85 @@ mod tests {
             .iter()
             .map(|(id, keys)| (id.to_string(), Binding::new(keys.to_vec())))
             .collect()
+    }
+
+    /// Сочетание, сохранённое со сломанным Caps Lock, должно чиститься при
+    /// чтении: иначе оно не сработало бы уже никогда.
+    #[test]
+    fn caps_lock_вычищается_из_сочетания() {
+        let saved = Binding::new(vec![CAPS, L_OPT, L_CMD, KEY_C]);
+        assert_eq!(saved.keys, Binding::new(vec![L_OPT, L_CMD, KEY_C]).keys);
+        assert!(!saved.keys.contains(&CAPS));
+    }
+
+    /// Caps Lock — переключатель: пока он включён, его флаг выставлен всегда.
+    /// В набор зажатых клавиш он попадать не должен, иначе приклеивается
+    /// к каждому сочетанию.
+    #[test]
+    fn caps_lock_не_попадает_в_набор() {
+        let mut held = HeldKeys::default();
+
+        // Caps Lock включён, пользователь жмёт ⌥ и ⌘.
+        let (keys, _) = held
+            .apply(classify(RawKind::FlagsChanged, CAPS, CAPS_LOCK_FLAG))
+            .unwrap();
+        assert!(keys.is_empty(), "Caps Lock не удерживают, он переключается");
+
+        let (keys, _) = held
+            .apply(classify(
+                RawKind::FlagsChanged,
+                L_OPT,
+                CAPS_LOCK_FLAG | flags(&[L_OPT]),
+            ))
+            .unwrap();
+        assert_eq!(keys, vec![L_OPT]);
+
+        let (keys, _) = held
+            .apply(classify(
+                RawKind::FlagsChanged,
+                L_CMD,
+                CAPS_LOCK_FLAG | flags(&[L_OPT, L_CMD]),
+            ))
+            .unwrap();
+        assert_eq!(keys, vec![L_CMD, L_OPT]);
+
+        let (keys, is_down) = held
+            .apply(classify(
+                RawKind::KeyDown,
+                KEY_C,
+                CAPS_LOCK_FLAG | flags(&[L_OPT, L_CMD]),
+            ))
+            .unwrap();
+        assert_eq!(keys, vec![KEY_C, L_CMD, L_OPT]);
+        assert!(is_down);
+    }
+
+    /// Потерянное событие отпускания не должно оставлять модификатор навсегда:
+    /// состояние берётся из флагов целиком и восстанавливается само.
+    #[test]
+    fn потерянное_отпускание_восстанавливается() {
+        let mut held = HeldKeys::default();
+        held.apply(classify(RawKind::FlagsChanged, L_CMD, flags(&[L_CMD])));
+        held.apply(classify(
+            RawKind::FlagsChanged,
+            L_OPT,
+            flags(&[L_CMD, L_OPT]),
+        ));
+
+        // Событие отпускания ⌘ до нас не дошло, но следующее событие несёт
+        // полное состояние — лишний модификатор исчезает сам.
+        let (keys, _) = held
+            .apply(classify(RawKind::FlagsChanged, L_OPT, flags(&[L_OPT])))
+            .unwrap();
+        assert_eq!(keys, vec![L_OPT]);
+    }
+
+    /// Модификаторы не должны попадать в набор как обычные клавиши.
+    #[test]
+    fn модификаторы_не_считаются_обычными_клавишами() {
+        assert_eq!(classify(RawKind::KeyDown, L_CMD, 0), KeyUpdate::Ignore);
+        assert_eq!(classify(RawKind::KeyUp, L_OPT, 0), KeyUpdate::Ignore);
+        assert_eq!(classify(RawKind::Other, KEY_C, 0), KeyUpdate::Ignore);
     }
 
     /// ⌘ + ⌥ + C — сочетание из трёх клавиш, оканчивающееся обычной.

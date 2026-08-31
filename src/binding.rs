@@ -13,7 +13,25 @@ pub const K_RIGHT_OPTION: u16 = 61;
 pub const K_LEFT_CONTROL: u16 = 59;
 pub const K_RIGHT_CONTROL: u16 = 62;
 pub const K_FN: u16 = 63;
-pub const K_CAPS_LOCK: u16 = 57;
+
+/// Переключатель, а не удерживаемая клавиша: в сочетаниях бесполезен.
+const CAPS_LOCK: u16 = 57;
+
+/// Все модификаторы, которые можно удерживать. Caps Lock сюда не входит:
+/// он переключатель, а не удерживаемая клавиша. Пока он включён, флаг
+/// AlphaShift выставлен постоянно, и его код навсегда застревал в наборе
+/// зажатых клавиш, приклеиваясь к любому сочетанию.
+pub const HOLDABLE_MODIFIERS: [u16; 9] = [
+    K_LEFT_COMMAND,
+    K_RIGHT_COMMAND,
+    K_LEFT_SHIFT,
+    K_RIGHT_SHIFT,
+    K_LEFT_OPTION,
+    K_RIGHT_OPTION,
+    K_LEFT_CONTROL,
+    K_RIGHT_CONTROL,
+    K_FN,
+];
 
 pub fn is_modifier(code: u16) -> bool {
     matches!(
@@ -27,7 +45,6 @@ pub fn is_modifier(code: u16) -> bool {
             | K_LEFT_CONTROL
             | K_RIGHT_CONTROL
             | K_FN
-            | K_CAPS_LOCK
     )
 }
 
@@ -44,7 +61,6 @@ pub fn modifier_flag_mask(code: u16) -> u64 {
         K_LEFT_CONTROL => 0x0000_0001,  // NX_DEVICELCTLKEYMASK
         K_RIGHT_CONTROL => 0x0000_2000, // NX_DEVICERCTLKEYMASK
         K_FN => 0x0080_0000,            // kCGEventFlagMaskSecondaryFn
-        K_CAPS_LOCK => 0x0001_0000,     // kCGEventFlagMaskAlphaShift
         _ => 0,
     }
 }
@@ -69,7 +85,6 @@ fn sort_rank(code: u16) -> u8 {
         K_LEFT_CONTROL | K_RIGHT_CONTROL => 1,
         K_LEFT_OPTION | K_RIGHT_OPTION => 2,
         K_LEFT_SHIFT | K_RIGHT_SHIFT => 3,
-        K_CAPS_LOCK => 4,
         K_LEFT_COMMAND | K_RIGHT_COMMAND => 5,
         _ => 6,
     }
@@ -86,7 +101,7 @@ pub fn key_label(code: u16) -> String {
         K_LEFT_CONTROL => "левый ⌃",
         K_RIGHT_CONTROL => "правый ⌃",
         K_FN => "Fn",
-        K_CAPS_LOCK => "Caps Lock",
+        CAPS_LOCK => "Caps Lock",
 
         0 => "A",
         1 => "S",
@@ -242,6 +257,10 @@ impl Default for Binding {
 
 impl Binding {
     pub fn new(mut keys: Vec<u16>) -> Self {
+        // Caps Lock мог попасть в сочетание из-за прежней ошибки разбора.
+        // Удерживать его нельзя, поэтому такое сочетание не сработало бы
+        // никогда — вычищаем и при чтении настроек, и при наборе.
+        keys.retain(|k| *k != CAPS_LOCK);
         keys.sort_by_key(|k| (sort_rank(*k), *k));
         keys.dedup();
         Self { keys }

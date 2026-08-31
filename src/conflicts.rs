@@ -191,8 +191,12 @@ pub fn check(b: &Binding) -> Verdict {
             )),
         };
     }
-    if b.keys == vec![binding::K_CAPS_LOCK] {
-        return Verdict::Taken("Caps Lock переключает раскладку".into());
+    if b.keys == vec![57] {
+        return Verdict::Taken(
+            "Caps Lock — переключатель, а не удерживаемая клавиша: как часть \
+             сочетания он не работает"
+                .into(),
+        );
     }
 
     let mask = b.carbon_mask();
