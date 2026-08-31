@@ -1,5 +1,7 @@
 //! Мелочи, специфичные для macOS: иконка в доке и активация окна.
 
+use core_graphics::event::CGEvent;
+use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
 
@@ -31,4 +33,13 @@ pub fn activate() {
         }
         let _: () = msg_send![app, activateIgnoringOtherApps: true];
     }
+}
+
+/// Положение указателя мыши в глобальных координатах экрана.
+/// Нужно, чтобы поставить индикатор диктовки рядом с курсором.
+pub fn cursor_position() -> Option<(f32, f32)> {
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState).ok()?;
+    let event = CGEvent::new(source).ok()?;
+    let p = event.location();
+    Some((p.x as f32, p.y as f32))
 }

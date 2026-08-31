@@ -49,6 +49,11 @@ pub struct Shared {
     pub history: Mutex<Vec<history::Entry>>,
     pub hotkey_state: Arc<HotKeyState>,
     pub tap_running: AtomicBool,
+    /// Ключ из Keychain уже прочитан: до этого пустое поле означает
+    /// «ещё читаем», а не «ключа нет».
+    key_loaded: AtomicBool,
+    /// Последнее сочетание, набранное пользователем в настройках.
+    captured: Mutex<Option<Vec<u16>>>,
     /// Растёт при каждом изменении, чтобы трей перерисовал иконку.
     pub dirty: AtomicBool,
 }
@@ -56,13 +61,13 @@ pub struct Shared {
 impl Shared {
     pub fn new(config: Config) -> Arc<Self> {
         let hotkey_state = Arc::new(HotKeyState::new(
-            config.general.hotkey,
+            config.general.hotkey.clone(),
             config.general.hotkey_mode,
         ));
         let limit = config.general.history_limit;
-        Arc::new(Self {
+        let shared = Arc::new(Self {
             config: RwLock::new(config),
-            api_key: RwLock::new(crate::config::secrets::get("groq_api_key").unwrap_or_default()),
+            api_key: RwLock::new(String::new()),
             stage: Mutex::new(Stage::Idle),
             level: Arc::new(audio::Level::default()),
             last_error: Mutex::new(None),
@@ -70,8 +75,34 @@ impl Shared {
             history: Mutex::new(history::load(limit)),
             hotkey_state,
             tap_running: AtomicBool::new(false),
+            key_loaded: AtomicBool::new(false),
+            captured: Mutex::new(None),
             dirty: AtomicBool::new(true),
-        })
+        });
+
+        // Keychain умеет показать модальный запрос доступа — например когда
+        // сменилась подпись сборки. На главном потоке это подвесило бы окно
+        // ещё до его появления, поэтому ключ подтягивается фоном.
+        {
+            let shared = shared.clone();
+            std::thread::spawn(move || {
+                let key = shared.config_snapshot().load_api_key();
+                *shared.api_key.write().unwrap() = key;
+                shared.key_loaded.store(true, Ordering::Relaxed);
+                shared.dirty.store(true, Ordering::Relaxed);
+            });
+        }
+
+        shared
+    }
+
+    pub fn key_loaded(&self) -> bool {
+        self.key_loaded.load(Ordering::Relaxed)
+    }
+
+    /// Забирает набранное в настройках сочетание, если оно появилось.
+    pub fn take_captured(&self) -> Option<Vec<u16>> {
+        self.captured.lock().unwrap().take()
     }
 
     pub fn stage(&self) -> Stage {
@@ -102,7 +133,7 @@ impl Shared {
     /// Применяет изменения горячей клавиши к живому тапу без перезапуска.
     pub fn sync_hotkey(&self) {
         let cfg = self.config.read().unwrap();
-        self.hotkey_state.set_key(cfg.general.hotkey);
+        self.hotkey_state.set_binding(cfg.general.hotkey.clone());
         self.hotkey_state.set_mode(cfg.general.hotkey_mode);
     }
 }
@@ -163,6 +194,11 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
                         shared.set_error(Some(format!("Микрофон недоступен: {e}")));
                     }
                 }
+            }
+
+            HotKeyEvent::Captured(keys) => {
+                *shared.captured.lock().unwrap() = Some(keys);
+                shared.dirty.store(true, Ordering::Relaxed);
             }
 
             HotKeyEvent::StopRecording => {

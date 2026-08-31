@@ -4,7 +4,9 @@
 mod app;
 mod audio;
 mod autostart;
+mod binding;
 mod config;
+mod conflicts;
 mod engine;
 mod history;
 mod hotkey;
@@ -12,6 +14,7 @@ mod insert;
 mod macos;
 mod permissions;
 mod providers;
+mod updater;
 
 use std::sync::Arc;
 

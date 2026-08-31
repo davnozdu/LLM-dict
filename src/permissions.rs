@@ -3,11 +3,12 @@
 //! Приложению нужны два: «Универсальный доступ» (чтение горячей клавиши через
 //! CGEventTap и отправка синтетического ⌘V) и «Микрофон».
 
+use block2::RcBlock;
 use core_foundation::base::TCFType;
 use core_foundation::boolean::CFBoolean;
 use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
 use core_foundation::string::{CFString, CFStringRef};
-use objc2::runtime::AnyClass;
+use objc2::runtime::{AnyClass, Bool};
 use objc2::{class, msg_send};
 use objc2_foundation::NSString;
 
@@ -75,16 +76,31 @@ pub fn microphone() -> Status {
     }
 }
 
-/// Системный диалог микрофона появляется сам при первом открытии устройства,
-/// поэтому «запрос» — это короткая пустая запись.
+/// Просит систему показать диалог доступа к микрофону.
+///
+/// Раньше здесь открывалась короткая запись в расчёте на то, что система
+/// спросит сама. Диалог асинхронный, поток успевал закрыться раньше ответа,
+/// и разрешение срабатывало только со второго раза. Штатный вызов
+/// AVCaptureDevice дожидается ответа сам.
 pub fn prompt_microphone() {
-    std::thread::spawn(|| {
-        let level = std::sync::Arc::new(crate::audio::Level::default());
-        if let Ok(rec) = crate::audio::start(level) {
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            let _ = rec.finish();
-        }
+    let media = NSString::from_str("soun");
+    let handler = RcBlock::new(|granted: Bool| {
+        log::info!(
+            "доступ к микрофону: {}",
+            if granted.as_bool() {
+                "выдан"
+            } else {
+                "отклонён"
+            }
+        );
     });
+    unsafe {
+        let _: () = msg_send![
+            class!(AVCaptureDevice),
+            requestAccessForMediaType: &*media,
+            completionHandler: &*handler,
+        ];
+    }
 }
 
 pub fn open_accessibility_settings() {

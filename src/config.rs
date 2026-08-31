@@ -1,110 +1,12 @@
 //! Конфигурация приложения. Хранится в ~/Library/Application Support/LLM-dict/config.toml
 //! API-ключ в конфиг НЕ пишется — он живёт в Keychain (см. `secrets`).
 
+use crate::binding::Binding;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub const KEYCHAIN_SERVICE: &str = "com.davnozdu.llm-dict";
-
-/// Клавиша, удержание которой запускает диктовку.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum HotKey {
-    RightCommand,
-    RightOption,
-    RightControl,
-    RightShift,
-    Fn,
-    F13,
-    F14,
-    F15,
-    F16,
-    F17,
-    F18,
-    F19,
-}
-
-impl HotKey {
-    /// Виртуальный keycode macOS.
-    pub fn keycode(self) -> i64 {
-        match self {
-            HotKey::RightCommand => 54,
-            HotKey::RightOption => 61,
-            HotKey::RightControl => 62,
-            HotKey::RightShift => 60,
-            HotKey::Fn => 63,
-            HotKey::F13 => 105,
-            HotKey::F14 => 107,
-            HotKey::F15 => 113,
-            HotKey::F16 => 106,
-            HotKey::F17 => 64,
-            HotKey::F18 => 79,
-            HotKey::F19 => 80,
-        }
-    }
-
-    /// Модификаторы приходят как FlagsChanged, функциональные клавиши — как KeyDown/KeyUp.
-    pub fn is_modifier(self) -> bool {
-        !matches!(
-            self,
-            HotKey::F13
-                | HotKey::F14
-                | HotKey::F15
-                | HotKey::F16
-                | HotKey::F17
-                | HotKey::F18
-                | HotKey::F19
-        )
-    }
-
-    /// Бит в CGEventFlags, по которому определяется нажатие модификатора.
-    ///
-    /// Берутся device-dependent маски (NX_DEVICE*), а не общие
-    /// kCGEventFlagMaskCommand и подобные: общие не различают левую и правую
-    /// клавишу, и удержание левого ⌘ выглядело бы как удержание правого.
-    pub fn flag_mask(self) -> u64 {
-        match self {
-            HotKey::RightCommand => 0x0000_0010, // NX_DEVICERCMDKEYMASK
-            HotKey::RightOption => 0x0000_0040,  // NX_DEVICERALTKEYMASK
-            HotKey::RightControl => 0x0000_2000, // NX_DEVICERCTLKEYMASK
-            HotKey::RightShift => 0x0000_0004,   // NX_DEVICERSHIFTKEYMASK
-            HotKey::Fn => 0x0080_0000,           // kCGEventFlagMaskSecondaryFn
-            _ => 0,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            HotKey::RightCommand => "Правый ⌘",
-            HotKey::RightOption => "Правый ⌥",
-            HotKey::RightControl => "Правый ⌃",
-            HotKey::RightShift => "Правый ⇧",
-            HotKey::Fn => "Fn",
-            HotKey::F13 => "F13",
-            HotKey::F14 => "F14",
-            HotKey::F15 => "F15",
-            HotKey::F16 => "F16",
-            HotKey::F17 => "F17",
-            HotKey::F18 => "F18",
-            HotKey::F19 => "F19",
-        }
-    }
-
-    pub const ALL: [HotKey; 12] = [
-        HotKey::RightCommand,
-        HotKey::RightOption,
-        HotKey::RightControl,
-        HotKey::RightShift,
-        HotKey::Fn,
-        HotKey::F13,
-        HotKey::F14,
-        HotKey::F15,
-        HotKey::F16,
-        HotKey::F17,
-        HotKey::F18,
-        HotKey::F19,
-    ];
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HotKeyMode {
@@ -195,7 +97,7 @@ impl Default for LlmConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GeneralConfig {
-    pub hotkey: HotKey,
+    pub hotkey: Binding,
     pub hotkey_mode: HotKeyMode,
     /// Показывать иконку в доке (иначе только в верхней панели).
     pub show_in_dock: bool,
@@ -205,17 +107,31 @@ pub struct GeneralConfig {
     pub restore_clipboard: bool,
     /// Сколько записей диктовки хранить.
     pub history_limit: usize,
+    /// Показывать маленький индикатор у курсора во время диктовки.
+    pub show_overlay: bool,
+    /// Проверять обновления при запуске.
+    pub check_updates: bool,
+    /// Хранить ключ прямо в файле настроек, минуя Keychain.
+    ///
+    /// ACL записи в связке ключей привязан к подписи приложения, поэтому при
+    /// нестабильной подписи macOS считает каждую сборку новой программой и
+    /// переспрашивает пароль. Это запасной путь для таких случаев: файл лежит
+    /// в домашнем каталоге и правами защищён слабее связки ключей.
+    pub key_in_config: bool,
 }
 
 impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
-            hotkey: HotKey::RightCommand,
+            hotkey: Binding::default(),
             hotkey_mode: HotKeyMode::Hold,
             show_in_dock: false,
             play_sounds: true,
             restore_clipboard: true,
             history_limit: 200,
+            show_overlay: true,
+            check_updates: true,
+            key_in_config: false,
         }
     }
 }
@@ -226,6 +142,9 @@ pub struct Config {
     pub general: GeneralConfig,
     pub stt: SttConfig,
     pub llm: LlmConfig,
+    /// Заполняется только при включённом `general.key_in_config`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub api_key: String,
 }
 
 pub fn config_dir() -> PathBuf {
@@ -262,6 +181,17 @@ impl Config {
         let text = toml::to_string_pretty(self)?;
         std::fs::write(config_path(), text)?;
         Ok(())
+    }
+}
+
+impl Config {
+    /// Читает ключ оттуда, куда его положили настройки.
+    pub fn load_api_key(&self) -> String {
+        if self.general.key_in_config {
+            self.api_key.clone()
+        } else {
+            secrets::get("groq_api_key").unwrap_or_default()
+        }
     }
 }
 

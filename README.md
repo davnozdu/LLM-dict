@@ -110,7 +110,7 @@ POST /chat/completions
 | `src/permissions.rs` | проверка и запрос разрешений macOS |
 | `src/autostart.rs` | LaunchAgent для запуска при входе |
 
-Настройки и история лежат в `~/Library/Application Support/LLM-dict/`.
+Настройки и история лежат в `~/Library/Application Support/com.davnozdu.LLM-dict/`.
 
 ## Планы
 
