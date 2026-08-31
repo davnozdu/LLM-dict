@@ -75,28 +75,36 @@ jobs:
           SIGN_IDENTITY: ${{ steps.cert.outputs.identity }}
         run: build/sign.sh dist/LLM-dict.app
 
-      - name: Упаковка
+      - name: Образ DMG
+        run: build/dmg.sh dist/LLM-dict.app "${{ steps.version.outputs.value }}"
+
+      - name: Архив ZIP
         run: |
           cd dist
           # ditto сохраняет подпись и расширенные атрибуты, обычный zip — нет.
           ditto -c -k --sequesterRsrc --keepParent LLM-dict.app LLM-dict-macos-arm64.zip
 
+      # Actions архивирует артефакты сам, поэтому кладём сюда только DMG:
+      # после распаковки получается сразу образ, а не второй архив.
       - uses: actions/upload-artifact@v4
         with:
-          name: LLM-dict-macos-arm64
-          path: dist/LLM-dict-macos-arm64.zip
+          name: LLM-dict-macos-arm64-dmg
+          path: dist/*.dmg
           if-no-files-found: error
 
       - name: Релиз
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/LLM-dict-macos-arm64.zip
+          files: |
+            dist/*.dmg
+            dist/LLM-dict-macos-arm64.zip
           body: |
             Сборка для macOS на Apple Silicon.
 
             Установка:
-            1. Распаковать и перенести `LLM-dict.app` в `/Applications`.
-            2. Снять карантин: `xattr -dr com.apple.quarantine /Applications/LLM-dict.app`
-            3. Запустить, открыть вкладку «Права» и выдать «Универсальный доступ» и «Микрофон».
-            4. Перезапустить приложение.
+            1. Открыть `.dmg` и перетащить `LLM-dict.app` в `Applications`.
+            2. Снять карантин — сборка не нотаризована Apple:
+               `xattr -dr com.apple.quarantine /Applications/LLM-dict.app`
+            3. Запустить, открыть вкладку «Права», выдать «Универсальный доступ» и «Микрофон».
+            4. Перезапустить приложение — macOS не отдаёт доступ уже запущенному процессу.

@@ -17,11 +17,13 @@
 
 ## Установка
 
-Готовая сборка лежит в [релизах](../../releases) и в артефактах каждой сборки CI.
+Готовая сборка — в [релизах](../../releases): скачать `.dmg`, открыть, перетащить `LLM-dict.app` в `Applications`.
+
+Артефакты промежуточных сборок лежат во вкладке Actions. Учтите, что Actions архивирует артефакты сам, поэтому скачанный файл нужно сначала распаковать — внутри будет `.dmg`.
+
+Сборка не нотаризована Apple, поэтому карантин снимается вручную:
 
 ```bash
-# 1. Распаковать и положить в /Applications
-# 2. Снять карантин — сборка не нотаризована Apple
 xattr -dr com.apple.quarantine /Applications/LLM-dict.app
 open /Applications/LLM-dict.app
 ```
@@ -64,6 +66,9 @@ cargo build --release
 build/bundle.sh target/release/llm-dict 0.1.0
 build/sign.sh
 open dist/LLM-dict.app
+
+# при желании собрать образ
+build/dmg.sh dist/LLM-dict.app 0.1.0
 ```
 
 ### Про подпись и разрешения
