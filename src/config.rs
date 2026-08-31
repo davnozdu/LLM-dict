@@ -58,12 +58,16 @@ impl HotKey {
     }
 
     /// Бит в CGEventFlags, по которому определяется нажатие модификатора.
+    ///
+    /// Берутся device-dependent маски (NX_DEVICE*), а не общие
+    /// kCGEventFlagMaskCommand и подобные: общие не различают левую и правую
+    /// клавишу, и удержание левого ⌘ выглядело бы как удержание правого.
     pub fn flag_mask(self) -> u64 {
         match self {
-            HotKey::RightCommand => 0x0010_0000, // kCGEventFlagMaskCommand
-            HotKey::RightOption => 0x0008_0000,  // kCGEventFlagMaskAlternate
-            HotKey::RightControl => 0x0004_0000, // kCGEventFlagMaskControl
-            HotKey::RightShift => 0x0002_0000,   // kCGEventFlagMaskShift
+            HotKey::RightCommand => 0x0000_0010, // NX_DEVICERCMDKEYMASK
+            HotKey::RightOption => 0x0000_0040,  // NX_DEVICERALTKEYMASK
+            HotKey::RightControl => 0x0000_2000, // NX_DEVICERCTLKEYMASK
+            HotKey::RightShift => 0x0000_0004,   // NX_DEVICERSHIFTKEYMASK
             HotKey::Fn => 0x0080_0000,           // kCGEventFlagMaskSecondaryFn
             _ => 0,
         }
