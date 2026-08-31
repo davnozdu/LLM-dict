@@ -7,6 +7,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Для создания релиза токену нужен доступ на запись в содержимое репозитория.
+permissions:
+  contents: write
+
 env:
   CARGO_TERM_COLOR: always
 
