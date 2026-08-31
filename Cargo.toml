@@ -1,0 +1,38 @@
+[package]
+name = "llm-dict"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Диктовка через LLM: горячая клавиша, распознавание речи в облаке, вставка под курсором"
+license = "MIT"
+repository = "https://github.com/davnozdu/LLM-dict"
+
+[dependencies]
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "persistence"] }
+egui = "0.36"
+tray-icon = "0.24"
+cpal = "0.18"
+hound = "3.5"
+arboard = "3.6"
+keyring = { version = "4.2", features = ["apple-native-keyring-store"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "multipart", "blocking", "rustls", "webpki-roots", "charset", "http2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+directories = "6"
+open = "5"
+log = "0.4"
+env_logger = "0.11"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.25"
+core-foundation = "0.10"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString"] }
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true

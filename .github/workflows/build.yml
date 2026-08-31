@@ -1,0 +1,102 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    # macos-14 и новее — это Apple Silicon, сборка сразу под ARM.
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Проверка
+        run: |
+          cargo fmt --check || echo "форматирование не по канону — не блокирую сборку"
+          cargo clippy --all-targets -- -D warnings
+
+      - name: Сборка
+        run: cargo build --release --locked
+
+      - name: Версия
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "value=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=0.0.0-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Бандл
+        run: build/bundle.sh target/release/llm-dict "${{ steps.version.outputs.value }}"
+
+      - name: Импорт сертификата подписи
+        id: cert
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          if [[ -z "${CERT_P12}" ]]; then
+            echo "identity=-" >> "$GITHUB_OUTPUT"
+            echo "Сертификата в секретах нет — подписываю ad-hoc."
+            exit 0
+          fi
+          KEYCHAIN="$RUNNER_TEMP/build.keychain"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          IDENTITY="$(security find-identity -v "$KEYCHAIN" | head -1 | awk '{print $2}')"
+          echo "identity=$IDENTITY" >> "$GITHUB_OUTPUT"
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Подпись
+        env:
+          SIGN_IDENTITY: ${{ steps.cert.outputs.identity }}
+        run: build/sign.sh dist/LLM-dict.app
+
+      - name: Упаковка
+        run: |
+          cd dist
+          # ditto сохраняет подпись и расширенные атрибуты, обычный zip — нет.
+          ditto -c -k --sequesterRsrc --keepParent LLM-dict.app LLM-dict-macos-arm64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LLM-dict-macos-arm64
+          path: dist/LLM-dict-macos-arm64.zip
+          if-no-files-found: error
+
+      - name: Релиз
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/LLM-dict-macos-arm64.zip
+          body: |
+            Сборка для macOS на Apple Silicon.
+
+            Установка:
+            1. Распаковать и перенести `LLM-dict.app` в `/Applications`.
+            2. Снять карантин: `xattr -dr com.apple.quarantine /Applications/LLM-dict.app`
+            3. Запустить, открыть вкладку «Права» и выдать «Универсальный доступ» и «Микрофон».
+            4. Перезапустить приложение.
