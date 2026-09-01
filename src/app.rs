@@ -1840,7 +1840,7 @@ impl App {
         ui.label(egui::RichText::new("Что видит приложение").strong());
         ui.add_space(4.0);
 
-        let (held, events) = self.shared.hotkey_state.diagnostics();
+        let (held, events, regular) = self.shared.hotkey_state.diagnostics();
         if events == 0 {
             ui.colored_label(
                 egui::Color32::from_rgb(220, 80, 80),
@@ -1868,6 +1868,23 @@ impl App {
                 "Событий получено: {events}. Зажмите нужные клавиши — если здесь \
                  они не появляются, до приложения они не доходят."
             ));
+
+            ui.add_space(4.0);
+            // Считаем только количество, без кодов: журнал не должен
+            // превращаться в запись того, что печатают.
+            let color = if regular == 0 {
+                egui::Color32::from_rgb(220, 80, 80)
+            } else {
+                egui::Color32::from_rgb(60, 160, 90)
+            };
+            ui.colored_label(color, format!("Нажатий обычных клавиш получено: {regular}"));
+            if regular == 0 {
+                ui.weak(
+                    "Напечатайте несколько букв в любом окне. Если счётчик не растёт, \
+                     значит обычные клавиши до перехватчиков не доходят — сочетание с \
+                     буквой задать не получится, берите сочетание из модификаторов.",
+                );
+            }
 
             let recent = self.shared.hotkey_state.recent_events();
             if !recent.is_empty() {

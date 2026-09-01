@@ -47,6 +47,9 @@ pub struct HotKeyState {
     held_now: Mutex<Vec<u16>>,
     /// Событий от клавиатуры получено всего. Ноль означает, что тап молчит.
     events_seen: AtomicU64,
+    /// Отдельно — нажатия обычных клавиш. Считаем только количество, без
+    /// кодов: журнал не должен превращаться в запись того, что печатают.
+    regular_seen: AtomicU64,
     /// Последние события в сыром виде, до всякого разбора. По журналу видно
     /// только модификаторы, и без этого не отличить «событие не пришло» от
     /// «пришло, но мы его выбросили».
@@ -67,6 +70,7 @@ impl HotKeyState {
             swallow: AtomicBool::new(false),
             held_now: Mutex::new(Vec::new()),
             events_seen: AtomicU64::new(0),
+            regular_seen: AtomicU64::new(0),
             recent: Mutex::new(VecDeque::new()),
             disabled_by_system: AtomicBool::new(false),
         };
@@ -103,11 +107,13 @@ impl HotKeyState {
         self.swallow.store(v, Ordering::Relaxed);
     }
 
-    /// Что зажато сейчас и сколько событий тап видел за всё время.
-    pub fn diagnostics(&self) -> (Vec<u16>, u64) {
+    /// Что зажато сейчас, сколько событий тап видел всего и сколько из них —
+    /// нажатия обычных клавиш.
+    pub fn diagnostics(&self) -> (Vec<u16>, u64, u64) {
         (
             self.held_now.lock().unwrap().clone(),
             self.events_seen.load(Ordering::Relaxed),
+            self.regular_seen.load(Ordering::Relaxed),
         )
     }
 
@@ -373,17 +379,34 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
                 // не попали бы в диагностику, а именно они и интересны.
                 cb_state.remember(kind, code);
                 cb_state.events_seen.fetch_add(1, Ordering::Relaxed);
+                if matches!(kind, RawKind::KeyDown) && !binding::is_modifier(code) {
+                    cb_state.regular_seen.fetch_add(1, Ordering::Relaxed);
+                }
 
-                let update = classify(kind, code, event.get_flags().bits());
+                let capturing = cb_state.is_capturing();
+                let flags = event.get_flags().bits();
+                if capturing {
+                    // Пишем событие до разбора и до любых проверок. Раньше эта
+                    // запись стояла после отсева незначащих событий, и то, что
+                    // разбор выбрасывал, в журнал не попадало вовсе — по такому
+                    // журналу нельзя было отличить «клавиша не дошла» от
+                    // «дошла, но мы её отбросили».
+                    log::info!(
+                        "событие при наборе: {kind:?} (тип {}) код={code} флаги=0x{flags:x}",
+                        event_type as u32
+                    );
+                }
+
+                let update = classify(kind, code, flags);
                 let Some((held, is_down)) = pressed.lock().unwrap().apply(update) else {
+                    if capturing {
+                        log::info!("  ↑ событие отброшено разбором");
+                    }
                     return CallbackResult::Keep;
                 };
                 *cb_state.held_now.lock().unwrap() = held.clone();
 
-                if cb_state.is_capturing() {
-                    // Во время набора пишем каждое событие: иначе не отличить
-                    // «клавиша не дошла» от «дошла, но не попала в набор».
-                    log::info!("событие при наборе: {kind:?} код={code}");
+                if capturing {
                     if let Some(keys) = capture.lock().unwrap().update(&held, is_down) {
                         log::info!("набрано сочетание: {keys:?}");
                         let _ = cb_tx.send(HotKeyEvent::Captured(keys));
