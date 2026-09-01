@@ -348,7 +348,12 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
         let cb_tx = tx.clone();
 
         let tap = CGEventTap::new(
-            CGEventTapLocation::Session,
+            // HID, а не Session. Session-перехватчик получает события уже
+            // после чужих перехватчиков, и то, что забрала другая программа,
+            // до нас не доходит: модификаторы приходили всегда, а сочетание
+            // с буквой пропадало целиком. HID — самый низкий уровень, раньше
+            // всех остальных.
+            CGEventTapLocation::HID,
             CGEventTapPlacement::HeadInsertEventTap,
             // Default, а не ListenOnly: только так можно проглотить событие,
             // когда включён перехват. Без перехвата всё возвращается как есть.

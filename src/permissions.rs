@@ -22,6 +22,15 @@ extern "C" {
 #[link(name = "AVFoundation", kind = "framework")]
 extern "C" {}
 
+#[link(name = "IOKit", kind = "framework")]
+extern "C" {
+    fn IOHIDCheckAccess(request: u32) -> u32;
+    fn IOHIDRequestAccess(request: u32) -> bool;
+}
+
+/// kIOHIDRequestTypeListenEvent — чтение событий клавиатуры.
+const HID_REQUEST_LISTEN: u32 = 1;
+
 const BUNDLE_ID: &str = "com.davnozdu.llm-dict";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +85,36 @@ pub fn microphone() -> Status {
         0 => Status::NotAsked,
         _ => Status::Denied,
     }
+}
+
+/// «Мониторинг ввода» — отдельное от «Универсального доступа» разрешение.
+///
+/// Перехватчик работает на HID-уровне, чтобы получать события раньше других
+/// программ, а для этого macOS спрашивает именно его.
+pub fn input_monitoring() -> Status {
+    // 0 — выдан, 1 — отказано, 2 — не спрашивали.
+    match unsafe { IOHIDCheckAccess(HID_REQUEST_LISTEN) } {
+        0 => Status::Granted,
+        2 => Status::NotAsked,
+        _ => Status::Denied,
+    }
+}
+
+pub fn prompt_input_monitoring() {
+    let granted = unsafe { IOHIDRequestAccess(HID_REQUEST_LISTEN) };
+    log::info!(
+        "мониторинг ввода: {}",
+        if granted {
+            "выдан"
+        } else {
+            "отклонён"
+        }
+    );
+}
+
+pub fn open_input_monitoring_settings() {
+    let _ =
+        open::that("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent");
 }
 
 /// Просит систему показать диалог доступа к микрофону.

@@ -1797,6 +1797,29 @@ impl App {
         }
 
         ui.add_space(12.0);
+        let listen = permissions::input_monitoring();
+        perm_row(
+            ui,
+            "Мониторинг ввода",
+            listen,
+            "нужен, чтобы получать клавиши раньше других программ",
+        );
+        ui.horizontal(|ui| {
+            if ui.button("Запросить").clicked() {
+                permissions::prompt_input_monitoring();
+            }
+            if ui.button("Открыть настройки").clicked() {
+                permissions::open_input_monitoring_settings();
+            }
+        });
+        if !listen.is_ok() {
+            ui.weak(
+                "Без него перехватчик работает уровнем выше, и сочетания, которые \
+                 забирает другая программа, до нас не доходят.",
+            );
+        }
+
+        ui.add_space(12.0);
         perm_row(ui, "Микрофон", mic, "нужен для записи речи");
         ui.horizontal(|ui| {
             if ui.button("Запросить").clicked() {
