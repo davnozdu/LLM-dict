@@ -40,8 +40,9 @@ fn explain(status: reqwest::StatusCode, body: &str, base_url: &str) -> anyhow::E
     // порознь, и их легко развести.
     let hint = match status.as_u16() {
         401 | 403 => format!(
-            "\nКлюч не принят. Проверьте, что он выдан тем же сервисом, \
-             что стоит в адресе API ({base_url}). Ключи Groq начинаются с gsk_."
+            "\nКлюч не принят или не сохранён. Проверьте, что он выдан тем же \
+             сервисом, что стоит в адресе API ({base_url}), и что вы нажали \
+             «Сохранить ключ». Ключи Groq начинаются с gsk_."
         ),
         404 => "\nАдрес API или название модели не найдены — проверьте оба поля.".to_string(),
         429 => "\nПревышен лимит запросов, попробуйте позже.".to_string(),
@@ -222,6 +223,35 @@ pub fn run_prompt(
         .map(|c| c.message.content.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow!("модель вернула пустой ответ"))
+}
+
+/// Настоящая проверка ключа: короткий запрос к модели.
+///
+/// Список моделей для этого не годится — у некоторых поставщиков, в том числе
+/// у Ollama Cloud, он отдаётся вообще без ключа. Кнопка «Считать модели»
+/// поэтому срабатывала, а перевод падал с 401.
+pub fn verify_key(endpoint: &crate::provider::Endpoint, api_key: &str) -> Result<()> {
+    let base_url = endpoint.base_url();
+    require_key(api_key, &base_url)?;
+
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let payload = serde_json::json!({
+        "model": endpoint.model,
+        "max_tokens": 1,
+        "messages": [{ "role": "user", "content": "ok" }]
+    });
+
+    let mut req = client()?.post(&url).json(&payload);
+    if !api_key.is_empty() {
+        req = req.bearer_auth(api_key);
+    }
+    let resp = req.send()?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body = resp.text()?;
+    Err(explain(status, &body, &base_url))
 }
 
 #[derive(Deserialize)]

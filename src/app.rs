@@ -80,8 +80,15 @@ pub struct App {
     provider_keys: HashMap<Provider, String>,
 }
 
-/// Идущее чтение списка моделей с одного поставщика.
-type ModelFetch = (Provider, Receiver<Result<Vec<String>, String>>);
+/// Что именно спрашиваем у поставщика: список моделей или годность ключа.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum FetchKind {
+    Models,
+    KeyCheck,
+}
+
+/// Идущий запрос к поставщику.
+type ModelFetch = (Provider, FetchKind, Receiver<Result<Vec<String>, String>>);
 
 struct Download {
     model_id: String,
@@ -1123,15 +1130,20 @@ impl App {
     }
 
     fn poll_model_fetch(&mut self) {
-        let Some((provider, rx)) = &self.model_fetch else {
+        let Some((provider, kind, rx)) = &self.model_fetch else {
             return;
         };
         let provider = *provider;
+        let kind = *kind;
         match rx.try_recv() {
             Ok(Ok(models)) => {
-                let n = models.len();
-                self.provider_models.insert(provider, models);
-                self.toast(format!("{}: моделей {n}", provider.label()));
+                if kind == FetchKind::KeyCheck {
+                    self.toast(format!("Ключ {} принят", provider.label()));
+                } else {
+                    let n = models.len();
+                    self.provider_models.insert(provider, models);
+                    self.toast(format!("{}: моделей {n}", provider.label()));
+                }
                 self.model_fetch = None;
             }
             Ok(Err(e)) => {
@@ -1155,7 +1167,7 @@ impl App {
         std::thread::spawn(move || {
             let _ = tx.send(providers::list_models(&base_url, &key).map_err(|e| e.to_string()));
         });
-        self.model_fetch = Some((provider, rx));
+        self.model_fetch = Some((provider, FetchKind::Models, rx));
         self.toast(format!("Читаю модели с {}…", provider.label()));
     }
 
@@ -1185,6 +1197,20 @@ impl App {
         });
         self.provider_keys.insert(provider, value.clone());
 
+        // Видно, лежит ли ключ на самом деле: набранное в поле ещё не сохранено.
+        let stored_now = self.cfg.key_for(provider.key_account());
+        if stored_now.is_empty() {
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 130, 40),
+                "Ключ не сохранён — наберите его и нажмите «Сохранить ключ»",
+            );
+        } else if stored_now != value.trim() {
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 130, 40),
+                "В поле не то, что сохранено — нажмите «Сохранить ключ»",
+            );
+        }
+
         ui.horizontal(|ui| {
             if ui.button("Сохранить ключ").clicked() {
                 let account = provider.key_account();
@@ -1193,12 +1219,40 @@ impl App {
                     Err(e) => self.toast(format!("Не сохранить ключ: {e}")),
                 }
             }
+            if ui.button("Проверить ключ").clicked() {
+                self.verify_key_now(provider);
+            }
             if let Some(url) = provider.key_url() {
                 if ui.button("Где взять").clicked() {
                     let _ = open::that(url);
                 }
             }
         });
+    }
+
+    /// Проверяет ключ настоящим запросом к модели, а не чтением списка.
+    fn verify_key_now(&mut self, provider: Provider) {
+        let Some(action) = self
+            .cfg
+            .actions
+            .iter()
+            .find(|a| a.endpoint.provider == provider)
+            .cloned()
+        else {
+            self.toast("Сначала выберите модель для этого поставщика");
+            return;
+        };
+        let key = self.cfg.key_for(provider.key_account());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(
+                providers::verify_key(&action.endpoint, &key)
+                    .map(|()| Vec::new())
+                    .map_err(|e| e.to_string()),
+            );
+        });
+        self.model_fetch = Some((provider, FetchKind::KeyCheck, rx));
+        self.toast(format!("Проверяю ключ {}…", provider.label()));
     }
 
     fn ui_actions(&mut self, ui: &mut egui::Ui) {
@@ -1443,6 +1497,11 @@ impl App {
                 self.fetch_models(&endpoint);
             }
         });
+        ui.weak(
+            "Список моделей у части поставщиков отдаётся без ключа, поэтому \
+             успешное чтение ещё не значит, что ключ рабочий — для этого есть \
+             отдельная проверка ниже.",
+        );
 
         ui.add_space(4.0);
         self.ui_provider_key(ui, provider);
@@ -1786,6 +1845,24 @@ impl App {
                 "Событий получено: {events}. Зажмите нужные клавиши — если здесь \
                  они не появляются, до приложения они не доходят."
             ));
+
+            let recent = self.shared.hotkey_state.recent_events();
+            if !recent.is_empty() {
+                ui.add_space(4.0);
+                ui.collapsing(
+                    "Последние события клавиатуры",
+                    |ui| {
+                        ui.weak(
+                            "Сырой список до всякого разбора. Если здесь нет строк \
+                         «нажатие» для обычных клавиш, значит система их \
+                         перехватчикам не отдаёт.",
+                        );
+                        for line in recent.iter().take(14) {
+                            ui.monospace(line);
+                        }
+                    },
+                );
+            }
         }
 
         ui.add_space(10.0);

@@ -11,7 +11,7 @@ use core_graphics::event::{
     CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
     CallbackResult, EventField,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -47,6 +47,10 @@ pub struct HotKeyState {
     held_now: Mutex<Vec<u16>>,
     /// Событий от клавиатуры получено всего. Ноль означает, что тап молчит.
     events_seen: AtomicU64,
+    /// Последние события в сыром виде, до всякого разбора. По журналу видно
+    /// только модификаторы, и без этого не отличить «событие не пришло» от
+    /// «пришло, но мы его выбросили».
+    recent: Mutex<VecDeque<String>>,
     /// Система отключила тап — обычно за слишком долгий обработчик.
     /// Дальше горячая клавиша молча не работает, поэтому это надо показать.
     disabled_by_system: AtomicBool,
@@ -63,6 +67,7 @@ impl HotKeyState {
             swallow: AtomicBool::new(false),
             held_now: Mutex::new(Vec::new()),
             events_seen: AtomicU64::new(0),
+            recent: Mutex::new(VecDeque::new()),
             disabled_by_system: AtomicBool::new(false),
         };
         s.set_mode(mode);
@@ -104,6 +109,28 @@ impl HotKeyState {
             self.held_now.lock().unwrap().clone(),
             self.events_seen.load(Ordering::Relaxed),
         )
+    }
+
+    /// Последние сырые события, новые сверху.
+    pub fn recent_events(&self) -> Vec<String> {
+        self.recent.lock().unwrap().iter().rev().cloned().collect()
+    }
+
+    fn remember(&self, kind: RawKind, code: u16) {
+        let mut recent = self.recent.lock().unwrap();
+        if recent.len() >= 14 {
+            recent.pop_front();
+        }
+        let name = match kind {
+            RawKind::FlagsChanged => "модификатор",
+            RawKind::KeyDown => "нажатие",
+            RawKind::KeyUp => "отпускание",
+            RawKind::Other => "прочее",
+        };
+        recent.push_back(format!(
+            "{name}: {} (код {code})",
+            crate::binding::key_label(code)
+        ));
     }
 
     pub fn is_disabled_by_system(&self) -> bool {
@@ -342,12 +369,15 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
                     _ => RawKind::Other,
                 };
                 let code = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
-                let update = classify(kind, code, event.get_flags().bits());
+                // Запоминаем событие до разбора: иначе выброшенные события
+                // не попали бы в диагностику, а именно они и интересны.
+                cb_state.remember(kind, code);
+                cb_state.events_seen.fetch_add(1, Ordering::Relaxed);
 
+                let update = classify(kind, code, event.get_flags().bits());
                 let Some((held, is_down)) = pressed.lock().unwrap().apply(update) else {
                     return CallbackResult::Keep;
                 };
-                cb_state.events_seen.fetch_add(1, Ordering::Relaxed);
                 *cb_state.held_now.lock().unwrap() = held.clone();
 
                 if cb_state.is_capturing() {
