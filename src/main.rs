@@ -122,7 +122,14 @@ fn run_action_test(name: &str, text: &str) -> eframe::Result<()> {
 
     let started = std::time::Instant::now();
     let key = action.endpoint.api_key(&cfg);
-    match providers::run_prompt(&action.endpoint, &key, &action.prompt, text) {
+    let context = action.load_context().unwrap_or(None);
+    match providers::run_prompt(
+        &action.endpoint,
+        &key,
+        &action.prompt,
+        context.as_deref(),
+        text,
+    ) {
         Ok(result) => println!(
             "Готово за {:.2} с:\n{result}",
             started.elapsed().as_secs_f32()

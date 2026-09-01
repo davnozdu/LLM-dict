@@ -38,6 +38,10 @@ pub struct TextAction {
     /// Прогонять через это действие текст сразу после диктовки, до вставки.
     /// Так надиктованное можно автоматически причёсывать.
     pub after_dictation: bool,
+    /// Файл с данными, на которые опирается ответ: расписание, услуги, что
+    /// угодно. Читается при каждом запуске, поэтому правки подхватываются
+    /// без перезапуска приложения.
+    pub context_file: String,
 }
 
 impl Default for TextAction {
@@ -51,6 +55,7 @@ impl Default for TextAction {
             output: Output::Clipboard,
             enabled: true,
             after_dictation: false,
+            context_file: String::new(),
         }
     }
 }
@@ -90,6 +95,31 @@ pub fn correction_action(endpoint: Endpoint) -> TextAction {
         output: Output::Clipboard,
         enabled: true,
         after_dictation: true,
+        context_file: String::new(),
+    }
+}
+
+/// Ответ на сообщение по своим данным: расписание, услуги, условия.
+///
+/// Язык ответа задаётся не настройкой, а самим сообщением: спросили
+/// по-чешски — ответ по-чешски. Иначе пришлось бы держать отдельное
+/// действие на каждый язык.
+pub fn answer_action(endpoint: Endpoint) -> TextAction {
+    TextAction {
+        id: new_id(),
+        name: "Ответ по моим данным".into(),
+        prompt: "Ниже даны сведения обо мне и о моей работе. Ответь на сообщение \
+                 пользователя от моего лица, опираясь только на эти сведения.\n\n\
+                 Отвечай на том языке, на котором написано сообщение. Если сведений \
+                 для ответа не хватает, скажи об этом прямо и ничего не выдумывай. \
+                 Пиши коротко и по делу, выведи только сам ответ без пояснений."
+            .into(),
+        endpoint,
+        hotkey: Binding::new(Vec::new()),
+        output: Output::Clipboard,
+        enabled: true,
+        after_dictation: false,
+        context_file: String::new(),
     }
 }
 
@@ -112,6 +142,7 @@ pub fn defaults() -> Vec<TextAction> {
             output: Output::Clipboard,
             enabled: true,
             after_dictation: false,
+            context_file: String::new(),
         },
         TextAction {
             id: new_id(),
@@ -122,6 +153,7 @@ pub fn defaults() -> Vec<TextAction> {
             output: Output::Clipboard,
             enabled: true,
             after_dictation: false,
+            context_file: String::new(),
         },
         TextAction {
             id: new_id(),
@@ -132,6 +164,7 @@ pub fn defaults() -> Vec<TextAction> {
             output: Output::Clipboard,
             enabled: true,
             after_dictation: false,
+            context_file: String::new(),
         },
         TextAction {
             id: new_id(),
@@ -145,6 +178,33 @@ pub fn defaults() -> Vec<TextAction> {
             output: Output::Replace,
             enabled: true,
             after_dictation: false,
+            context_file: String::new(),
         },
     ]
+}
+
+/// Больше этого файл с данными не читаем: он уходит в каждый запрос, а
+/// оплачивается и обрабатывается по объёму.
+const MAX_CONTEXT_BYTES: u64 = 256 * 1024;
+
+impl TextAction {
+    /// Читает файл с данными. Перечитывается при каждом запуске, поэтому
+    /// правки в файле подхватываются без перезапуска приложения.
+    pub fn load_context(&self) -> anyhow::Result<Option<String>> {
+        let path = self.context_file.trim();
+        if path.is_empty() {
+            return Ok(None);
+        }
+        let meta = std::fs::metadata(path)
+            .map_err(|e| anyhow::anyhow!("не открыть файл данных {path}: {e}"))?;
+        if meta.len() > MAX_CONTEXT_BYTES {
+            anyhow::bail!(
+                "файл данных больше {} КБ — он уходит в каждый запрос, сократите его",
+                MAX_CONTEXT_BYTES / 1024
+            );
+        }
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("не прочитать файл данных {path}: {e}"))?;
+        Ok(Some(text))
+    }
 }

@@ -465,8 +465,17 @@ fn process(
         shared.set_stage(Stage::PostProcessing);
         for action in after {
             let action_key = action.endpoint.api_key(cfg);
-            match providers::run_prompt(&action.endpoint, &action_key, &action.prompt, &final_text)
-            {
+            let context = action.load_context().unwrap_or_else(|e| {
+                log::warn!("{}: {e}", action.name);
+                None
+            });
+            match providers::run_prompt(
+                &action.endpoint,
+                &action_key,
+                &action.prompt,
+                context.as_deref(),
+                &final_text,
+            ) {
                 Ok(text) => final_text = text,
                 Err(e) => {
                     log::warn!("«{}» не отработало: {e}", action.name);
@@ -577,7 +586,14 @@ fn run_action(shared: &Arc<Shared>, id: &str) {
         let outcome = (|| -> anyhow::Result<(String, Option<String>)> {
             let (selection, previous) = insert::copy_selection()?;
             let key = action.endpoint.api_key(&cfg);
-            let result = providers::run_prompt(&action.endpoint, &key, &action.prompt, &selection)?;
+            let context = action.load_context()?;
+            let result = providers::run_prompt(
+                &action.endpoint,
+                &key,
+                &action.prompt,
+                context.as_deref(),
+                &selection,
+            )?;
 
             match action.output {
                 crate::actions::Output::Replace => {

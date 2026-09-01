@@ -127,6 +127,7 @@ pub fn run_prompt(
     endpoint: &crate::provider::Endpoint,
     api_key: &str,
     system_prompt: &str,
+    context: Option<&str>,
     text: &str,
 ) -> Result<String> {
     if text.trim().is_empty() {
@@ -142,13 +143,24 @@ pub fn run_prompt(
     require_key(api_key, &base_url)?;
 
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+
+    // Данные идут отдельным системным сообщением, а не внутри промпта: так
+    // видно, где инструкция, а где сведения, и промпт остаётся читаемым.
+    let mut messages = vec![serde_json::json!({
+        "role": "system", "content": system_prompt
+    })];
+    if let Some(context) = context.filter(|c| !c.trim().is_empty()) {
+        messages.push(serde_json::json!({
+            "role": "system",
+            "content": format!("Сведения, на которые нужно опираться:\n\n{context}"),
+        }));
+    }
+    messages.push(serde_json::json!({ "role": "user", "content": text }));
+
     let payload = serde_json::json!({
         "model": endpoint.model,
         "temperature": 0.0,
-        "messages": [
-            { "role": "system", "content": system_prompt },
-            { "role": "user", "content": text }
-        ]
+        "messages": messages,
     });
 
     let mut req = client()?.post(&url).json(&payload);

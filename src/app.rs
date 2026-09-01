@@ -1311,11 +1311,23 @@ impl App {
         );
         ui.add_space(8.0);
 
-        if ui.button("+  Новое действие").clicked() {
-            let action = TextAction::default();
-            self.editing_action = Some(action.id.clone());
-            self.cfg.actions.push(action);
-        }
+        ui.horizontal(|ui| {
+            if ui.button("+  Новое действие").clicked() {
+                let action = TextAction::default();
+                self.editing_action = Some(action.id.clone());
+                self.cfg.actions.push(action);
+            }
+            if ui.button("+  Ответ по моим данным").clicked() {
+                let action = crate::actions::answer_action(Endpoint::default());
+                self.editing_action = Some(action.id.clone());
+                self.cfg.actions.push(action);
+            }
+        });
+        ui.weak(
+            "«Ответ по моим данным» — заготовка: указываете файл со сведениями о себе, \
+             выделяете чужое сообщение, жмёте сочетание и получаете готовый ответ на \
+             языке этого сообщения.",
+        );
         ui.add_space(6.0);
 
         let ids: Vec<String> = self.cfg.actions.iter().map(|a| a.id.clone()).collect();
@@ -1572,6 +1584,48 @@ impl App {
                 ui.selectable_value(&mut self.cfg.actions[pos].output, o, o.label());
             }
         });
+
+        // --- файл со сведениями ---
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.add_sized([130.0, 20.0], egui::Label::new("Файл с данными"));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.cfg.actions[pos].context_file)
+                    .desired_width(240.0)
+                    .hint_text("не задан"),
+            );
+            if ui.button("Выбрать").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Текст и Markdown", &["md", "markdown", "txt"])
+                    .pick_file()
+                {
+                    self.cfg.actions[pos].context_file = path.to_string_lossy().to_string();
+                }
+            }
+            if !self.cfg.actions[pos].context_file.is_empty() && ui.button("Убрать").clicked()
+            {
+                self.cfg.actions[pos].context_file.clear();
+            }
+        });
+        if !self.cfg.actions[pos].context_file.is_empty() {
+            match self.cfg.actions[pos].load_context() {
+                Ok(Some(text)) => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(60, 160, 90),
+                        format!("Файл читается: {} символов", text.chars().count()),
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    ui.colored_label(egui::Color32::from_rgb(220, 80, 80), e.to_string());
+                }
+            }
+            ui.weak(
+                "Содержимое уходит в каждый запрос отдельным сообщением. Файл \
+                 перечитывается при каждом запуске, так что правки подхватываются \
+                 без перезапуска приложения.",
+            );
+        }
 
         ui.add_space(6.0);
         ui.checkbox(
