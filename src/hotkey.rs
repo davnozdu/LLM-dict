@@ -417,7 +417,9 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
                     // разбор выбрасывал, в журнал не попадало вовсе — по такому
                     // журналу нельзя было отличить «клавиша не дошла» от
                     // «дошла, но мы её отбросили».
-                    log::info!(
+                    // debug, а не info: подробности нужны только при разборе
+                    // жалоб, а в обычной работе они забивают журнал.
+                    log::debug!(
                         "событие при наборе: {kind:?} (тип {}) код={code} флаги=0x{flags:x}",
                         event_type as u32
                     );
@@ -426,7 +428,7 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
                 let update = classify(kind, code, flags);
                 let Some((held, is_down)) = pressed.lock().unwrap().apply(update) else {
                     if capturing {
-                        log::info!("  ↑ событие отброшено разбором");
+                        log::debug!("  ↑ событие отброшено разбором");
                     }
                     return CallbackResult::Keep;
                 };
@@ -434,7 +436,7 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
 
                 if capturing {
                     if let Some(keys) = capture.lock().unwrap().update(&held, is_down) {
-                        log::info!("набрано сочетание: {keys:?}");
+                        log::debug!("набрано сочетание: {keys:?}");
                         let _ = cb_tx.send(HotKeyEvent::Captured(keys));
                     }
                     return CallbackResult::Keep;
@@ -446,9 +448,18 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
 
                 // Клавиша из любого нашего сочетания — кандидат на
                 // проглатывание. Остальная клавиатура не затрагивается.
+                // Проглатываем только обычные клавиши и только когда сочетание
+                // с ними собрано целиком.
+                //
+                // Модификаторы трогать нельзя: диктовка висит на правом ⌘, и
+                // проглатывание сломало бы все обычные ⌘C и ⌘V. А вот букву
+                // отдавать дальше незачем — программа её не знает и отвечает
+                // системным писком.
                 let swallow = cb_state.swallow.load(Ordering::Relaxed)
-                    && (binding.keys.contains(&code)
-                        || actions.iter().any(|(_, b)| b.keys.contains(&code)));
+                    && !binding::is_modifier(code)
+                    && std::iter::once(&binding)
+                        .chain(actions.iter().map(|(_, b)| b))
+                        .any(|b| b.keys.contains(&code) && b.keys.iter().all(|k| held.contains(k)));
 
                 let recording = cb_state.recording.load(Ordering::Relaxed);
                 let toggle = cb_state.mode.load(Ordering::Relaxed) == 1;
