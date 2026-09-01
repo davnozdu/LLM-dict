@@ -1856,6 +1856,14 @@ impl App {
                 self.cfg.actions[pos].context_file.clear();
             }
         });
+        if self.cfg.actions[pos].context_file.trim().is_empty()
+            && self.cfg.actions[pos].prompt.contains("сведения")
+        {
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 130, 40),
+                "Промпт ссылается на сведения, но файл не выбран — отвечать будет не по чему",
+            );
+        }
         if !self.cfg.actions[pos].context_file.is_empty() {
             match self.cfg.actions[pos].load_context() {
                 Ok(Some(text)) => {
@@ -1885,6 +1893,16 @@ impl App {
             "Надиктованный текст пройдёт через этот промпт до вставки. Результат \
              и сочетание клавиш здесь ни при чём — они для ручного запуска.",
         );
+        if self.cfg.actions[pos].after_dictation {
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 130, 40),
+                "Время ответа модели добавляется к каждой диктовке",
+            );
+            ui.weak(
+                "Крупная модель здесь обойдётся дорого по ожиданию: разница между \
+                 быстрой и большой на короткой фразе — секунды против десятка секунд.",
+            );
+        }
     }
 
     fn ui_update_block(&mut self, ui: &mut egui::Ui) {
