@@ -217,11 +217,11 @@ impl Matcher {
             if is_down {
                 if let Some((id, _)) = best_action {
                     if self.fired.as_deref() != Some(id.as_str()) {
-                        // Диктовка успела начаться по более короткому сочетанию —
-                        // выбрасываем запись, пользователь метил в действие.
-                        if recording {
-                            out.push(HotKeyEvent::CancelRecording);
-                        }
+                        // Отмену шлём всегда, не глядя на флаг записи: клавиши
+                        // приходят быстрее, чем рабочий поток успевает его
+                        // выставить, и при быстром нажатии диктовка оставалась
+                        // включённой. Лишняя отмена безвредна.
+                        out.push(HotKeyEvent::CancelRecording);
                         self.fired = Some(id.clone());
                         out.push(HotKeyEvent::Action(id.clone()));
                     }
@@ -381,6 +381,9 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
                 *cb_state.held_now.lock().unwrap() = held.clone();
 
                 if cb_state.is_capturing() {
+                    // Во время набора пишем каждое событие: иначе не отличить
+                    // «клавиша не дошла» от «дошла, но не попала в набор».
+                    log::info!("событие при наборе: {kind:?} код={code}");
                     if let Some(keys) = capture.lock().unwrap().update(&held, is_down) {
                         log::info!("набрано сочетание: {keys:?}");
                         let _ = cb_tx.send(HotKeyEvent::Captured(keys));
@@ -463,6 +466,7 @@ mod tests {
     const L_CMD: u16 = 55;
     const L_OPT: u16 = 58;
     const R_CMD: u16 = 54;
+    const R_OPT: u16 = 61;
     const KEY_C: u16 = 8;
     const SPACE: u16 = 49;
 
@@ -568,7 +572,10 @@ mod tests {
             .is_empty());
         assert_eq!(
             m.decide(&[KEY_C, L_CMD, L_OPT], true, &dict, &acts, false, false),
-            vec![HotKeyEvent::Action("перевод".into())]
+            vec![
+                HotKeyEvent::CancelRecording,
+                HotKeyEvent::Action("перевод".into())
+            ]
         );
     }
 
@@ -584,7 +591,33 @@ mod tests {
             .is_empty());
         assert_eq!(
             m.decide(&[L_OPT, SPACE], true, &dict, &acts, false, false),
-            vec![HotKeyEvent::Action("правка".into())]
+            vec![
+                HotKeyEvent::CancelRecording,
+                HotKeyEvent::Action("правка".into())
+            ]
+        );
+    }
+
+    /// Клавиши приходят быстрее, чем рабочий поток успевает отметить начало
+    /// записи. Отмену надо слать и при `recording = false`, иначе в режиме
+    /// переключателя диктовка остаётся включённой.
+    #[test]
+    fn действие_отменяет_диктовку_даже_если_флаг_отстал() {
+        let mut m = Matcher::default();
+        let dict = Binding::new(vec![R_CMD]);
+        let acts = actions(&[("перевод", &[R_CMD, R_OPT])]);
+
+        assert_eq!(
+            m.decide(&[R_CMD], true, &dict, &acts, false, true),
+            vec![HotKeyEvent::StartRecording]
+        );
+        // Рабочий поток ещё не выставил флаг, а действие уже сработало.
+        assert_eq!(
+            m.decide(&[R_CMD, R_OPT], true, &dict, &acts, false, true),
+            vec![
+                HotKeyEvent::CancelRecording,
+                HotKeyEvent::Action("перевод".into())
+            ]
         );
     }
 
@@ -598,7 +631,7 @@ mod tests {
         assert_eq!(
             m.decide(&[L_OPT, SPACE], true, &dict, &acts, false, false)
                 .len(),
-            1
+            2
         );
         assert!(m
             .decide(&[L_OPT, SPACE], true, &dict, &acts, false, false)
@@ -612,7 +645,7 @@ mod tests {
         assert_eq!(
             m.decide(&[L_OPT, SPACE], true, &dict, &acts, false, false)
                 .len(),
-            1
+            2
         );
     }
 

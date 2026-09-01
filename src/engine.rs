@@ -322,6 +322,13 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
             }
 
             HotKeyEvent::Action(id) => {
+                // Запись могла успеть начаться по более короткому сочетанию,
+                // и в режиме переключателя она бы так и осталась включённой.
+                if let Some(rec) = recording.take() {
+                    let _ = rec.finish();
+                    shared.hotkey_state.set_recording(false);
+                    shared.set_stage(Stage::Idle);
+                }
                 run_action(&shared, &id);
             }
 
