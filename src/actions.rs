@@ -17,8 +17,21 @@ pub enum Output {
 impl Output {
     pub fn label(self) -> &'static str {
         match self {
-            Output::Clipboard => "в буфер обмена",
-            Output::Replace => "заменить выделенное",
+            Output::Clipboard => "положить в буфер",
+            Output::Replace => "заменить выделенное сразу",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            Output::Clipboard => {
+                "Результат ложится в буфер обмена, у курсора появляется плашка. \
+                 Вставляете сами, ⌘V — удобно, когда ответ идёт в другое окно."
+            }
+            Output::Replace => {
+                "Выделенный текст заменяется результатом на месте, вставлять ничего \
+                 не нужно. Удобно для перевода и правки прямо в письме."
+            }
         }
     }
 }

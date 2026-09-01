@@ -100,6 +100,24 @@ fn press_cmd_v() -> Result<()> {
 /// Вставляет текст под курсором. Возвращает прежнее содержимое буфера.
 pub fn insert(text: &str, restore_clipboard: bool) -> Result<Option<String>> {
     let previous = read_clipboard();
+    insert_restoring(
+        text,
+        if restore_clipboard {
+            previous.clone()
+        } else {
+            None
+        },
+    )?;
+    Ok(previous)
+}
+
+/// То же, но возвращает в буфер заданное значение, а не то, что там было
+/// перед вставкой.
+///
+/// Нужно для замены выделенного: к этому моменту в буфере лежит само
+/// выделение, скопированное нами же, а вернуть надо то, что было у
+/// пользователя до всей операции.
+pub fn insert_restoring(text: &str, restore: Option<String>) -> Result<()> {
     write_clipboard(text)?;
 
     // Пастборд обновляется асинхронно, без паузы приложение-получатель
@@ -107,15 +125,13 @@ pub fn insert(text: &str, restore_clipboard: bool) -> Result<Option<String>> {
     std::thread::sleep(Duration::from_millis(60));
     press_cmd_v()?;
 
-    if restore_clipboard {
-        if let Some(prev) = previous.clone() {
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(400));
-                let _ = write_clipboard(&prev);
-            });
-        }
+    if let Some(prev) = restore {
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            let _ = write_clipboard(&prev);
+        });
     }
-    Ok(previous)
+    Ok(())
 }
 
 pub fn play_sound(name: &str) {

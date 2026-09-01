@@ -1584,6 +1584,7 @@ impl App {
                 ui.selectable_value(&mut self.cfg.actions[pos].output, o, o.label());
             }
         });
+        ui.weak(self.cfg.actions[pos].output.hint());
 
         // --- файл со сведениями ---
         ui.add_space(8.0);

@@ -597,7 +597,14 @@ fn run_action(shared: &Arc<Shared>, id: &str) {
 
             match action.output {
                 crate::actions::Output::Replace => {
-                    insert::insert(&result, cfg.general.restore_clipboard)?;
+                    // Возвращаем в буфер то, что там было до нашего ⌘C,
+                    // а не скопированное выделение.
+                    let restore = cfg
+                        .general
+                        .restore_clipboard
+                        .then(|| previous.clone())
+                        .flatten();
+                    insert::insert_restoring(&result, restore)?;
                 }
                 crate::actions::Output::Clipboard => {
                     insert::write_clipboard(&result)?;
