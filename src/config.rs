@@ -159,7 +159,9 @@ impl Default for GeneralConfig {
             hotkey: Binding::default(),
             hotkey_mode: HotKeyMode::Hold,
             show_in_dock: false,
-            play_sounds: true,
+            // По умолчанию тихо: приложение работает в фоне и подаёт голос
+            // на каждую диктовку — это быстро надоедает.
+            play_sounds: false,
             restore_clipboard: true,
             history_limit: 200,
             max_recording_secs: 60,
