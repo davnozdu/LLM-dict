@@ -163,6 +163,27 @@ pub fn reset_accessibility() -> Result<(), String> {
     }
 }
 
+/// Стирает запись о «Мониторинге ввода».
+///
+/// Разрешение помнится вместе с подписью приложения: после смены подписи в
+/// списке остаётся запись от прежней сборки, тумблер выглядит включённым, а
+/// текущему процессу отказывают. Сброс убирает старую запись начисто.
+pub fn reset_input_monitoring() -> Result<(), String> {
+    reset_service("ListenEvent")
+}
+
+fn reset_service(service: &str) -> Result<(), String> {
+    let out = std::process::Command::new("/usr/bin/tccutil")
+        .args(["reset", service, BUNDLE_ID])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
 pub fn reset_microphone() -> Result<(), String> {
     let out = std::process::Command::new("/usr/bin/tccutil")
         .args(["reset", "Microphone", BUNDLE_ID])

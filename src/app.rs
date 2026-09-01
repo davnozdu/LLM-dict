@@ -1842,7 +1842,24 @@ impl App {
             if ui.button("Открыть настройки").clicked() {
                 permissions::open_input_monitoring_settings();
             }
+            if ui.button("Сбросить и выдать заново").clicked() {
+                match permissions::reset_input_monitoring() {
+                    Ok(()) => {
+                        self.toast("Запись сброшена — выдайте доступ заново");
+                        permissions::prompt_input_monitoring();
+                    }
+                    Err(e) => self.toast(format!("tccutil: {e}")),
+                }
+            }
         });
+        if !listen.is_ok() {
+            ui.weak(
+                "Если тумблер в настройках включён, а здесь написано «запрещён» — \
+                 там осталась запись от прежней сборки. Нажмите «Сбросить и выдать \
+                 заново», удалите строку LLM-dict из системного списка кнопкой −, \
+                 затем перезапустите приложение.",
+            );
+        }
         if !listen.is_ok() {
             ui.weak(
                 "Без него перехватчик работает уровнем выше, и сочетания, которые \
