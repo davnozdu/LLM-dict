@@ -1001,6 +1001,29 @@ impl App {
                 ui.add(egui::DragValue::new(&mut self.cfg.general.history_limit).range(10..=5000));
             });
 
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Пределы записи").weak());
+            labeled(ui, "Максимум диктовки", |ui| {
+                ui.add(
+                    egui::DragValue::new(&mut self.cfg.general.max_recording_secs)
+                        .range(5..=1800)
+                        .suffix(" с"),
+                );
+                ui.weak("запись оборвётся сама, даже если клавишу зажали и забыли");
+            });
+            labeled(ui, "Обрыв по тишине", |ui| {
+                ui.add(
+                    egui::DragValue::new(&mut self.cfg.general.silence_stop_secs)
+                        .range(0..=60)
+                        .suffix(" с"),
+                );
+                ui.weak(if self.cfg.general.silence_stop_secs == 0 {
+                    "выключено"
+                } else {
+                    "столько тишины подряд — и запись останавливается"
+                });
+            });
+
             ui.add_space(12.0);
             ui.separator();
             ui.add_space(6.0);

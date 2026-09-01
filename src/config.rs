@@ -123,6 +123,11 @@ pub struct GeneralConfig {
     pub restore_clipboard: bool,
     /// Сколько записей диктовки хранить.
     pub history_limit: usize,
+    /// Предел длины одной диктовки в секундах. Запись оборвётся сама, даже
+    /// если клавишу зажали и забыли.
+    pub max_recording_secs: u32,
+    /// Обрывать запись после стольких секунд тишины. Ноль — не обрывать.
+    pub silence_stop_secs: u32,
     /// Показывать маленький индикатор у курсора во время диктовки.
     pub show_overlay: bool,
     /// Проверять обновления при запуске.
@@ -154,6 +159,8 @@ impl Default for GeneralConfig {
             play_sounds: true,
             restore_clipboard: true,
             history_limit: 200,
+            max_recording_secs: 60,
+            silence_stop_secs: 4,
             show_overlay: true,
             check_updates: true,
             swallow_hotkey: false,

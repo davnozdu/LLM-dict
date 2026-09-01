@@ -251,7 +251,45 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
         }
     }
 
-    while let Ok(event) = rx.recv() {
+    loop {
+        // Пока идёт запись, ждём событие с таймаутом: иначе некому проверить,
+        // не пора ли оборвать её по тишине или по пределу длины.
+        let event = if recording.is_some() {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(e) => Some(e),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match rx.recv() {
+                Ok(e) => Some(e),
+                Err(_) => break,
+            }
+        };
+
+        // Проверка пределов до разбора события: остановиться надо и тогда,
+        // когда пользователь ничего не нажимает.
+        let mut forced_stop = false;
+        if let Some(rec) = recording.as_mut() {
+            let cfg = shared.config_snapshot();
+            if let Some(reason) = rec.should_stop(
+                cfg.general.max_recording_secs,
+                cfg.general.silence_stop_secs,
+            ) {
+                log::info!("запись оборвана: {reason}");
+                shared.notify(format!("Запись остановлена: {reason}"));
+                forced_stop = true;
+            }
+        }
+
+        let event = if forced_stop {
+            Some(HotKeyEvent::StopRecording)
+        } else {
+            event
+        };
+
+        let Some(event) = event else { continue };
+
         match event {
             HotKeyEvent::StartRecording => {
                 if recording.is_some() {

@@ -27,13 +27,38 @@ impl Level {
 pub struct Recording {
     stop_tx: Sender<()>,
     done_rx: Receiver<Vec<f32>>,
+    started: std::time::Instant,
+    level: Arc<Level>,
+    /// Когда в последний раз слышали что-то громче порога тишины.
+    last_sound: std::time::Instant,
 }
+
+/// Ниже этого уровня считаем, что говорить перестали. Порог низкий:
+/// комнатный шум и дыхание сюда попадать не должны, а тихая речь — должна.
+const SILENCE_LEVEL: f32 = 0.02;
 
 impl Recording {
     /// Останавливает запись и отдаёт накопленные сэмплы (16 кГц, моно, f32).
     pub fn finish(self) -> Vec<f32> {
         let _ = self.stop_tx.send(());
         self.done_rx.recv().unwrap_or_default()
+    }
+
+    /// Причина оборвать запись, если она есть.
+    ///
+    /// Проверяется снаружи, из рабочего потока: сам поток записи о настройках
+    /// не знает, а держать их копию в двух местах ни к чему.
+    pub fn should_stop(&mut self, max_secs: u32, silence_secs: u32) -> Option<&'static str> {
+        if self.level.get() > SILENCE_LEVEL {
+            self.last_sound = std::time::Instant::now();
+        }
+        if max_secs > 0 && self.started.elapsed().as_secs() >= max_secs as u64 {
+            return Some("достигнут предел длины записи");
+        }
+        if silence_secs > 0 && self.last_sound.elapsed().as_secs() >= silence_secs as u64 {
+            return Some("тишина");
+        }
+        None
     }
 }
 
@@ -80,6 +105,7 @@ impl Downmix {
 }
 
 pub fn start(level: Arc<Level>) -> Result<Recording> {
+    let level_out = level.clone();
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
     let (done_tx, done_rx) = mpsc::channel::<Vec<f32>>();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
@@ -180,7 +206,13 @@ pub fn start(level: Arc<Level>) -> Result<Recording> {
     });
 
     match ready_rx.recv() {
-        Ok(Ok(())) => Ok(Recording { stop_tx, done_rx }),
+        Ok(Ok(())) => Ok(Recording {
+            stop_tx,
+            done_rx,
+            started: std::time::Instant::now(),
+            level: level_out,
+            last_sound: std::time::Instant::now(),
+        }),
         Ok(Err(e)) => Err(anyhow!(e)),
         Err(_) => Err(anyhow!("поток записи не запустился")),
     }

@@ -135,12 +135,75 @@ fn run_action_test(name: &str, text: &str) -> eframe::Result<()> {
     Ok(())
 }
 
+/// Печатает всё, что видит перехватчик, разбирая события тем же кодом, что и
+/// приложение. Нужен, чтобы отделить «событие не пришло» от «пришло, но мы
+/// его выбросили при разборе».
+fn run_watch_keys() -> eframe::Result<()> {
+    // Полный путь приложения: перехватчик → канал → рабочий поток → общее
+    // состояние → опрос из окна. Прямое чтение канала проверяло только
+    // половину, а сочетание могло теряться и дальше.
+    let cfg = config::Config::load().normalized();
+    let shared = engine::Shared::new(cfg);
+    let _tx = engine::spawn(shared.clone());
+    // Флаг готовности перехватчика выставляется внутри spawn через 400 мс —
+    // ждём дольше, иначе читаем его раньше времени.
+    std::thread::sleep(std::time::Duration::from_millis(900));
+
+    if !shared
+        .tap_running
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        eprintln!("перехватчик не поднялся — нет «Универсального доступа»");
+        std::process::exit(1);
+    }
+    shared.hotkey_state.set_capturing(true);
+
+    println!("Слушаю 20 секунд. Нажимайте сочетания — покажу всё, что дойдёт.\n");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut seen_last = String::new();
+    let mut regular_keys = 0usize;
+    let mut max_len = 0usize;
+
+    while std::time::Instant::now() < deadline {
+        // Сырые события: печатаем только новые, иначе список повторяется.
+        if let Some(line) = shared.hotkey_state.recent_events().into_iter().next() {
+            if line != seen_last {
+                if line.starts_with("нажатие") {
+                    regular_keys += 1;
+                }
+                println!("  {line}");
+                seen_last = line;
+            }
+        }
+        // Ровно то же, что делает окно настроек.
+        if let Some(keys) = shared.take_captured() {
+            let names: Vec<String> = keys.iter().map(|k| binding::key_label(*k)).collect();
+            max_len = max_len.max(keys.len());
+            println!("НАБОР ИЗ {} КЛАВИШ: {}", keys.len(), names.join(" + "));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(16));
+    }
+
+    println!("\n--- итог ---");
+    println!("Самый длинный набор: {max_len} клавиш");
+    if regular_keys == 0 {
+        println!("Обычных клавиш (букв, цифр, пробела) не нажималось ни разу —");
+        println!("до перехватчика дошли только модификаторы.");
+    } else {
+        println!("Обычных клавиш получено: {regular_keys}. Перехватчик их видит.");
+    }
+    Ok(())
+}
+
 fn main() -> eframe::Result<()> {
     logging::init();
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 3 && args[1] == "--bench" {
         return run_bench(&args[2], args.get(3).map(|s| s.as_str()));
+    }
+    if args.len() >= 2 && args[1] == "--watch-keys" {
+        return run_watch_keys();
     }
     if args.len() >= 4 && args[1] == "--test-action" {
         return run_action_test(&args[2], &args[3]);
