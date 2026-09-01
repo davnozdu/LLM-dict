@@ -101,8 +101,16 @@ pub fn init() {
     if log::set_boxed_logger(logger).is_ok() {
         log::set_max_level(level);
     }
+    // Отладочные запуски помечаются отдельно: иначе в журнале они выглядят
+    // как обычный старт, и записи от них легко принять за действия
+    // пользователя — на этом я сам однажды ошибся в разборе.
+    let mode = std::env::args()
+        .nth(1)
+        .filter(|a| a.starts_with("--"))
+        .map(|a| format!(" [{a}]"))
+        .unwrap_or_default();
     log::info!(
-        "LLM-dict {} запущен, журнал: {}",
+        "LLM-dict {} запущен{mode}, журнал: {}",
         env!("CARGO_PKG_VERSION"),
         path.display()
     );
