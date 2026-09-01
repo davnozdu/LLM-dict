@@ -32,6 +32,7 @@ pub enum HotKeyEvent {
 pub struct HotKeyState {
     binding: Mutex<Binding>,
     /// Сочетания действий над текстом: идентификатор действия и его клавиши.
+    /// Окно выбора из буфера обмена ходит здесь же под своим именем.
     actions: Mutex<Vec<(String, Binding)>>,
     /// 0 = Hold, 1 = Toggle
     mode: AtomicU8,

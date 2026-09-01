@@ -132,6 +132,12 @@ pub struct GeneralConfig {
     pub silence_stop_secs: u32,
     /// Показывать маленький индикатор у курсора во время диктовки.
     pub show_overlay: bool,
+    /// Вести историю буфера обмена.
+    pub clipboard_history: bool,
+    /// Сколько дней её хранить. Ноль — не выбрасывать.
+    pub clipboard_days: u32,
+    /// Сочетание, открывающее окно выбора из истории буфера.
+    pub clipboard_hotkey: Binding,
     /// Проверять обновления при запуске.
     pub check_updates: bool,
     /// Не пропускать обычную клавишу сочетания дальше в систему.
@@ -167,6 +173,9 @@ impl Default for GeneralConfig {
             max_recording_secs: 60,
             silence_stop_secs: 4,
             show_overlay: true,
+            clipboard_history: true,
+            clipboard_days: 30,
+            clipboard_hotkey: Binding::new(Vec::new()),
             check_updates: true,
             swallow_hotkey: true,
             actions_initialised: false,

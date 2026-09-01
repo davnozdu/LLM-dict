@@ -69,6 +69,10 @@ pub struct Shared {
     /// кадры сам, а плашку у курсора рисовать всё равно надо.
     #[allow(clippy::type_complexity)]
     wake: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Пользователь попросил окно выбора из буфера обмена.
+    pub clipboard_requested: AtomicBool,
+    /// История буфера обмена.
+    pub clipboard: Arc<crate::clipboard::History>,
     /// Растёт при каждом изменении, чтобы трей перерисовал иконку.
     pub dirty: AtomicBool,
 }
@@ -80,15 +84,10 @@ impl Shared {
             config.general.hotkey_mode,
         ));
         hotkey_state.set_swallow(config.general.swallow_hotkey);
-        hotkey_state.set_actions(
-            config
-                .actions
-                .iter()
-                .filter(|a| a.enabled && !a.hotkey.is_empty())
-                .map(|a| (a.id.clone(), a.hotkey.clone()))
-                .collect(),
-        );
+        hotkey_state.set_actions(collect_bindings(&config));
         let limit = config.general.history_limit;
+        let clipboard = crate::clipboard::History::new(config.general.clipboard_history);
+        crate::clipboard::spawn(clipboard.clone(), config.general.clipboard_days);
         let shared = Arc::new(Self {
             config: RwLock::new(config),
             api_key: RwLock::new(String::new()),
@@ -103,6 +102,8 @@ impl Shared {
             captured: Mutex::new(None),
             notice: Mutex::new(None),
             wake: Mutex::new(None),
+            clipboard_requested: AtomicBool::new(false),
+            clipboard,
             dirty: AtomicBool::new(true),
         });
 
@@ -130,7 +131,7 @@ impl Shared {
         *self.wake.lock().unwrap() = Some(f);
     }
 
-    fn wake_ui(&self) {
+    pub fn wake_ui(&self) {
         if let Some(f) = self.wake.lock().unwrap().as_ref() {
             f();
         }
@@ -188,18 +189,17 @@ impl Shared {
         self.hotkey_state.set_binding(cfg.general.hotkey.clone());
         self.hotkey_state.set_mode(cfg.general.hotkey_mode);
         self.hotkey_state.set_swallow(cfg.general.swallow_hotkey);
-        self.hotkey_state.set_actions(
-            cfg.actions
-                .iter()
-                .filter(|a| a.enabled && !a.hotkey.is_empty())
-                .map(|a| (a.id.clone(), a.hotkey.clone()))
-                .collect(),
-        );
+        self.hotkey_state.set_actions(collect_bindings(&cfg));
     }
 }
 
 /// Сколько живёт сообщение о готовности. Секунда — чтобы заметить и не
 /// раздражаться: плашка висит поверх всего.
+/// Особое имя для сочетания, открывающего окно выбора из буфера.
+/// Проходит тем же путём, что и действия, — отдельная ветка в перехватчике
+/// только усложнила бы разбор вложенных сочетаний.
+pub const CLIPBOARD_ACTION_ID: &str = "__clipboard_picker__";
+
 pub const NOTICE_LIFETIME: std::time::Duration = std::time::Duration::from_millis(1000);
 
 /// Слишком короткое нажатие — это промах по клавише, а не диктовка.
@@ -321,6 +321,12 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
                 shared.set_stage(Stage::Idle);
             }
 
+            HotKeyEvent::Action(id) if id == CLIPBOARD_ACTION_ID => {
+                // Окно рисует интерфейс, поэтому здесь только поднимаем флаг.
+                shared.clipboard_requested.store(true, Ordering::Relaxed);
+                shared.wake_ui();
+            }
+
             HotKeyEvent::Action(id) => {
                 // Запись могла успеть начаться по более короткому сочетанию,
                 // и в режиме переключателя она бы так и осталась включённой.
@@ -369,6 +375,23 @@ struct Outcome {
     duration_secs: f32,
     clipboard_before: Option<String>,
     engine: Engine,
+}
+
+/// Все сочетания, кроме диктовки: действия над текстом и окно буфера.
+fn collect_bindings(cfg: &Config) -> Vec<(String, crate::binding::Binding)> {
+    let mut out: Vec<(String, crate::binding::Binding)> = cfg
+        .actions
+        .iter()
+        .filter(|a| a.enabled && !a.hotkey.is_empty())
+        .map(|a| (a.id.clone(), a.hotkey.clone()))
+        .collect();
+    if !cfg.general.clipboard_hotkey.is_empty() {
+        out.push((
+            CLIPBOARD_ACTION_ID.to_string(),
+            cfg.general.clipboard_hotkey.clone(),
+        ));
+    }
+    out
 }
 
 /// Какие действия применялись после диктовки — для колонки в истории.

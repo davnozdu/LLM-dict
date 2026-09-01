@@ -6,6 +6,7 @@ mod app;
 mod audio;
 mod autostart;
 mod binding;
+mod clipboard;
 mod config;
 mod conflicts;
 mod engine;

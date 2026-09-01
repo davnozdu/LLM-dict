@@ -62,6 +62,14 @@ pub struct App {
     verdict_for: Binding,
     update: UpdateState,
     update_checked: bool,
+    /// Открыто окно выбора из буфера обмена.
+    picker: bool,
+    picker_query: String,
+    picker_index: usize,
+    /// Куда вернуть фокус после выбора.
+    picker_return_pid: Option<i32>,
+    /// Набирается сочетание именно для окна буфера, а не для действия.
+    capturing_clipboard: bool,
     duplicates: Vec<String>,
     duplicates_checked: Instant,
     key_synced: bool,
@@ -132,6 +140,11 @@ impl App {
             verdict_for: Binding::new(Vec::new()),
             update: UpdateState::Idle,
             update_checked: false,
+            picker: false,
+            picker_query: String::new(),
+            picker_index: 0,
+            picker_return_pid: None,
+            capturing_clipboard: false,
             duplicates: Vec::new(),
             duplicates_checked: Instant::now() - Duration::from_secs(60),
             key_synced: false,
@@ -455,6 +468,15 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
         self.poll_model_check();
+        // Запрос на окно буфера приходит из перехватчика клавиш.
+        if self
+            .shared
+            .clipboard_requested
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            self.open_picker(ctx);
+        }
+
         self.poll_api_key();
         self.poll_download();
         self.poll_capture();
@@ -534,6 +556,13 @@ impl eframe::App for App {
             });
             ui.add_space(3.0);
         });
+
+        if self.picker {
+            egui::CentralPanel::default().show(ui, |ui| self.ui_picker(ui));
+            self.apply_config();
+            ctx.request_repaint_after(Duration::from_millis(50));
+            return;
+        }
 
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
             Tab::Status => self.ui_status(ui),
@@ -852,6 +881,64 @@ impl App {
                      отвечает системным писком.",
                 );
             }
+
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("История буфера обмена").strong());
+            ui.add_space(4.0);
+            ui.checkbox(
+                &mut self.cfg.general.clipboard_history,
+                "Запоминать всё, что попадает в буфер",
+            );
+            self.shared
+                .clipboard
+                .set_enabled(self.cfg.general.clipboard_history);
+
+            let capturing_clip = self.capturing_clipboard;
+            ui.horizontal(|ui| {
+                ui.add_sized([130.0, 20.0], egui::Label::new("Сочетание"));
+                if capturing_clip {
+                    let shown = if self.capture_preview.is_empty() {
+                        "нажмите клавиши…".to_string()
+                    } else {
+                        Binding::new(self.capture_preview.clone()).label()
+                    };
+                    ui.colored_label(egui::Color32::from_rgb(90, 140, 240), shown);
+                    if ui
+                        .add_enabled(!self.capture_preview.is_empty(), egui::Button::new("ОК"))
+                        .clicked()
+                    {
+                        self.cfg.general.clipboard_hotkey =
+                            Binding::new(self.capture_preview.clone());
+                        self.set_capturing(false);
+                        self.capturing_clipboard = false;
+                    }
+                    if ui.button("Отмена").clicked() {
+                        self.set_capturing(false);
+                        self.capturing_clipboard = false;
+                    }
+                } else {
+                    ui.label(self.cfg.general.clipboard_hotkey.label());
+                    if ui.button("Задать").clicked() {
+                        self.set_capturing(true);
+                        self.capturing_clipboard = true;
+                    }
+                    if !self.cfg.general.clipboard_hotkey.is_empty()
+                        && ui.button("Убрать").clicked()
+                    {
+                        self.cfg.general.clipboard_hotkey = Binding::new(Vec::new());
+                    }
+                }
+            });
+            labeled(ui, "Хранить дней", |ui| {
+                ui.add(egui::DragValue::new(&mut self.cfg.general.clipboard_days).range(0..=365));
+                ui.weak(if self.cfg.general.clipboard_days == 0 {
+                    "не выбрасывать"
+                } else {
+                    "старые записи удаляются сами"
+                });
+            });
 
             ui.add_space(12.0);
             ui.separator();
@@ -1298,6 +1385,126 @@ impl App {
         });
         self.model_fetch = Some((provider, FetchKind::KeyCheck, rx));
         self.toast(format!("Проверяю ключ {}…", provider.label()));
+    }
+
+    /// Открывает окно выбора из истории буфера.
+    ///
+    /// Запоминает, кто был впереди: после выбора фокус надо вернуть туда,
+    /// иначе вставка уйдёт в наше же окно.
+    fn open_picker(&mut self, ctx: &egui::Context) {
+        self.picker_return_pid = macos::frontmost_app_pid();
+        self.picker = true;
+        self.picker_query.clear();
+        self.picker_index = 0;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        macos::activate();
+    }
+
+    fn close_picker(&mut self, ctx: &egui::Context) {
+        self.picker = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        if let Some(pid) = self.picker_return_pid.take() {
+            macos::activate_app(pid);
+        }
+    }
+
+    /// Вставляет выбранное туда, откуда пришёл пользователь.
+    fn paste_from_picker(&mut self, ctx: &egui::Context, text: String) {
+        self.close_picker(ctx);
+        let clipboard = self.shared.clipboard.clone();
+        std::thread::spawn(move || {
+            // Ждём, пока система вернёт фокус прежней программе: вставка
+            // раньше этого уйдёт в никуда.
+            std::thread::sleep(Duration::from_millis(220));
+            clipboard.mark_ours(&text);
+            if let Err(e) = insert::insert_restoring(&text, None) {
+                log::warn!("вставка из истории буфера: {e}");
+            }
+        });
+    }
+
+    fn ui_picker(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("История буфера обмена").strong());
+            ui.weak("Enter — вставить, Esc — закрыть");
+        });
+        ui.add_space(4.0);
+
+        let search = ui.add(
+            egui::TextEdit::singleline(&mut self.picker_query)
+                .desired_width(f32::INFINITY)
+                .hint_text("поиск по тексту"),
+        );
+        // Фокус в поле поиска: окно открылось по горячей клавише, и печатать
+        // пользователь начнёт сразу.
+        if !search.has_focus() {
+            search.request_focus();
+        }
+
+        let entries = self.shared.clipboard.entries.lock().unwrap().clone();
+        let query = self.picker_query.trim().to_lowercase();
+        let found: Vec<&crate::clipboard::Entry> = entries
+            .iter()
+            .filter(|e| query.is_empty() || e.text.to_lowercase().contains(&query))
+            .take(200)
+            .collect();
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.close_picker(&ctx);
+            return;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) && !found.is_empty() {
+            self.picker_index = (self.picker_index + 1).min(found.len() - 1);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+            self.picker_index = self.picker_index.saturating_sub(1);
+        }
+        if self.picker_index >= found.len() {
+            self.picker_index = found.len().saturating_sub(1);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+            if let Some(entry) = found.get(self.picker_index) {
+                let text = entry.text.clone();
+                self.paste_from_picker(&ctx, text);
+                return;
+            }
+        }
+
+        ui.add_space(6.0);
+        if found.is_empty() {
+            ui.weak(if entries.is_empty() {
+                "История пуста. Скопируйте что-нибудь, и оно появится здесь."
+            } else {
+                "Ничего не нашлось."
+            });
+            return;
+        }
+
+        let mut chosen: Option<String> = None;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for (i, entry) in found.iter().enumerate() {
+                let selected = i == self.picker_index;
+                let label = format!("{}   {}", entry.at.format("%d.%m %H:%M"), entry.preview(90));
+                let response = ui.selectable_label(selected, label);
+                if response.clicked() {
+                    chosen = Some(entry.text.clone());
+                }
+                if selected {
+                    response.scroll_to_me(None);
+                    if let Some(source) = &entry.source {
+                        ui.weak(format!("    из {source}"));
+                    }
+                }
+            }
+        });
+
+        if let Some(text) = chosen {
+            self.paste_from_picker(&ctx, text);
+        }
     }
 
     fn ui_actions(&mut self, ui: &mut egui::Ui) {
@@ -1798,52 +2005,66 @@ impl App {
 
     fn ui_clipboard(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
-        ui.label(egui::RichText::new("Что лежало в буфере обмена перед вставкой").strong());
-        ui.weak("Вставка идёт через буфер, поэтому прежнее содержимое сохраняется здесь — на случай, если оно было нужно.");
-        ui.add_space(8.0);
-
-        if let Some(current) = insert::read_clipboard() {
-            ui.weak("Сейчас в буфере:");
-            ui.label(truncate(&current, 300));
-            ui.separator();
-            ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("История буфера обмена").strong());
+            if !self.cfg.general.clipboard_hotkey.is_empty() {
+                ui.weak(format!(
+                    "быстрый выбор: {}",
+                    self.cfg.general.clipboard_hotkey.label()
+                ));
+            }
+        });
+        if !self.cfg.general.clipboard_history {
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 130, 40),
+                "Запоминание выключено — включите в настройках.",
+            );
         }
+        ui.add_space(6.0);
 
-        let entries = self.shared.history.lock().unwrap().clone();
-        let with_clip: Vec<&history::Entry> = entries
-            .iter()
-            .filter(|e| {
-                e.clipboard_before
-                    .as_deref()
-                    .is_some_and(|s| !s.trim().is_empty())
-            })
-            .collect();
+        ui.horizontal(|ui| {
+            if ui.button("Очистить историю").clicked() {
+                let _ = crate::clipboard::clear();
+                self.shared.clipboard.entries.lock().unwrap().clear();
+                self.toast("История буфера очищена");
+            }
+            let days = self.cfg.general.clipboard_days;
+            if days > 0 {
+                ui.weak(format!("хранится {days} дн."));
+            }
+        });
+        ui.add_space(6.0);
 
-        if with_clip.is_empty() {
-            ui.weak("Пока пусто.");
+        let entries = self.shared.clipboard.entries.lock().unwrap().clone();
+        if entries.is_empty() {
+            ui.weak("Пока пусто. Скопируйте что-нибудь, и оно появится здесь.");
             return;
         }
 
-        let mut restore: Option<String> = None;
+        let mut copy: Option<String> = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
-            for (i, e) in with_clip.iter().enumerate() {
-                let Some(clip) = &e.clipboard_before else {
-                    continue;
-                };
+            for (i, entry) in entries.iter().take(300).enumerate() {
                 ui.push_id(i, |ui| {
-                    ui.weak(e.at.format("%d.%m %H:%M:%S").to_string());
-                    ui.label(truncate(clip, 400));
+                    ui.horizontal(|ui| {
+                        ui.weak(entry.at.format("%d.%m %H:%M").to_string());
+                        if let Some(source) = &entry.source {
+                            ui.weak("·");
+                            ui.weak(source);
+                        }
+                    });
+                    ui.label(entry.preview(160));
                     if ui.small_button("Вернуть в буфер").clicked() {
-                        restore = Some(clip.clone());
+                        copy = Some(entry.text.clone());
                     }
                     ui.separator();
                 });
             }
         });
 
-        if let Some(text) = restore {
+        if let Some(text) = copy {
+            self.shared.clipboard.mark_ours(&text);
             let _ = insert::write_clipboard(&text);
-            self.toast("Возвращено в буфер");
+            self.toast("Скопировано");
         }
     }
 
@@ -2132,12 +2353,4 @@ fn model_picker(ui: &mut egui::Ui, id: &str, value: &mut String, models: &[Strin
                 ui.selectable_value(value, m.clone(), m);
             }
         });
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let head: String = s.chars().take(max).collect();
-    format!("{head}…")
 }

@@ -24,7 +24,7 @@ pub fn write_clipboard(text: &str) -> Result<()> {
 
 /// Счётчик изменений пастборда. По нему видно, что копирование сработало,
 /// — сравнивать тексты ненадёжно: пользователь мог скопировать то же самое.
-fn pasteboard_change_count() -> i64 {
+pub fn pasteboard_change_count() -> i64 {
     use objc2::runtime::AnyObject;
     use objc2::{class, msg_send};
     unsafe {
