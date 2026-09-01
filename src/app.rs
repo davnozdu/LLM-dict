@@ -20,6 +20,17 @@ use std::time::{Duration, Instant};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
+/// Момент в прошлом, пригодный как «давно не проверяли».
+///
+/// Прямое вычитание из `Instant::now()` паникует в первые секунды после
+/// загрузки системы: отсчёт идёт от неё. Для приложения в автозапуске это
+/// падение при входе в систему.
+fn long_ago(secs: u64) -> Instant {
+    Instant::now()
+        .checked_sub(Duration::from_secs(secs))
+        .unwrap_or_else(Instant::now)
+}
+
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Tab {
     Status,
@@ -133,7 +144,10 @@ impl App {
             filter: HistoryFilter::All,
             toast: None,
             perms: (permissions::Status::NotAsked, permissions::Status::NotAsked),
-            perms_checked: Instant::now() - Duration::from_secs(10),
+            // checked_sub, а не вычитание: Instant отсчитывается от загрузки
+            // системы, и в первую минуту после неё вычитание паникует.
+            // Приложение стоит в автозапуске, то есть стартует именно тогда.
+            perms_checked: long_ago(10),
             capturing: false,
             capture_preview: Vec::new(),
             verdict: conflicts::Verdict::Free,
@@ -146,7 +160,7 @@ impl App {
             picker_return_pid: None,
             capturing_clipboard: false,
             duplicates: Vec::new(),
-            duplicates_checked: Instant::now() - Duration::from_secs(60),
+            duplicates_checked: long_ago(60),
             key_synced: false,
             overlay: crate::overlay::Overlay::new(),
             download: None,
@@ -406,7 +420,11 @@ impl App {
         };
         // Полупрозрачная и гаснущая — просили ненавязчивую.
         self.overlay.show(&text, pos, 0.88 * fade);
-        ctx.request_repaint_after(Duration::from_millis(80));
+        // Часто перерисовывать нужно только пока сообщение гаснет. В
+        // остальное время плашка неподвижна, и лишние кадры только грузят
+        // систему — на них жаловались как на подтормаживание курсора.
+        let interval = if fade < 1.0 { 40 } else { 300 };
+        ctx.request_repaint_after(Duration::from_millis(interval));
     }
 
     /// Ключ уходит туда, куда указано настройками, а из другого места

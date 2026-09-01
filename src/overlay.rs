@@ -26,6 +26,15 @@ pub struct Overlay {
     label: *mut AnyObject,
     visible: bool,
     last_text: String,
+    /// Куда поставили плашку при появлении. Дальше она стоит на месте:
+    /// перемещение окна на каждом кадре заметно тормозит курсор, а бегающая
+    /// за указателем плашка ещё и отвлекает.
+    anchor: Option<(f32, f32)>,
+    /// Высота экрана меняется редко, а спрашивать её у системы на каждом
+    /// кадре дорого.
+    screen_height: Option<f64>,
+    last_width: f64,
+    last_opacity: f32,
 }
 
 impl Default for Overlay {
@@ -41,12 +50,16 @@ impl Overlay {
             label: std::ptr::null_mut(),
             visible: false,
             last_text: String::new(),
+            anchor: None,
+            screen_height: None,
+            last_width: 0.0,
+            last_opacity: -1.0,
         }
     }
 
     /// Высота основного экрана: CGEvent отдаёт координаты от верхнего края,
     /// а окна живут в системе координат от нижнего.
-    fn primary_screen_height() -> f64 {
+    fn primary_screen_height_uncached() -> f64 {
         unsafe {
             let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
             if screens.is_null() {
@@ -136,8 +149,15 @@ impl Overlay {
             return;
         }
 
+        // Место выбирается один раз, при появлении.
+        let anchor = *self.anchor.get_or_insert(cursor);
+        let flip = *self
+            .screen_height
+            .get_or_insert_with(Self::primary_screen_height_uncached);
+
         unsafe {
-            if text != self.last_text {
+            let text_changed = text != self.last_text;
+            if text_changed {
                 let ns = NSString::from_str(text);
                 let _: () = msg_send![self.label, setStringValue: &*ns];
                 self.last_text = text.to_string();
@@ -145,14 +165,21 @@ impl Overlay {
 
             // Ширина по длине надписи: обрезанный текст хуже широкой плашки.
             let width = (text.chars().count() as f64 * 7.6 + 34.0).clamp(120.0, 460.0);
-            let height = 30.0;
-            let flip = Self::primary_screen_height();
-            let x = cursor.0 as f64 - width / 2.0;
-            let y = flip - cursor.1 as f64 + 22.0;
+            // Двигаем окно только когда что-то изменилось: setFrame на каждом
+            // кадре — это как раз то, от чего дёргается курсор.
+            if !self.visible || (width - self.last_width).abs() > 0.5 {
+                let x = f64::from(anchor.0) - width / 2.0;
+                let y = flip - f64::from(anchor.1) + 22.0;
+                let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(width, 30.0));
+                let _: () = msg_send![self.window, setFrame: frame, display: true];
+                self.last_width = width;
+            }
 
-            let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(width, height));
-            let _: () = msg_send![self.window, setFrame: frame, display: true];
-            let _: () = msg_send![self.window, setAlphaValue: opacity.clamp(0.0, 1.0) as f64];
+            if (opacity - self.last_opacity).abs() > 0.01 {
+                let _: () =
+                    msg_send![self.window, setAlphaValue: f64::from(opacity.clamp(0.0, 1.0))];
+                self.last_opacity = opacity;
+            }
 
             if !self.visible {
                 // orderFrontRegardless, а не makeKeyAndOrderFront: фокус должен
@@ -164,6 +191,7 @@ impl Overlay {
     }
 
     pub fn hide(&mut self) {
+        self.anchor = None;
         if self.window.is_null() || !self.visible {
             return;
         }

@@ -15,6 +15,10 @@ use std::sync::{Arc, Mutex};
 /// а список должен оставаться списком.
 const MAX_ENTRY_BYTES: usize = 64 * 1024;
 
+/// Сколько записей держим в памяти. На диске остаётся всё до ротации, но
+/// список без предела за месяц активной работы вырос бы до сотен мегабайт.
+const MAX_IN_MEMORY: usize = 500;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
     pub at: DateTime<Local>,
@@ -56,6 +60,13 @@ pub fn load() -> Vec<Entry> {
         .filter_map(|l| serde_json::from_str(&l).ok())
         .collect();
     entries.reverse(); // новые сверху
+    entries
+}
+
+/// То же, но только последние записи — для показа в окне.
+pub fn load_recent() -> Vec<Entry> {
+    let mut entries = load();
+    entries.truncate(MAX_IN_MEMORY);
     entries
 }
 
@@ -107,7 +118,7 @@ pub struct History {
 impl History {
     pub fn new(enabled: bool) -> Arc<Self> {
         Arc::new(Self {
-            entries: Mutex::new(load()),
+            entries: Mutex::new(load_recent()),
             enabled: AtomicBool::new(enabled),
             ours: Mutex::new(None),
         })
@@ -169,6 +180,7 @@ pub fn spawn(history: Arc<History>, days: u32) {
             };
             let _ = append(&entry);
             entries.insert(0, entry);
+            entries.truncate(MAX_IN_MEMORY);
         }
     });
 }

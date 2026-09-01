@@ -501,8 +501,9 @@ fn process(
             ) {
                 Ok(text) => final_text = text,
                 Err(e) => {
+                    // Текст важнее обработки: вставляем распознанное как есть.
                     log::warn!("«{}» не отработало: {e}", action.name);
-                    shared.notify(format!("{} не отработало, вставляю как есть", action.name));
+                    shared.notify(format!("{e} — вставляю без обработки"));
                 }
             }
         }

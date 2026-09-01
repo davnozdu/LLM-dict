@@ -1,6 +1,6 @@
 [package]
 name = "llm-dict"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2021"
 rust-version = "1.82"
 description = "Диктовка через LLM: горячая клавиша, распознавание речи в облаке, вставка под курсором"

@@ -9,9 +9,23 @@ use anyhow::{anyhow, bail, Result};
 use serde::Deserialize;
 use std::time::Duration;
 
+/// Для загрузки записи: минута речи — это мегабайты, отправка небыстрая.
 fn client() -> Result<reqwest::blocking::Client> {
     Ok(reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(120))
+        .connect_timeout(Duration::from_secs(8))
+        .build()?)
+}
+
+/// Для запросов к модели по тексту.
+///
+/// Таймаут короткий намеренно: обработка идёт между распознаванием и
+/// вставкой, и если облако не отвечает, лучше быстро вставить текст как есть,
+/// чем держать пользователя две минуты.
+fn text_client() -> Result<reqwest::blocking::Client> {
+    Ok(reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(25))
+        .connect_timeout(Duration::from_secs(5))
         .build()?)
 }
 
@@ -163,11 +177,19 @@ pub fn run_prompt(
         "messages": messages,
     });
 
-    let mut req = client()?.post(&url).json(&payload);
+    let mut req = text_client()?.post(&url).json(&payload);
     if !api_key.is_empty() {
         req = req.bearer_auth(api_key);
     }
-    let resp = req.send()?;
+    // Отдельное сообщение вместо английского текста от библиотеки: эту
+    // ошибку пользователь видит на плашке во время диктовки.
+    let resp = req.send().map_err(|e| {
+        if e.is_timeout() || e.is_connect() {
+            anyhow!("{} не отвечает", endpoint.provider.label())
+        } else {
+            anyhow!("{e}")
+        }
+    })?;
     let status = resp.status();
     let body = resp.text()?;
     if !status.is_success() {
@@ -200,7 +222,7 @@ pub fn verify_key(endpoint: &crate::provider::Endpoint, api_key: &str) -> Result
         "messages": [{ "role": "user", "content": "ok" }]
     });
 
-    let mut req = client()?.post(&url).json(&payload);
+    let mut req = text_client()?.post(&url).json(&payload);
     if !api_key.is_empty() {
         req = req.bearer_auth(api_key);
     }
