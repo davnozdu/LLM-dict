@@ -607,6 +607,31 @@ impl App {
 
         ui.add_space(8.0);
 
+        // Без «Мониторинга ввода» работают только сочетания из модификаторов.
+        // Диктовка на правом ⌘ при этом идёт как ни в чём не бывало, поэтому
+        // без явного предупреждения причина неочевидна.
+        if !permissions::input_monitoring().is_ok() {
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 80, 80),
+                "Нет разрешения «Мониторинг ввода»",
+            );
+            ui.label(
+                "Сочетания с буквами и цифрами работать не будут: macOS отдаёт \
+                 приложению только модификаторы. Сочетания из одних модификаторов \
+                 при этом работают, поэтому со стороны похоже на выборочный сбой.",
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Выдать разрешение").clicked() {
+                    permissions::prompt_input_monitoring();
+                }
+                if ui.button("Открыть настройки").clicked() {
+                    permissions::open_input_monitoring_settings();
+                }
+            });
+            ui.weak("После выдачи приложение нужно перезапустить.");
+            ui.add_space(10.0);
+        }
+
         let missing = engine::missing_permissions();
         if !missing.is_empty() {
             ui.colored_label(
@@ -757,6 +782,12 @@ impl App {
                     "Зажмите нужное сочетание целиком — до трёх клавиш. \
                      Записывается самый полный набор, который вы удерживали.",
                 );
+                if !permissions::input_monitoring().is_ok() {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 80, 80),
+                        "Буквы и цифры сейчас не поймаются — нет «Мониторинга ввода»",
+                    );
+                }
             } else {
                 ui.horizontal(|ui| {
                     ui.add_sized(

@@ -612,6 +612,9 @@ pub fn missing_permissions() -> Vec<&'static str> {
     if !permissions::microphone().is_ok() {
         out.push("Микрофон");
     }
+    if !permissions::input_monitoring().is_ok() {
+        out.push("Мониторинг ввода");
+    }
     out
 }
 

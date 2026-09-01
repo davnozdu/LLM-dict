@@ -216,6 +216,13 @@ fn main() -> eframe::Result<()> {
         let _ = cfg.save();
     }
     let show_in_dock = cfg.general.show_in_dock;
+    // Без «Мониторинга ввода» macOS отдаёт перехватчику только модификаторы,
+    // а нажатия обычных клавиш молча отсекает. Спрашиваем сразу: иначе
+    // сочетания с буквами не работают, и понять почему невозможно.
+    if permissions::input_monitoring() == permissions::Status::NotAsked {
+        permissions::prompt_input_monitoring();
+    }
+
     let shared = engine::Shared::new(cfg);
 
     // Слушатель клавиши и обработчик поднимаются до окна: диктовка должна
