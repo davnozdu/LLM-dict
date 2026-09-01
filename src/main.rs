@@ -17,6 +17,7 @@ mod insert;
 mod logging;
 mod macos;
 mod models;
+mod net;
 mod overlay;
 mod permissions;
 mod provider;

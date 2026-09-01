@@ -565,6 +565,10 @@ impl eframe::App for App {
                 ));
                 ui.separator();
                 ui.label(self.cfg.stt.engine.label());
+                if !crate::net::is_online() {
+                    ui.separator();
+                    ui.colored_label(egui::Color32::from_rgb(220, 130, 40), "нет сети");
+                }
                 if let Some((msg, at)) = &self.toast {
                     if at.elapsed() < Duration::from_secs(4) {
                         ui.separator();
@@ -677,6 +681,25 @@ impl App {
             });
             ui.weak("После выдачи приложение нужно перезапустить.");
             ui.add_space(10.0);
+        }
+
+        // Без сети облачные действия отказывают сразу, а не по таймауту —
+        // но об этом надо сказать, иначе выглядит как поломка.
+        if !crate::net::is_online() {
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 130, 40),
+                "Сети нет — облачные модели недоступны",
+            );
+            let local_ok = self.cfg.stt.fallback.map(|f| f.is_local()).unwrap_or(false)
+                || self.cfg.stt.engine.is_local();
+            ui.label(if local_ok {
+                "Диктовка работает через локальную модель. Перевод и другие действия \
+                 через облако будут отказывать сразу, без ожидания."
+            } else {
+                "Запасной локальный движок не выбран — диктовка тоже не сработает. \
+                 Настройте его в разделе «Распознавание речи»."
+            });
+            ui.add_space(8.0);
         }
 
         let missing = engine::missing_permissions();

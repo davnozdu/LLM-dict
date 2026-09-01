@@ -436,7 +436,20 @@ fn recognize(
     samples: &[f32],
 ) -> anyhow::Result<(String, Engine)> {
     let key = shared.api_key_snapshot();
-    let primary = cfg.stt.engine;
+    let mut primary = cfg.stt.engine;
+
+    // Без сети облако даже не пробуем: ждать таймаута там, где ответ известен
+    // заранее, — это те самые «тупняки». Сразу берём локальный движок.
+    if primary == Engine::Cloud
+        && !crate::net::is_local_url(&cfg.stt.base_url)
+        && !crate::net::is_online()
+    {
+        if let Some(local_engine) = cfg.stt.fallback.filter(|f| f.is_local()) {
+            log::info!("сети нет — распознаю через {}", local_engine.label());
+            shared.notify("Нет сети — распознаю локально");
+            primary = local_engine;
+        }
+    }
 
     match stt::transcribe(local, cfg, &key, primary, samples) {
         Ok(text) => Ok((text, primary)),

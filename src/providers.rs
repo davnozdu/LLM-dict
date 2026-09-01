@@ -76,11 +76,23 @@ fn require_key(api_key: &str, base_url: &str) -> Result<()> {
 
 /// Локальным серверам (whisper.cpp, Ollama, LM Studio) ключ не нужен.
 fn is_local(base_url: &str) -> bool {
-    base_url.contains("localhost") || base_url.contains("127.0.0.1") || base_url.contains("0.0.0.0")
+    crate::net::is_local_url(base_url)
+}
+
+/// Отказ до запроса, когда сети заведомо нет.
+///
+/// Без этого каждый запрос упирался бы в таймаут: секунды ожидания там, где
+/// ответ известен заранее.
+fn require_network(base_url: &str) -> Result<()> {
+    if !is_local(base_url) && !crate::net::is_online() {
+        bail!("нет сети");
+    }
+    Ok(())
 }
 
 /// Распознавание речи: POST /audio/transcriptions (multipart).
 pub fn transcribe(cfg: &SttConfig, api_key: &str, wav: Vec<u8>) -> Result<String> {
+    require_network(&cfg.base_url)?;
     let url = format!(
         "{}/audio/transcriptions",
         cfg.base_url.trim_end_matches('/')
@@ -154,6 +166,7 @@ pub fn run_prompt(
             endpoint.provider.label()
         );
     }
+    require_network(&base_url)?;
     require_key(api_key, &base_url)?;
 
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
@@ -185,6 +198,11 @@ pub fn run_prompt(
     // ошибку пользователь видит на плашке во время диктовки.
     let resp = req.send().map_err(|e| {
         if e.is_timeout() || e.is_connect() {
+            // Помечаем сеть недоступной: следующий запрос откажет сразу,
+            // а не через таймаут.
+            if !is_local(&base_url) {
+                crate::net::mark_offline();
+            }
             anyhow!("{} не отвечает", endpoint.provider.label())
         } else {
             anyhow!("{e}")
