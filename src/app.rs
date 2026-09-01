@@ -1864,6 +1864,25 @@ impl App {
         ui.add_space(4.0);
 
         let (held, events, regular) = self.shared.hotkey_state.diagnostics();
+
+        // Уровень перехватчика решает, увидим ли мы сочетания, занятые
+        // другими программами, — и увидим ли вообще нажатия клавиш.
+        if self.shared.hotkey_state.is_hid_level() {
+            ui.colored_label(
+                egui::Color32::from_rgb(60, 160, 90),
+                "Перехватчик на HID-уровне — видит клавиши раньше других программ",
+            );
+        } else {
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 130, 40),
+                "Перехватчик на уровне сессии",
+            );
+            ui.weak(
+                "Сочетания, которые забирает другая программа, до нас не дойдут. \
+                 Выдайте «Мониторинг ввода» выше и перезапустите приложение.",
+            );
+        }
+        ui.add_space(6.0);
         if events == 0 {
             ui.colored_label(
                 egui::Color32::from_rgb(220, 80, 80),

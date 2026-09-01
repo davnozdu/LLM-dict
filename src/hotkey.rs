@@ -54,6 +54,9 @@ pub struct HotKeyState {
     /// только модификаторы, и без этого не отличить «событие не пришло» от
     /// «пришло, но мы его выбросили».
     recent: Mutex<VecDeque<String>>,
+    /// Перехватчик работает на HID-уровне. Иначе — на уровне сессии, где
+    /// чужие программы могут забрать сочетание раньше нас.
+    hid_level: AtomicBool,
     /// Система отключила тап — обычно за слишком долгий обработчик.
     /// Дальше горячая клавиша молча не работает, поэтому это надо показать.
     disabled_by_system: AtomicBool,
@@ -71,6 +74,7 @@ impl HotKeyState {
             held_now: Mutex::new(Vec::new()),
             events_seen: AtomicU64::new(0),
             regular_seen: AtomicU64::new(0),
+            hid_level: AtomicBool::new(false),
             recent: Mutex::new(VecDeque::new()),
             disabled_by_system: AtomicBool::new(false),
         };
@@ -137,6 +141,10 @@ impl HotKeyState {
             "{name}: {} (код {code})",
             crate::binding::key_label(code)
         ));
+    }
+
+    pub fn is_hid_level(&self) -> bool {
+        self.hid_level.load(Ordering::Relaxed)
     }
 
     pub fn is_disabled_by_system(&self) -> bool {
@@ -347,13 +355,26 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
         let cb_state = state.clone();
         let cb_tx = tx.clone();
 
+        // HID-уровень видит события раньше чужих перехватчиков, поэтому
+        // сочетание, которое забрала другая программа, до нас всё равно
+        // дойдёт. Но за него macOS спрашивает «Мониторинг ввода», и без
+        // этого разрешения перехватчик создаётся успешно, а нажатия клавиш
+        // молча не отдаются — приходят одни модификаторы. Поэтому уровень
+        // выбирается по факту наличия разрешения.
+        let use_hid = crate::permissions::input_monitoring().is_ok();
+        let location = if use_hid {
+            CGEventTapLocation::HID
+        } else {
+            log::warn!(
+                "нет разрешения «Мониторинг ввода» — работаю на уровне сессии. \
+                 Сочетания, занятые другими программами, доходить не будут."
+            );
+            CGEventTapLocation::Session
+        };
+        state.hid_level.store(use_hid, Ordering::Relaxed);
+
         let tap = CGEventTap::new(
-            // HID, а не Session. Session-перехватчик получает события уже
-            // после чужих перехватчиков, и то, что забрала другая программа,
-            // до нас не доходит: модификаторы приходили всегда, а сочетание
-            // с буквой пропадало целиком. HID — самый низкий уровень, раньше
-            // всех остальных.
-            CGEventTapLocation::HID,
+            location,
             CGEventTapPlacement::HeadInsertEventTap,
             // Default, а не ListenOnly: только так можно проглотить событие,
             // когда включён перехват. Без перехвата всё возвращается как есть.
