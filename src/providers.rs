@@ -4,7 +4,7 @@
 //! протоколе, поэтому провайдер задаётся одним полем `base_url` в настройках —
 //! переход на локальные модели не требует изменений в коде.
 
-use crate::config::{LlmConfig, PostMode, SttConfig};
+use crate::config::SttConfig;
 use anyhow::{anyhow, bail, Result};
 use serde::Deserialize;
 use std::time::Duration;
@@ -119,59 +119,6 @@ struct ChatChoice {
 #[derive(Deserialize)]
 struct ChatMessage {
     content: String,
-}
-
-fn system_prompt(cfg: &LlmConfig) -> String {
-    match cfg.mode {
-        PostMode::Raw => String::new(),
-        PostMode::Correct => "Ты редактор расшифровок речи. Исправь пунктуацию, регистр и явные \
-             ошибки распознавания. Не меняй смысл, не добавляй и не убирай информацию, не отвечай \
-             на содержание. Сохрани язык оригинала. Выведи только исправленный текст."
-            .to_string(),
-        PostMode::Translate => format!(
-            "Переведи текст пользователя на язык: {}. Сохрани тон и форматирование. \
-             Не комментируй и не отвечай на содержание. Выведи только перевод.",
-            cfg.target_language
-        ),
-        PostMode::Custom => cfg.custom_prompt.clone(),
-    }
-}
-
-/// Пост-обработка: POST /chat/completions.
-pub fn post_process(cfg: &LlmConfig, api_key: &str, text: &str) -> Result<String> {
-    if matches!(cfg.mode, PostMode::Raw) || text.trim().is_empty() {
-        return Ok(text.to_string());
-    }
-    require_key(api_key, &cfg.base_url)?;
-    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
-    let payload = serde_json::json!({
-        "model": cfg.model,
-        "temperature": 0.0,
-        "messages": [
-            { "role": "system", "content": system_prompt(cfg) },
-            { "role": "user", "content": text }
-        ]
-    });
-
-    let mut req = client()?.post(&url).json(&payload);
-    if !api_key.is_empty() {
-        req = req.bearer_auth(api_key);
-    }
-
-    let resp = req.send()?;
-    let status = resp.status();
-    let body = resp.text()?;
-    if !status.is_success() {
-        return Err(explain(status, &body, &cfg.base_url));
-    }
-    let parsed: ChatResponse =
-        serde_json::from_str(&body).map_err(|e| anyhow!("неожиданный ответ модели: {e}"))?;
-    parsed
-        .choices
-        .into_iter()
-        .next()
-        .map(|c| c.message.content.trim().to_string())
-        .ok_or_else(|| anyhow!("модель вернула пустой ответ"))
 }
 
 /// Один запрос к модели: системный промпт плюс текст пользователя.

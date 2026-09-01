@@ -964,38 +964,26 @@ impl App {
             ui.add_space(12.0);
             ui.separator();
             ui.add_space(6.0);
-            ui.label(egui::RichText::new("Обработка текста").strong());
+            ui.label(egui::RichText::new("Обработка после диктовки").strong());
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                for m in PostMode::ALL {
-                    ui.selectable_value(&mut self.cfg.llm.mode, m, m.label());
-                }
-            });
-            if !matches!(self.cfg.llm.mode, PostMode::Raw) {
-                labeled(ui, "Адрес API", |ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.cfg.llm.base_url).desired_width(320.0),
-                    );
-                });
-                labeled(ui, "Модель", |ui| {
-                    model_picker(ui, "llm_model", &mut self.cfg.llm.model, &self.models, "");
-                });
+            let after: Vec<String> = self
+                .cfg
+                .actions
+                .iter()
+                .filter(|a| a.enabled && a.after_dictation)
+                .map(|a| a.name.clone())
+                .collect();
+            if after.is_empty() {
+                ui.weak("Надиктованное вставляется как есть.");
+            } else {
+                ui.label(format!("Применяется по порядку: {}", after.join(" → ")));
             }
-            if matches!(self.cfg.llm.mode, PostMode::Translate) {
-                labeled(ui, "Целевой язык", |ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.cfg.llm.target_language)
-                            .desired_width(200.0),
-                    );
-                });
-            }
-            if matches!(self.cfg.llm.mode, PostMode::Custom) {
-                ui.label("Промпт:");
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.cfg.llm.custom_prompt)
-                        .desired_rows(3)
-                        .desired_width(f32::INFINITY),
-                );
+            ui.weak(
+                "Настраивается на вкладке «Действия»: у каждого промпта есть галочка \
+                 «Использовать после диктовки».",
+            );
+            if ui.button("Открыть «Действия»").clicked() {
+                self.tab = Tab::Actions;
             }
 
             ui.add_space(12.0);
@@ -1354,11 +1342,15 @@ impl App {
                         }
                         let name = self.cfg.actions[pos].name.clone();
                         let hotkey = self.cfg.actions[pos].hotkey.clone();
-                        let title = if hotkey.is_empty() {
+                        let after = self.cfg.actions[pos].after_dictation;
+                        let mut title = if hotkey.is_empty() {
                             format!("{name}  —  сочетание не задано")
                         } else {
                             format!("{name}  —  {}", hotkey.label())
                         };
+                        if after {
+                            title.push_str("  ·  после диктовки");
+                        }
                         if ui.selectable_label(expanded, title).clicked() {
                             self.editing_action = if expanded { None } else { Some(id.clone()) };
                         }
@@ -1580,6 +1572,16 @@ impl App {
                 ui.selectable_value(&mut self.cfg.actions[pos].output, o, o.label());
             }
         });
+
+        ui.add_space(6.0);
+        ui.checkbox(
+            &mut self.cfg.actions[pos].after_dictation,
+            "Использовать после диктовки",
+        );
+        ui.weak(
+            "Надиктованный текст пройдёт через этот промпт до вставки. Результат \
+             и сочетание клавиш здесь ни при чём — они для ручного запуска.",
+        );
     }
 
     fn ui_update_block(&mut self, ui: &mut egui::Ui) {

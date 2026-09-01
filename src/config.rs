@@ -284,6 +284,35 @@ impl Config {
             self.actions = crate::actions::defaults();
             self.general.actions_initialised = true;
         }
+
+        // Прежняя обработка диктовки жила отдельной настройкой. Теперь это
+        // обычное действие с галочкой «после диктовки»: два механизма для
+        // одного дела только путали. Переносим и выключаем старую.
+        if !matches!(self.llm.mode, PostMode::Raw) {
+            let mut action = crate::actions::correction_action(crate::provider::Endpoint {
+                provider: crate::provider::Provider::Groq,
+                base_url_override: if self.llm.base_url
+                    == crate::provider::Provider::Groq.default_base_url()
+                {
+                    String::new()
+                } else {
+                    self.llm.base_url.clone()
+                },
+                model: self.llm.model.clone(),
+            });
+            action.name = format!("{} (перенесено)", self.llm.mode.label());
+            if let PostMode::Custom = self.llm.mode {
+                action.prompt = self.llm.custom_prompt.clone();
+            } else if let PostMode::Translate = self.llm.mode {
+                action.prompt = format!(
+                    "Переведи текст пользователя на {}. Выведи только перевод.",
+                    self.llm.target_language
+                );
+            }
+            log::info!("прежняя обработка диктовки перенесена в действие");
+            self.actions.push(action);
+            self.llm.mode = PostMode::Raw;
+        }
         self
     }
 

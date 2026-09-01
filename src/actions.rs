@@ -35,6 +35,9 @@ pub struct TextAction {
     pub hotkey: Binding,
     pub output: Output,
     pub enabled: bool,
+    /// Прогонять через это действие текст сразу после диктовки, до вставки.
+    /// Так надиктованное можно автоматически причёсывать.
+    pub after_dictation: bool,
 }
 
 impl Default for TextAction {
@@ -47,6 +50,7 @@ impl Default for TextAction {
             hotkey: Binding::new(Vec::new()),
             output: Output::Clipboard,
             enabled: true,
+            after_dictation: false,
         }
     }
 }
@@ -72,6 +76,23 @@ fn translate_prompt(target: &str) -> String {
     )
 }
 
+/// Готовое действие для правки надиктованного.
+pub fn correction_action(endpoint: Endpoint) -> TextAction {
+    TextAction {
+        id: new_id(),
+        name: "Правка после диктовки".into(),
+        prompt: "Расставь знаки препинания и заглавные буквы, исправь опечатки и \
+                 явные ошибки распознавания речи. Не меняй смысл, стиль и язык, \
+                 ничего не добавляй и не убирай. Выведи только исправленный текст."
+            .into(),
+        endpoint,
+        hotkey: Binding::new(Vec::new()),
+        output: Output::Clipboard,
+        enabled: true,
+        after_dictation: true,
+    }
+}
+
 /// Набор при первом запуске: пара переводов и корректура.
 /// Сочетания клавиш намеренно не заданы — их пользователь назначает сам,
 /// иначе мы бы наугад заняли что-то нужное.
@@ -90,6 +111,7 @@ pub fn defaults() -> Vec<TextAction> {
             hotkey: Binding::new(Vec::new()),
             output: Output::Clipboard,
             enabled: true,
+            after_dictation: false,
         },
         TextAction {
             id: new_id(),
@@ -99,6 +121,7 @@ pub fn defaults() -> Vec<TextAction> {
             hotkey: Binding::new(Vec::new()),
             output: Output::Clipboard,
             enabled: true,
+            after_dictation: false,
         },
         TextAction {
             id: new_id(),
@@ -108,6 +131,7 @@ pub fn defaults() -> Vec<TextAction> {
             hotkey: Binding::new(Vec::new()),
             output: Output::Clipboard,
             enabled: true,
+            after_dictation: false,
         },
         TextAction {
             id: new_id(),
@@ -120,6 +144,7 @@ pub fn defaults() -> Vec<TextAction> {
             hotkey: Binding::new(Vec::new()),
             output: Output::Replace,
             enabled: true,
+            after_dictation: false,
         },
     ]
 }

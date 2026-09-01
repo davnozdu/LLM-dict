@@ -2,7 +2,7 @@
 //! пост-обработка → вставка → запись в историю.
 
 use crate::audio;
-use crate::config::{Config, HotKeyMode, PostMode};
+use crate::config::{Config, HotKeyMode};
 use crate::history;
 use crate::hotkey::{self, HotKeyEvent, HotKeyState};
 use crate::insert;
@@ -371,6 +371,21 @@ struct Outcome {
     engine: Engine,
 }
 
+/// Какие действия применялись после диктовки — для колонки в истории.
+fn post_names(cfg: &Config) -> String {
+    let names: Vec<&str> = cfg
+        .actions
+        .iter()
+        .filter(|a| a.enabled && a.after_dictation)
+        .map(|a| a.name.as_str())
+        .collect();
+    if names.is_empty() {
+        "Без обработки".to_string()
+    } else {
+        names.join(" → ")
+    }
+}
+
 /// Ошибку тоже надо записать с реальной длительностью речи: иначе в истории
 /// у неудачных попыток стоит ноль, и не понять, писался ли звук вообще.
 fn error_entry(cfg: &Config, msg: String, duration_secs: f32, latency_ms: u64) -> history::Entry {
@@ -379,7 +394,7 @@ fn error_entry(cfg: &Config, msg: String, duration_secs: f32, latency_ms: u64) -
         duration_secs,
         raw_text: String::new(),
         final_text: String::new(),
-        mode: cfg.llm.mode.label().to_string(),
+        mode: post_names(cfg),
         stt_model: cfg.stt.model.clone(),
         llm_model: None,
         latency_ms,
@@ -431,20 +446,35 @@ fn process(
     samples: Vec<f32>,
 ) -> anyhow::Result<Outcome> {
     let duration_secs = audio::duration_secs(&samples);
-    let key = shared.api_key_snapshot();
-
     shared.set_stage(Stage::Transcribing);
     let (raw_text, used_engine) = recognize(shared, local, cfg, &samples)?;
     if raw_text.trim().is_empty() {
         anyhow::bail!("распознавание вернуло пустой текст — тишина или слишком тихий микрофон");
     }
 
-    let final_text = if matches!(cfg.llm.mode, PostMode::Raw) {
-        raw_text.clone()
-    } else {
+    // Действия, помеченные «после диктовки», прогоняются по порядку.
+    // Отказ одного из них не должен ронять всю диктовку: лучше вставить
+    // распознанное как есть, чем потерять сказанное.
+    let mut final_text = raw_text.clone();
+    let after: Vec<_> = cfg
+        .actions
+        .iter()
+        .filter(|a| a.enabled && a.after_dictation)
+        .collect();
+    if !after.is_empty() {
         shared.set_stage(Stage::PostProcessing);
-        providers::post_process(&cfg.llm, &key, &raw_text)?
-    };
+        for action in after {
+            let action_key = action.endpoint.api_key(cfg);
+            match providers::run_prompt(&action.endpoint, &action_key, &action.prompt, &final_text)
+            {
+                Ok(text) => final_text = text,
+                Err(e) => {
+                    log::warn!("«{}» не отработало: {e}", action.name);
+                    shared.notify(format!("{} не отработало, вставляю как есть", action.name));
+                }
+            }
+        }
+    }
 
     shared.set_stage(Stage::Inserting);
     let clipboard_before = insert::insert(&final_text, cfg.general.restore_clipboard)?;
@@ -475,9 +505,9 @@ fn record_result(
                 duration_secs: out.duration_secs,
                 raw_text: out.raw_text,
                 final_text: out.final_text,
-                mode: cfg.llm.mode.label().to_string(),
+                mode: post_names(cfg),
                 stt_model: cfg.stt.model.clone(),
-                llm_model: (!matches!(cfg.llm.mode, PostMode::Raw)).then(|| cfg.llm.model.clone()),
+                llm_model: None,
                 latency_ms,
                 clipboard_before: out.clipboard_before,
                 error: None,
