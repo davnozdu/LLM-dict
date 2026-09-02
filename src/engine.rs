@@ -233,20 +233,25 @@ pub fn spawn(shared: Arc<Shared>) -> Sender<HotKeyEvent> {
 
 fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
     let mut recording: Option<audio::Recording> = None;
-    // Модель живёт здесь: загрузка занимает секунды, повторять её на каждую
-    // фразу бессмысленно. Владеет ей только этот поток.
+    // Модели живут здесь: загрузка занимает секунды, повторять её на каждую
+    // фразу бессмысленно. Владеет ими только этот поток.
     let mut local = LocalEngines::default();
+    let mut llm = crate::local_llm::LocalLlm::default();
 
     {
         let cfg = shared.config_snapshot();
         if cfg.stt.preload_local && cfg.stt.engine.is_local() {
             let id = match cfg.stt.engine {
-                Engine::Whisper => cfg.stt.whisper_model.clone(),
                 Engine::Parakeet => cfg.stt.parakeet_model.clone(),
-                Engine::Cloud => String::new(),
+                Engine::Cloud | Engine::Llm => String::new(),
             };
             shared.set_stage(Stage::LoadingModel);
             local.preload(cfg.stt.engine, &id);
+            shared.set_stage(Stage::Idle);
+        }
+        if cfg.local_llm.keep_loaded && !cfg.local_llm.model.is_empty() {
+            shared.set_stage(Stage::LoadingModel);
+            llm.preload(&cfg.local_llm.model);
             shared.set_stage(Stage::Idle);
         }
     }
@@ -261,9 +266,16 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         } else {
-            match rx.recv() {
+            // Не блокируемся навсегда: иначе некому проверить, не пора ли
+            // выгрузить локальные модели. Полминуты — достаточно частая
+            // проверка для таймаута, который считается в минутах.
+            match rx.recv_timeout(Duration::from_secs(30)) {
                 Ok(e) => Some(e),
-                Err(_) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    unload_idle(&shared, &mut local, &mut llm);
+                    None
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         };
 
@@ -361,7 +373,7 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
                 }
                 let started = Instant::now();
                 let spoken = audio::duration_secs(&samples);
-                let result = process(&shared, &mut local, &cfg, samples);
+                let result = process(&shared, &mut local, &mut llm, &cfg, samples);
                 record_result(&shared, &cfg, result, started, spoken);
                 shared.set_stage(Stage::Idle);
             }
@@ -475,9 +487,39 @@ fn recognize(
     }
 }
 
+/// Выгружает локальные модели, если ими давно не пользовались.
+///
+/// Правило одно на распознавание и языковую модель: обе занимают гигабайты
+/// в программе, которая большую часть времени ничего не делает. Модель,
+/// которую велено держать наготове, не трогаем — это осознанный выбор
+/// пользователя в пользу скорости.
+fn unload_idle(
+    shared: &Arc<Shared>,
+    local: &mut LocalEngines,
+    llm: &mut crate::local_llm::LocalLlm,
+) {
+    let cfg = shared.config_snapshot();
+    let minutes = cfg.general.idle_unload_min;
+    if minutes == 0 {
+        return;
+    }
+    let limit = u64::from(minutes) * 60;
+
+    // Прогретую при запуске модель распознавания не выгружаем: её просили
+    // держать готовой, чтобы первая диктовка не ждала.
+    let keep_stt = cfg.stt.preload_local && cfg.stt.engine.is_local();
+    if !keep_stt && local.idle_secs().is_some_and(|s| s >= limit) {
+        local.unload();
+    }
+    if !cfg.local_llm.keep_loaded && llm.idle_secs().is_some_and(|s| s >= limit) {
+        llm.unload();
+    }
+}
+
 fn process(
     shared: &Arc<Shared>,
     local: &mut LocalEngines,
+    llm: &mut crate::local_llm::LocalLlm,
     cfg: &Config,
     samples: Vec<f32>,
 ) -> anyhow::Result<Outcome> {
@@ -501,22 +543,69 @@ fn process(
         shared.set_stage(Stage::PostProcessing);
         for action in after {
             let action_key = action.endpoint.api_key(cfg);
+            if action.missing_context() {
+                log::warn!("«{}»: файл сведений не выбран", action.name);
+                shared.notify(format!("«{}»: файл сведений не выбран", action.name));
+                continue;
+            }
             let context = action.load_context().unwrap_or_else(|e| {
                 log::warn!("{}: {e}", action.name);
                 None
             });
-            match providers::run_prompt(
-                &action.endpoint,
-                &action_key,
-                &action.prompt,
-                context.as_deref(),
-                &final_text,
-            ) {
+            // Локальный поставщик выбран явно — в облако не ходим вовсе.
+            let only_local = action.endpoint.provider.is_local();
+            let cloud = if only_local {
+                Err(anyhow::anyhow!("локальная модель"))
+            } else {
+                providers::run_prompt(
+                    &action.endpoint,
+                    &action_key,
+                    &action.prompt,
+                    context.as_deref(),
+                    &final_text,
+                )
+            };
+
+            match cloud {
                 Ok(text) => final_text = text,
                 Err(e) => {
+                    let mut reason: Option<anyhow::Error> = None;
+                    // Локальная модель — только когда облако не сработало:
+                    // держать её в памяти при работающей сети незачем.
+                    let local_allowed = only_local || action.fallback_local;
+                    let model_id = cfg.local_llm.model.clone();
+                    // Действия с файлом сведений локально не тянем: контекст
+                    // у модели 4096 токенов, файл туда не влезет.
+                    if local_allowed && !model_id.is_empty() && context.is_none() {
+                        shared.set_stage(Stage::LoadingModel);
+                        if !only_local {
+                            shared.notify("Облако недоступно — обрабатываю локально");
+                        }
+                        // Инструкция берётся у самого действия: подменять её
+                        // своей значило бы делать не то, что настроил
+                        // пользователь.
+                        let done = llm.run(&model_id, &action.prompt, &final_text);
+                        shared.set_stage(Stage::PostProcessing);
+                        match done {
+                            Ok(text) => {
+                                final_text = text;
+                                continue;
+                            }
+                            // Дальше пойдёт вставка без обработки, и назвать
+                            // надо ту причину, по которой не вышло на самом
+                            // деле, а не заглушку «локальная модель».
+                            Err(le) => reason = Some(le),
+                        }
+                    } else if local_allowed && context.is_some() {
+                        log::warn!(
+                            "«{}»: файл сведений не помещается в контекст локальной модели",
+                            action.name
+                        );
+                    }
                     // Текст важнее обработки: вставляем распознанное как есть.
-                    log::warn!("«{}» не отработало: {e}", action.name);
-                    shared.notify(format!("{e} — вставляю без обработки"));
+                    let reason = reason.unwrap_or(e);
+                    log::warn!("«{}» не отработало: {reason}", action.name);
+                    shared.notify(format!("{reason} — вставляю без обработки"));
                 }
             }
         }
@@ -623,6 +712,14 @@ fn run_action(shared: &Arc<Shared>, id: &str) {
         let outcome = (|| -> anyhow::Result<(String, Option<String>)> {
             let (selection, previous) = insert::copy_selection()?;
             let key = action.endpoint.api_key(&cfg);
+            // Молчаливое «не знаю» вместо ответа — самый непонятный отказ:
+            // модель отработала, а сведений ей не дали.
+            if action.missing_context() {
+                anyhow::bail!(
+                    "«{}» опирается на файл сведений, но файл не выбран в настройках действия",
+                    action.name
+                );
+            }
             let context = action.load_context()?;
             let result = providers::run_prompt(
                 &action.endpoint,

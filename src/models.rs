@@ -16,9 +16,16 @@ pub enum Engine {
     /// OpenAI-совместимое облако: Groq и всё, что говорит на том же протоколе.
     Cloud,
     /// NVIDIA Parakeet TDT через ONNX Runtime.
+    ///
+    /// Псевдоним `Whisper` оставлен намеренно: локального whisper.cpp больше
+    /// нет, и без него настройка со старым значением не прочиталась бы —
+    /// сбросив заодно всё остальное. Такие конфиги молча переезжают сюда.
+    #[serde(alias = "Whisper")]
     Parakeet,
-    /// whisper.cpp с Metal.
-    Whisper,
+    /// Локальная языковая модель через llama.cpp. Не распознаёт речь —
+    /// обрабатывает уже распознанный текст, поэтому в списке движков
+    /// распознавания (`ALL`) её нет.
+    Llm,
 }
 
 impl Engine {
@@ -26,7 +33,7 @@ impl Engine {
         match self {
             Engine::Cloud => "Groq (облако)",
             Engine::Parakeet => "Parakeet (локально)",
-            Engine::Whisper => "Whisper (локально)",
+            Engine::Llm => "Локальная языковая модель",
         }
     }
 
@@ -34,7 +41,7 @@ impl Engine {
         !matches!(self, Engine::Cloud)
     }
 
-    pub const ALL: [Engine; 3] = [Engine::Cloud, Engine::Parakeet, Engine::Whisper];
+    pub const ALL: [Engine; 2] = [Engine::Cloud, Engine::Parakeet];
 }
 
 pub struct ModelFile {
@@ -81,74 +88,96 @@ impl ModelSpec {
     }
 }
 
-pub static CATALOG: &[ModelSpec] = &[
-    ModelSpec {
-        id: "parakeet-tdt-0.6b-v3-int8",
-        engine: Engine::Parakeet,
-        title: "Parakeet TDT 0.6B v3 (int8)",
-        note: "25 языков с автоопределением, включая русский. \
-               Считает только реальную длину записи, поэтому на коротких фразах быстрее Whisper.",
-        files: &[
-            ModelFile {
-                name: "encoder-model.int8.onnx",
-                url: concat!(
-                    "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main",
-                    "/encoder-model.int8.onnx"
-                ),
-                size: 652_183_999,
-            },
-            ModelFile {
-                name: "decoder_joint-model.int8.onnx",
-                url: concat!(
-                    "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main",
-                    "/decoder_joint-model.int8.onnx"
-                ),
-                size: 18_202_004,
-            },
-            ModelFile {
-                name: "vocab.txt",
-                url: concat!(
-                    "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main",
-                    "/vocab.txt"
-                ),
-                size: 93_939,
-            },
-        ],
-    },
-    ModelSpec {
-        id: "whisper-large-v3-turbo-q5",
-        engine: Engine::Whisper,
-        title: "Whisper large-v3-turbo (q5_0)",
-        note: "Урезанный декодер вместо полного: заметно быстрее large-v3 при близкой точности. \
-               Разумный выбор, если локальный движок нужен как запасной.",
-        files: &[ModelFile {
-            name: "ggml-large-v3-turbo-q5_0.bin",
+pub static CATALOG: &[ModelSpec] = &[ModelSpec {
+    id: "parakeet-tdt-0.6b-v3-int8",
+    engine: Engine::Parakeet,
+    title: "Parakeet TDT 0.6B v3 (int8)",
+    note: "25 языков с автоопределением, включая русский. \
+               Считает только реальную длину записи, поэтому на коротких фразах отвечает быстро.",
+    files: &[
+        ModelFile {
+            name: "encoder-model.int8.onnx",
             url: concat!(
-                "https://huggingface.co/ggerganov/whisper.cpp/resolve/main",
-                "/ggml-large-v3-turbo-q5_0.bin"
+                "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main",
+                "/encoder-model.int8.onnx"
             ),
-            size: 574_041_195,
+            size: 652_183_999,
+        },
+        ModelFile {
+            name: "decoder_joint-model.int8.onnx",
+            url: concat!(
+                "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main",
+                "/decoder_joint-model.int8.onnx"
+            ),
+            size: 18_202_004,
+        },
+        ModelFile {
+            name: "vocab.txt",
+            url: concat!(
+                "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main",
+                "/vocab.txt"
+            ),
+            size: 93_939,
+        },
+    ],
+}];
+
+/// Языковые модели для локальной обработки текста.
+///
+/// Отобраны замером на реальных диктовках: в каталог попали только те, что
+/// в среднем приближают текст к результату облачной модели. Проверенные и
+/// отвергнутые — Gemma 3, EuroLLM, Ministral — портили текст чаще, чем
+/// улучшали, и здесь их нет намеренно.
+pub static LLM_CATALOG: &[ModelSpec] = &[
+    ModelSpec {
+        id: "gemma-4-e2b-q4",
+        engine: Engine::Llm,
+        title: "Gemma 4 E2B (Q4_K_M)",
+        note: "Лучшая по качеству правки: на замере десять реплик из сорока шести \
+               исправила ровно так же, как облачная модель. Около 3 ГБ памяти.",
+        files: &[ModelFile {
+            name: "gemma-4-e2b-q4.gguf",
+            url: concat!(
+                "https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/",
+                "0314792d7f1f7e229411f620751375812bb9faf2/gemma-4-E2B-it-Q4_K_M.gguf"
+            ),
+            size: 3_106_738_272,
         }],
     },
     ModelSpec {
-        id: "whisper-large-v3-q5",
-        engine: Engine::Whisper,
-        title: "Whisper large-v3 (q5_0)",
-        note: "Самая точная из локальных, особенно на шумной записи. \
-               И самая медленная: на диктовке пауза заметна.",
+        id: "qwen3-4b-q4",
+        engine: Engine::Llm,
+        title: "Qwen3 4B (Q4_K_M)",
+        note: "Чуть слабее Gemma 4 и вдвое медленнее, но осторожнее: реже меняет \
+               то, что менять не следовало. Около 2.8 ГБ памяти.",
         files: &[ModelFile {
-            name: "ggml-large-v3-q5_0.bin",
+            name: "qwen3-4b-q4.gguf",
             url: concat!(
-                "https://huggingface.co/ggerganov/whisper.cpp/resolve/main",
-                "/ggml-large-v3-q5_0.bin"
+                "https://huggingface.co/unsloth/Qwen3-4B-GGUF/resolve/",
+                "22c9fc8a8c7700b76a1789366280a6a5a1ad1120/Qwen3-4B-Q4_K_M.gguf"
             ),
-            size: 1_081_140_203,
+            size: 2_497_281_312,
+        }],
+    },
+    ModelSpec {
+        id: "qwen3-1.7b-q6",
+        engine: Engine::Llm,
+        title: "Qwen3 1.7B (Q6_K)",
+        note: "Для машин, где памяти жалко: около 1.9 ГБ. Правит заметно меньше, \
+               зато почти не портит.",
+        files: &[ModelFile {
+            name: "qwen3-1.7b-q6.gguf",
+            url: concat!(
+                "https://huggingface.co/unsloth/Qwen3-1.7B-GGUF/resolve/",
+                "d7f544eead698dbd1f15126ef60b45a1e1933222/Qwen3-1.7B-Q6_K.gguf"
+            ),
+            size: 1_417_755_200,
         }],
     },
 ];
 
 pub fn find(id: &str) -> Option<&'static ModelSpec> {
-    CATALOG.iter().find(|m| m.id == id)
+    CATALOG.iter().chain(LLM_CATALOG).find(|m| m.id == id)
 }
 
 pub fn models_dir() -> PathBuf {
@@ -244,5 +273,38 @@ pub fn human_size(bytes: u64) -> String {
         format!("{:.1} ГБ", mb / 1024.0)
     } else {
         format!("{mb:.0} МБ")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Настройки, сделанные до удаления whisper.cpp, должны читаться.
+    ///
+    /// Без псевдонима serde отказался бы разобрать `"Whisper"`, и приложение
+    /// молча сбросило бы все настройки к значениям по умолчанию — вместе с
+    /// сочетаниями клавиш и действиями.
+    #[test]
+    fn старый_выбор_whisper_переезжает_на_parakeet() {
+        let engine: Engine = serde_json::from_str("\"Whisper\"").expect("должно читаться");
+        assert_eq!(engine, Engine::Parakeet);
+    }
+
+    #[test]
+    fn паракит_читается_как_прежде() {
+        let engine: Engine = serde_json::from_str("\"Parakeet\"").unwrap();
+        assert_eq!(engine, Engine::Parakeet);
+    }
+
+    /// Идентификаторы в каталоге уникальны: по ним ищется папка модели,
+    /// и совпадение означало бы, что две модели пишут в одно место.
+    #[test]
+    fn идентификаторы_моделей_уникальны() {
+        let mut ids: Vec<&str> = CATALOG.iter().chain(LLM_CATALOG).map(|m| m.id).collect();
+        let count = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), count, "в каталоге повторяются идентификаторы");
     }
 }

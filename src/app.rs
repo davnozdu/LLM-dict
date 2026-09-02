@@ -1042,7 +1042,7 @@ impl App {
             if self.cfg.stt.engine == Engine::Parakeet {
                 ui.weak(
                     "Parakeet определяет язык сам и выбор здесь не учитывает — \
-                     он влияет на облако и на Whisper.",
+                     он влияет только на облачное распознавание.",
                 );
             } else if self.cfg.stt.language == "auto" {
                 ui.weak(
@@ -1087,6 +1087,40 @@ impl App {
             ui.weak(
                 "Загрузка занимает несколько секунд. Без неё первая диктовка после \
                  запуска будет заметно дольше остальных.",
+            );
+
+            // --- локальная обработка текста ---
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("Локальная обработка текста").strong());
+            ui.weak(
+                "Правит надиктованное без сети. Включается сама, когда облако \
+                 не ответило, — и только тогда, чтобы не занимать память зря.",
+            );
+            ui.add_space(6.0);
+            self.ui_llm_models(ui);
+            ui.add_space(4.0);
+            ui.checkbox(
+                &mut self.cfg.local_llm.keep_loaded,
+                "Держать модель в памяти постоянно",
+            );
+            ui.weak(
+                "Быстрее отвечает, но несколько гигабайт заняты всё время. \
+                 Без этого модель грузится при первой надобности.",
+            );
+            ui.add_space(6.0);
+            labeled(ui, "Выгружать через", |ui| {
+                ui.add(
+                    egui::DragValue::new(&mut self.cfg.general.idle_unload_min)
+                        .range(0..=120)
+                        .suffix(" мин"),
+                );
+                ui.weak("простоя, 0 — не выгружать");
+            });
+            ui.weak(
+                "Касается и распознавания, и языковой модели: обе освобождают \
+                 память, пока ими не пользуются.",
             );
 
             ui.add_space(12.0);
@@ -1215,11 +1249,20 @@ impl App {
 
     /// Список локальных моделей: что скачано, что качается, что можно удалить.
     fn ui_local_models(&mut self, ui: &mut egui::Ui) {
+        self.ui_model_list(ui, models::CATALOG);
+    }
+
+    /// Языковые модели для локальной обработки текста.
+    fn ui_llm_models(&mut self, ui: &mut egui::Ui) {
+        self.ui_model_list(ui, models::LLM_CATALOG);
+    }
+
+    fn ui_model_list(&mut self, ui: &mut egui::Ui, catalog: &'static [models::ModelSpec]) {
         let mut to_download: Option<&'static models::ModelSpec> = None;
         let mut to_remove: Option<&'static models::ModelSpec> = None;
         let mut cancel = false;
 
-        for spec in models::CATALOG.iter() {
+        for spec in catalog.iter() {
             let installed = spec.is_installed();
             let downloading = self
                 .download
@@ -1228,8 +1271,8 @@ impl App {
 
             // Радиокнопка выбирает модель внутри своего движка, а не движок.
             let selected = match spec.engine {
-                Engine::Whisper => self.cfg.stt.whisper_model == spec.id,
                 Engine::Parakeet => self.cfg.stt.parakeet_model == spec.id,
+                Engine::Llm => self.cfg.local_llm.model == spec.id,
                 Engine::Cloud => false,
             };
 
@@ -1237,8 +1280,8 @@ impl App {
                 ui.horizontal(|ui| {
                     if ui.radio(selected, spec.title).clicked() {
                         match spec.engine {
-                            Engine::Whisper => self.cfg.stt.whisper_model = spec.id.to_string(),
                             Engine::Parakeet => self.cfg.stt.parakeet_model = spec.id.to_string(),
+                            Engine::Llm => self.cfg.local_llm.model = spec.id.to_string(),
                             Engine::Cloud => {}
                         }
                     }
@@ -1864,6 +1907,23 @@ impl App {
                 "Промпт ссылается на сведения, но файл не выбран — отвечать будет не по чему",
             );
         }
+        // Обратный случай к проверке выше: файл выбран, а промпт про него
+        // молчит. Тогда сведения уходят в каждый запрос впустую, а
+        // пользователь считает, что действие ими пользуется, — именно так
+        // файл и оказывается прикреплённым не к тому действию.
+        if !self.cfg.actions[pos].context_file.trim().is_empty() {
+            let prompt = self.cfg.actions[pos].prompt.to_lowercase();
+            let mentions = ["сведени", "данны", "файл", "информаци", "контекст"]
+                .iter()
+                .any(|w| prompt.contains(w));
+            if !mentions {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 130, 40),
+                    "Файл выбран, но промпт на него не ссылается — сведения уходят \
+                     в каждый запрос впустую",
+                );
+            }
+        }
         if !self.cfg.actions[pos].context_file.is_empty() {
             match self.cfg.actions[pos].load_context() {
                 Ok(Some(text)) => {
@@ -1902,6 +1962,32 @@ impl App {
                 "Крупная модель здесь обойдётся дорого по ожиданию: разница между \
                  быстрой и большой на короткой фразе — секунды против десятка секунд.",
             );
+        }
+
+        ui.add_space(6.0);
+        let has_context = !self.cfg.actions[pos].context_file.trim().is_empty();
+        ui.add_enabled_ui(!has_context, |ui| {
+            ui.checkbox(
+                &mut self.cfg.actions[pos].fallback_local,
+                "Обработать локальной моделью, если поставщик не ответил",
+            );
+        });
+        if has_context {
+            ui.weak("Недоступно: файл сведений не помещается в контекст локальной модели.");
+        } else if self.cfg.actions[pos].fallback_local {
+            if self.cfg.local_llm.model.is_empty() {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 130, 40),
+                    "Локальная модель не выбрана — выберите её в настройках распознавания",
+                );
+            } else if !crate::models::find(&self.cfg.local_llm.model)
+                .is_some_and(|m| m.is_installed())
+            {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 130, 40),
+                    "Выбранная локальная модель не скачана — до этого дело не дойдёт",
+                );
+            }
         }
     }
 

@@ -61,10 +61,13 @@ pub struct SttConfig {
     pub model: String,
     /// Код языка или `auto`. Parakeet его игнорирует — он всегда определяет сам.
     pub language: String,
-    /// Подсказка для whisper: имена, термины, стиль пунктуации.
+    /// Подсказка для облачного распознавания: имена, термины, стиль
+    /// пунктуации. Parakeet её не принимает.
     pub prompt: String,
-    /// Выбранная модель для каждого локального движка.
-    pub whisper_model: String,
+    /// Выбранная локальная модель распознавания.
+    ///
+    /// Старое поле `whisper_model` из прежних настроек просто игнорируется:
+    /// serde пропускает незнакомые ключи, и при первом сохранении оно уйдёт.
     pub parakeet_model: String,
     /// Загружать локальную модель при запуске, не дожидаясь первой диктовки.
     pub preload_local: bool,
@@ -79,7 +82,6 @@ impl Default for SttConfig {
             model: "whisper-large-v3-turbo".into(),
             language: "ru".into(),
             prompt: String::new(),
-            whisper_model: "whisper-large-v3-turbo-q5".into(),
             parakeet_model: "parakeet-tdt-0.6b-v3-int8".into(),
             preload_local: true,
         }
@@ -106,6 +108,31 @@ impl Default for LlmConfig {
             target_language: "English".into(),
             custom_prompt:
                 "Перепиши текст в деловом стиле, сохранив смысл. Выведи только результат.".into(),
+        }
+    }
+}
+
+/// Локальная обработка текста.
+///
+/// Модель выбирается одна на всё приложение, а не на каждое действие: иначе
+/// два действия с разными моделями держали бы в памяти обе.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LocalLlmConfig {
+    /// Идентификатор модели из `models::LLM_CATALOG`.
+    pub model: String,
+    /// Держать модель загруженной постоянно, не дожидаясь первой надобности
+    /// и не выгружая по простою. Быстрее отвечает, но всегда занимает память.
+    pub keep_loaded: bool,
+}
+
+impl Default for LocalLlmConfig {
+    fn default() -> Self {
+        Self {
+            model: "gemma-4-e2b-q4".into(),
+            // По умолчанию модель не висит в памяти: у большинства работает
+            // облако, и локальная нужна только когда его нет.
+            keep_loaded: false,
         }
     }
 }
@@ -150,6 +177,12 @@ pub struct GeneralConfig {
     /// Набор действий уже создавался: пустой список после этого — выбор
     /// пользователя, а не первый запуск.
     pub actions_initialised: bool,
+    /// Через сколько минут простоя выгружать локальные модели из памяти.
+    ///
+    /// Правило общее для распознавания и языковой модели: обе живут в одном
+    /// потоке и обе занимают гигабайты, разделять им таймеры незачем.
+    /// Ноль — не выгружать.
+    pub idle_unload_min: u32,
     /// Хранить ключ прямо в файле настроек, минуя Keychain.
     ///
     /// ACL записи в связке ключей привязан к подписи приложения, поэтому при
@@ -179,6 +212,7 @@ impl Default for GeneralConfig {
             check_updates: true,
             swallow_hotkey: true,
             actions_initialised: false,
+            idle_unload_min: 10,
             key_in_config: false,
         }
     }
@@ -190,6 +224,7 @@ pub struct Config {
     pub general: GeneralConfig,
     pub stt: SttConfig,
     pub llm: LlmConfig,
+    pub local_llm: LocalLlmConfig,
     /// Действия над выделенным текстом со своими сочетаниями клавиш.
     pub actions: Vec<crate::actions::TextAction>,
     /// Заполняется только при включённом `general.key_in_config`.
@@ -202,7 +237,7 @@ pub struct Config {
 }
 
 /// Языки: 25 европейских из Parakeet TDT v3 плюс те, что часто нужны и
-/// поддерживаются Whisper с облаком. Первым идёт автоопределение.
+/// поддерживаются облачным распознаванием. Первым идёт автоопределение.
 pub const LANGUAGES: &[(&str, &str)] = &[
     ("auto", "Автоопределение"),
     ("ru", "Русский"),
