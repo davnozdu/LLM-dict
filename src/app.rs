@@ -1817,6 +1817,32 @@ impl App {
             });
         }
 
+        // У локального поставщика поля модели нет: она одна на всё
+        // приложение и выбирается в настройках распознавания. Иначе два
+        // действия могли бы указать разные модели, и в памяти оказались бы
+        // обе — по три гигабайта каждая.
+        if provider.is_local() {
+            let chosen = crate::models::find(&self.cfg.local_llm.model);
+            labeled(ui, "Модель", |ui| match chosen {
+                Some(spec) if spec.is_installed() => {
+                    ui.label(spec.title);
+                }
+                Some(spec) => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 130, 40),
+                        format!("{} — не скачана", spec.title),
+                    );
+                }
+                None => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 130, 40),
+                        "не выбрана в настройках распознавания",
+                    );
+                }
+            });
+            return;
+        }
+
         ui.horizontal(|ui| {
             ui.add_sized([130.0, 20.0], egui::Label::new("Модель"));
             let known = self

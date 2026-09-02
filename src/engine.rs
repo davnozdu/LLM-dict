@@ -75,6 +75,13 @@ pub struct Shared {
     pub clipboard: Arc<crate::clipboard::History>,
     /// Растёт при каждом изменении, чтобы трей перерисовал иконку.
     pub dirty: AtomicBool,
+    /// Локальная языковая модель.
+    ///
+    /// Лежит здесь, а не в потоке диктовки, потому что действия по горячей
+    /// клавише работают в своих потоках. Одна на всех: иначе в памяти
+    /// оказалось бы несколько копий по три гигабайта. Мьютекс заодно не даёт
+    /// двум запросам считать одновременно.
+    pub llm: Mutex<crate::local_llm::LocalLlm>,
 }
 
 impl Shared {
@@ -105,6 +112,7 @@ impl Shared {
             clipboard_requested: AtomicBool::new(false),
             clipboard,
             dirty: AtomicBool::new(true),
+            llm: Mutex::new(crate::local_llm::LocalLlm::default()),
         });
 
         // Keychain умеет показать модальный запрос доступа — например когда
@@ -236,7 +244,6 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
     // Модели живут здесь: загрузка занимает секунды, повторять её на каждую
     // фразу бессмысленно. Владеет ими только этот поток.
     let mut local = LocalEngines::default();
-    let mut llm = crate::local_llm::LocalLlm::default();
 
     {
         let cfg = shared.config_snapshot();
@@ -251,7 +258,7 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
         }
         if cfg.local_llm.keep_loaded && !cfg.local_llm.model.is_empty() {
             shared.set_stage(Stage::LoadingModel);
-            llm.preload(&cfg.local_llm.model);
+            shared.llm.lock().unwrap().preload(&cfg.local_llm.model);
             shared.set_stage(Stage::Idle);
         }
     }
@@ -272,7 +279,7 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
             match rx.recv_timeout(Duration::from_secs(30)) {
                 Ok(e) => Some(e),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    unload_idle(&shared, &mut local, &mut llm);
+                    unload_idle(&shared, &mut local);
                     None
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -373,7 +380,7 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
                 }
                 let started = Instant::now();
                 let spoken = audio::duration_secs(&samples);
-                let result = process(&shared, &mut local, &mut llm, &cfg, samples);
+                let result = process(&shared, &mut local, &cfg, samples);
                 record_result(&shared, &cfg, result, started, spoken);
                 shared.set_stage(Stage::Idle);
             }
@@ -387,6 +394,9 @@ struct Outcome {
     duration_secs: f32,
     clipboard_before: Option<String>,
     engine: Engine,
+    /// Чем обработан текст после распознавания. При откате это локальная
+    /// модель, и по истории должно быть видно, что сработал именно откат.
+    llm_model: Option<String>,
 }
 
 /// Все сочетания, кроме диктовки: действия над текстом и окно буфера.
@@ -487,17 +497,86 @@ fn recognize(
     }
 }
 
+/// Чем и как обработан текст.
+struct Applied {
+    text: String,
+    /// Название модели для истории.
+    model: String,
+    /// Сработала локальная модель, а не облако.
+    local: bool,
+}
+
+/// Прогоняет текст через действие: облако, а при его отказе — локальная
+/// модель.
+///
+/// Локальная включается ровно в двух случаях: поставщик выбран локальным
+/// вручную, либо облако отказало так, что модель на своей машине это
+/// исправит. Отвергнутый запрос — неверный ключ, несуществующая модель,
+/// кривой запрос — сюда не попадает: подменить его локальной обработкой
+/// значило бы скрыть поломку, и пользователь месяцами не знал бы, что
+/// облако у него не работает вовсе.
+fn apply_action(
+    shared: &Arc<Shared>,
+    cfg: &Config,
+    action: &crate::actions::TextAction,
+    api_key: &str,
+    context: Option<&str>,
+    text: &str,
+) -> anyhow::Result<Applied> {
+    let only_local = action.endpoint.provider.is_local();
+
+    if !only_local {
+        match providers::run_prompt(&action.endpoint, api_key, &action.prompt, context, text) {
+            Ok(text) => {
+                return Ok(Applied {
+                    text,
+                    model: action.endpoint.model.clone(),
+                    local: false,
+                })
+            }
+            Err(e) => {
+                if !action.fallback_local || !e.worth_local_retry() {
+                    return Err(e.into());
+                }
+                log::info!("«{}»: облако отказало ({e}), пробую локально", action.name);
+                shared.notify("Облако недоступно — обрабатываю локально");
+            }
+        }
+    }
+
+    // Сведения из файла в контекст локальной модели не помещаются: он
+    // рассчитан на фразу диктовки, а не на справочник.
+    if context.is_some() {
+        anyhow::bail!("файл сведений не помещается в контекст локальной модели");
+    }
+    let model_id = cfg.local_llm.model.trim();
+    if model_id.is_empty() {
+        anyhow::bail!("локальная модель не выбрана в настройках");
+    }
+
+    shared.set_stage(Stage::LoadingModel);
+    // Инструкция берётся у самого действия: подменять её своей значило бы
+    // делать не то, что настроил пользователь.
+    let out = shared
+        .llm
+        .lock()
+        .unwrap()
+        .run(model_id, &action.prompt, text);
+    shared.set_stage(Stage::PostProcessing);
+    Ok(Applied {
+        text: out?,
+        model: model_id.to_string(),
+        local: true,
+    })
+}
+
 /// Выгружает локальные модели, если ими давно не пользовались.
 ///
 /// Правило одно на распознавание и языковую модель: обе занимают гигабайты
 /// в программе, которая большую часть времени ничего не делает. Модель,
 /// которую велено держать наготове, не трогаем — это осознанный выбор
 /// пользователя в пользу скорости.
-fn unload_idle(
-    shared: &Arc<Shared>,
-    local: &mut LocalEngines,
-    llm: &mut crate::local_llm::LocalLlm,
-) {
+fn unload_idle(shared: &Arc<Shared>, local: &mut LocalEngines) {
     let cfg = shared.config_snapshot();
     let minutes = cfg.general.idle_unload_min;
     if minutes == 0 {
@@ -511,15 +590,17 @@ fn unload_idle(
     if !keep_stt && local.idle_secs().is_some_and(|s| s >= limit) {
         local.unload();
     }
-    if !cfg.local_llm.keep_loaded && llm.idle_secs().is_some_and(|s| s >= limit) {
-        llm.unload();
+    if !cfg.local_llm.keep_loaded {
+        let mut llm = shared.llm.lock().unwrap();
+        if llm.idle_secs().is_some_and(|s| s >= limit) {
+            llm.unload();
+        }
     }
 }
 
 fn process(
     shared: &Arc<Shared>,
     local: &mut LocalEngines,
-    llm: &mut crate::local_llm::LocalLlm,
     cfg: &Config,
     samples: Vec<f32>,
 ) -> anyhow::Result<Outcome> {
@@ -534,6 +615,7 @@ fn process(
     // Отказ одного из них не должен ронять всю диктовку: лучше вставить
     // распознанное как есть, чем потерять сказанное.
     let mut final_text = raw_text.clone();
+    let mut used_llm: Option<String> = None;
     let after: Vec<_> = cfg
         .actions
         .iter()
@@ -552,60 +634,22 @@ fn process(
                 log::warn!("{}: {e}", action.name);
                 None
             });
-            // Локальный поставщик выбран явно — в облако не ходим вовсе.
-            let only_local = action.endpoint.provider.is_local();
-            let cloud = if only_local {
-                Err(anyhow::anyhow!("локальная модель"))
-            } else {
-                providers::run_prompt(
-                    &action.endpoint,
-                    &action_key,
-                    &action.prompt,
-                    context.as_deref(),
-                    &final_text,
-                )
-            };
-
-            match cloud {
-                Ok(text) => final_text = text,
+            match apply_action(
+                shared,
+                cfg,
+                action,
+                &action_key,
+                context.as_deref(),
+                &final_text,
+            ) {
+                Ok(done) => {
+                    final_text = done.text;
+                    used_llm = Some(done.model);
+                }
                 Err(e) => {
-                    let mut reason: Option<anyhow::Error> = None;
-                    // Локальная модель — только когда облако не сработало:
-                    // держать её в памяти при работающей сети незачем.
-                    let local_allowed = only_local || action.fallback_local;
-                    let model_id = cfg.local_llm.model.clone();
-                    // Действия с файлом сведений локально не тянем: контекст
-                    // у модели 4096 токенов, файл туда не влезет.
-                    if local_allowed && !model_id.is_empty() && context.is_none() {
-                        shared.set_stage(Stage::LoadingModel);
-                        if !only_local {
-                            shared.notify("Облако недоступно — обрабатываю локально");
-                        }
-                        // Инструкция берётся у самого действия: подменять её
-                        // своей значило бы делать не то, что настроил
-                        // пользователь.
-                        let done = llm.run(&model_id, &action.prompt, &final_text);
-                        shared.set_stage(Stage::PostProcessing);
-                        match done {
-                            Ok(text) => {
-                                final_text = text;
-                                continue;
-                            }
-                            // Дальше пойдёт вставка без обработки, и назвать
-                            // надо ту причину, по которой не вышло на самом
-                            // деле, а не заглушку «локальная модель».
-                            Err(le) => reason = Some(le),
-                        }
-                    } else if local_allowed && context.is_some() {
-                        log::warn!(
-                            "«{}»: файл сведений не помещается в контекст локальной модели",
-                            action.name
-                        );
-                    }
                     // Текст важнее обработки: вставляем распознанное как есть.
-                    let reason = reason.unwrap_or(e);
-                    log::warn!("«{}» не отработало: {reason}", action.name);
-                    shared.notify(format!("{reason} — вставляю без обработки"));
+                    log::warn!("«{}» не отработало: {e}", action.name);
+                    shared.notify(format!("{e} — вставляю без обработки"));
                 }
             }
         }
@@ -620,6 +664,7 @@ fn process(
         duration_secs,
         clipboard_before,
         engine: used_engine,
+        llm_model: used_llm,
     })
 }
 
@@ -642,7 +687,10 @@ fn record_result(
                 final_text: out.final_text,
                 mode: post_names(cfg),
                 stt_model: cfg.stt.model.clone(),
-                llm_model: None,
+                // Чем обработали текст. Пусто — обработки не было; при
+                // откате здесь стоит локальная модель, и по истории видно,
+                // что облако не сработало.
+                llm_model: out.llm_model,
                 latency_ms,
                 clipboard_before: out.clipboard_before,
                 error: None,
@@ -709,7 +757,7 @@ fn run_action(shared: &Arc<Shared>, id: &str) {
         std::thread::sleep(Duration::from_millis(60));
 
         let started = Instant::now();
-        let outcome = (|| -> anyhow::Result<(String, Option<String>)> {
+        let outcome = (|| -> anyhow::Result<(String, Option<String>, String, bool)> {
             let (selection, previous) = insert::copy_selection()?;
             let key = action.endpoint.api_key(&cfg);
             // Молчаливое «не знаю» вместо ответа — самый непонятный отказ:
@@ -721,13 +769,11 @@ fn run_action(shared: &Arc<Shared>, id: &str) {
                 );
             }
             let context = action.load_context()?;
-            let result = providers::run_prompt(
-                &action.endpoint,
-                &key,
-                &action.prompt,
-                context.as_deref(),
-                &selection,
-            )?;
+            // Тот же путь, что и после диктовки: облако, а при подходящем
+            // отказе — локальная модель. Раньше здесь отката не было вовсе,
+            // и флажок в настройках действия ничего не делал.
+            let done = apply_action(&shared, &cfg, &action, &key, context.as_deref(), &selection)?;
+            let result = done.text;
 
             match action.output {
                 crate::actions::Output::Replace => {
@@ -747,12 +793,12 @@ fn run_action(shared: &Arc<Shared>, id: &str) {
             // Прежнее содержимое буфера мы затёрли своим же ⌘C. Вернуть его
             // нельзя — там теперь результат, — но в истории оно сохранится,
             // и на вкладке «Буфер» его можно достать обратно.
-            Ok((result, previous))
+            Ok((result, previous, done.model, done.local))
         })();
 
         let latency_ms = started.elapsed().as_millis() as u64;
         match outcome {
-            Ok((text, clipboard_before)) => {
+            Ok((text, clipboard_before, used_model, went_local)) => {
                 let note = match action.output {
                     crate::actions::Output::Clipboard => {
                         format!("{} — в буфере, вставьте ⌘V", action.name)
@@ -768,11 +814,16 @@ fn run_action(shared: &Arc<Shared>, id: &str) {
                     final_text: text,
                     mode: action.name.clone(),
                     stt_model: String::new(),
-                    llm_model: Some(action.endpoint.model.clone()),
+                    // Что реально обработало: при откате это локальная модель.
+                    llm_model: Some(used_model),
                     latency_ms,
                     clipboard_before,
                     error: None,
-                    engine: Some(action.endpoint.provider.label().to_string()),
+                    engine: Some(if went_local {
+                        crate::provider::Provider::Local.label().to_string()
+                    } else {
+                        action.endpoint.provider.label().to_string()
+                    }),
                 };
                 let _ = history::append(&entry);
                 shared.history.lock().unwrap().insert(0, entry);

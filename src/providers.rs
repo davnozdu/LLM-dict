@@ -29,6 +29,60 @@ fn text_client() -> Result<reqwest::blocking::Client> {
         .build()?)
 }
 
+/// Отчего запрос к поставщику не удался.
+///
+/// Разделение нужно ради отката на локальную модель: подменять облако она
+/// должна там, где сервис недоступен, и не должна там, где запрос отвергнут.
+/// Иначе протухший ключ выглядел бы как исправно работающая программа, и
+/// пользователь никогда не узнал бы, что платит за облако впустую.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Failure {
+    /// Сервис не отвечает, перегружен или сломался — попробовать локально
+    /// осмысленно.
+    Unavailable,
+    /// Запрос отвергнут: нет ключа, ключ не тот, нет такой модели, кривой
+    /// запрос. Локальная модель это не чинит.
+    Rejected,
+}
+
+/// Отказ запроса вместе с его видом.
+#[derive(Debug)]
+pub struct PromptError {
+    pub kind: Failure,
+    pub error: anyhow::Error,
+}
+
+impl PromptError {
+    fn unavailable(error: anyhow::Error) -> Self {
+        Self {
+            kind: Failure::Unavailable,
+            error,
+        }
+    }
+    fn rejected(error: anyhow::Error) -> Self {
+        Self {
+            kind: Failure::Rejected,
+            error,
+        }
+    }
+    /// Есть ли смысл пробовать локальную модель.
+    pub fn worth_local_retry(&self) -> bool {
+        self.kind == Failure::Unavailable
+    }
+}
+
+impl std::fmt::Display for PromptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
+
+impl From<PromptError> for anyhow::Error {
+    fn from(e: PromptError) -> Self {
+        e.error
+    }
+}
+
 #[derive(Deserialize)]
 struct TranscriptionResponse {
     text: String,
@@ -155,19 +209,22 @@ pub fn run_prompt(
     system_prompt: &str,
     context: Option<&str>,
     text: &str,
-) -> Result<String> {
+) -> std::result::Result<String, PromptError> {
     if text.trim().is_empty() {
-        bail!("нечего обрабатывать: текст пустой");
+        return Err(PromptError::rejected(anyhow!(
+            "нечего обрабатывать: текст пустой"
+        )));
     }
     let base_url = endpoint.base_url();
     if base_url.trim().is_empty() {
-        bail!(
+        return Err(PromptError::rejected(anyhow!(
             "не задан адрес API для поставщика {}",
             endpoint.provider.label()
-        );
+        )));
     }
-    require_network(&base_url)?;
-    require_key(api_key, &base_url)?;
+    // Сети нет — это ровно тот случай, ради которого локальная модель и есть.
+    require_network(&base_url).map_err(PromptError::unavailable)?;
+    require_key(api_key, &base_url).map_err(PromptError::rejected)?;
 
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
@@ -190,7 +247,8 @@ pub fn run_prompt(
         "messages": messages,
     });
 
-    let mut req = text_client()?.post(&url).json(&payload);
+    let client = text_client().map_err(PromptError::unavailable)?;
+    let mut req = client.post(&url).json(&payload);
     if !api_key.is_empty() {
         req = req.bearer_auth(api_key);
     }
@@ -203,25 +261,35 @@ pub fn run_prompt(
             if !is_local(&base_url) {
                 crate::net::mark_offline();
             }
-            anyhow!("{} не отвечает", endpoint.provider.label())
+            PromptError::unavailable(anyhow!("{} не отвечает", endpoint.provider.label()))
         } else {
-            anyhow!("{e}")
+            PromptError::unavailable(anyhow!("{e}"))
         }
     })?;
     let status = resp.status();
-    let body = resp.text()?;
+    let body = resp
+        .text()
+        .map_err(|e| PromptError::unavailable(anyhow!("{e}")))?;
     if !status.is_success() {
-        return Err(explain(status, &body, &base_url));
+        let error = explain(status, &body, &base_url);
+        // 5xx и 429 — сервису плохо, это пройдёт. Остальное (401, 403, 404,
+        // 400) означает, что запрос неверен, и повтор локально его не спасёт,
+        // а только скроет поломку от пользователя.
+        return Err(if status.is_server_error() || status.as_u16() == 429 {
+            PromptError::unavailable(error)
+        } else {
+            PromptError::rejected(error)
+        });
     }
-    let parsed: ChatResponse =
-        serde_json::from_str(&body).map_err(|e| anyhow!("неожиданный ответ модели: {e}"))?;
+    let parsed: ChatResponse = serde_json::from_str(&body)
+        .map_err(|e| PromptError::unavailable(anyhow!("неожиданный ответ модели: {e}")))?;
     parsed
         .choices
         .into_iter()
         .next()
         .map(|c| c.message.content.trim().to_string())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!("модель вернула пустой ответ"))
+        .ok_or_else(|| PromptError::unavailable(anyhow!("модель вернула пустой ответ")))
 }
 
 /// Настоящая проверка ключа: короткий запрос к модели.
@@ -240,7 +308,8 @@ pub fn verify_key(endpoint: &crate::provider::Endpoint, api_key: &str) -> Result
         "messages": [{ "role": "user", "content": "ok" }]
     });
 
-    let mut req = text_client()?.post(&url).json(&payload);
+    let client = text_client().map_err(PromptError::unavailable)?;
+    let mut req = client.post(&url).json(&payload);
     if !api_key.is_empty() {
         req = req.bearer_auth(api_key);
     }
@@ -281,4 +350,51 @@ pub fn list_models(base_url: &str, api_key: &str) -> Result<Vec<String>> {
     let mut ids: Vec<String> = parsed.data.into_iter().map(|m| m.id).collect();
     ids.sort();
     Ok(ids)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Отвергнутый запрос не должен подменяться локальной моделью.
+    ///
+    /// Иначе протухший ключ выглядел бы как исправно работающая программа:
+    /// текст обрабатывается, ошибки нет, и пользователь не узнаёт, что
+    /// облако у него не работает вовсе.
+    #[test]
+    fn отвергнутый_запрос_не_уходит_на_локальную_модель() {
+        for e in [
+            PromptError::rejected(anyhow!("401")),
+            PromptError::rejected(anyhow!("нет ключа")),
+        ] {
+            assert!(!e.worth_local_retry(), "{e} не должно уходить локально");
+        }
+    }
+
+    /// А недоступный сервис — должен: ровно ради этого локальная модель и есть.
+    #[test]
+    fn недоступный_сервис_уходит_на_локальную_модель() {
+        let e = PromptError::unavailable(anyhow!("Groq не отвечает"));
+        assert!(e.worth_local_retry());
+    }
+
+    /// Классификация по коду ответа: временное — локально, постоянное — нет.
+    #[test]
+    fn коды_ответа_разделены_верно() {
+        let cases = [
+            (500u16, true),
+            (502, true),
+            (503, true),
+            (429, true),
+            (400, false),
+            (401, false),
+            (403, false),
+            (404, false),
+        ];
+        for (code, expect_local) in cases {
+            let status = reqwest::StatusCode::from_u16(code).unwrap();
+            let temporary = status.is_server_error() || status.as_u16() == 429;
+            assert_eq!(temporary, expect_local, "код {code} отнесён не туда");
+        }
+    }
 }
