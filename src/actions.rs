@@ -55,6 +55,12 @@ pub struct TextAction {
     /// угодно. Читается при каждом запуске, поэтому правки подхватываются
     /// без перезапуска приложения.
     pub context_file: String,
+    /// Обработать локальной моделью, если поставщик не ответил.
+    ///
+    /// Отдельный флажок, а не общий режим: действие «поправь пунктуацию»
+    /// локальная модель потянет, а действие с большим файлом сведений —
+    /// нет, оно не влезет в её контекст.
+    pub fallback_local: bool,
 }
 
 impl Default for TextAction {
@@ -69,6 +75,7 @@ impl Default for TextAction {
             enabled: true,
             after_dictation: false,
             context_file: String::new(),
+            fallback_local: false,
         }
     }
 }
@@ -99,16 +106,19 @@ pub fn correction_action(endpoint: Endpoint) -> TextAction {
     TextAction {
         id: new_id(),
         name: "Правка после диктовки".into(),
-        prompt: "Расставь знаки препинания и заглавные буквы, исправь опечатки и \
-                 явные ошибки распознавания речи. Не меняй смысл, стиль и язык, \
-                 ничего не добавляй и не убирай. Выведи только исправленный текст."
-            .into(),
+        // Формулировка проверена замером на реальных диктовках: мягкий
+        // вариант давал втрое больше испорченных реплик — локальные модели
+        // начинали дописывать своё и переставлять слова.
+        prompt: crate::local_llm::CORRECT_PROMPT.into(),
         endpoint,
         hotkey: Binding::new(Vec::new()),
         output: Output::Clipboard,
         enabled: true,
         after_dictation: true,
+        // Ровно то действие, ради которого локальная модель и заводится:
+        // короткий текст, узкая задача, и без сети оно иначе просто пропадёт.
         context_file: String::new(),
+        fallback_local: true,
     }
 }
 
@@ -133,6 +143,7 @@ pub fn answer_action(endpoint: Endpoint) -> TextAction {
         enabled: true,
         after_dictation: false,
         context_file: String::new(),
+        fallback_local: false,
     }
 }
 
@@ -156,6 +167,7 @@ pub fn defaults() -> Vec<TextAction> {
             enabled: true,
             after_dictation: false,
             context_file: String::new(),
+            fallback_local: false,
         },
         TextAction {
             id: new_id(),
@@ -167,6 +179,7 @@ pub fn defaults() -> Vec<TextAction> {
             enabled: true,
             after_dictation: false,
             context_file: String::new(),
+            fallback_local: false,
         },
         TextAction {
             id: new_id(),
@@ -178,6 +191,7 @@ pub fn defaults() -> Vec<TextAction> {
             enabled: true,
             after_dictation: false,
             context_file: String::new(),
+            fallback_local: false,
         },
         TextAction {
             id: new_id(),
@@ -192,6 +206,7 @@ pub fn defaults() -> Vec<TextAction> {
             enabled: true,
             after_dictation: false,
             context_file: String::new(),
+            fallback_local: false,
         },
     ]
 }
@@ -203,6 +218,22 @@ const MAX_CONTEXT_BYTES: u64 = 256 * 1024;
 impl TextAction {
     /// Читает файл с данными. Перечитывается при каждом запуске, поэтому
     /// правки в файле подхватываются без перезапуска приложения.
+    /// Промпт опирается на файл сведений.
+    ///
+    /// Нужно, чтобы отличить «модель не нашла ответа» от «модели не дали
+    /// того, на чём отвечать»: без файла такое действие честно отвечает
+    /// «не знаю», и по ответу не догадаться, что дело в настройках.
+    pub fn expects_context(&self) -> bool {
+        const WORDS: [&str; 5] = ["сведени", "данны", "файл", "информаци", "контекст"];
+        let p = self.prompt.to_lowercase();
+        WORDS.iter().any(|w| p.contains(w))
+    }
+
+    /// Действие ждёт сведений, но файл не выбран.
+    pub fn missing_context(&self) -> bool {
+        self.context_file.trim().is_empty() && self.expects_context()
+    }
+
     pub fn load_context(&self) -> anyhow::Result<Option<String>> {
         let path = self.context_file.trim();
         if path.is_empty() {

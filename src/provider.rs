@@ -17,6 +17,9 @@ pub enum Provider {
     DeepSeek,
     /// Свой адрес: локальный сервер или что-то ещё OpenAI-совместимое.
     Custom,
+    /// Модель внутри самого приложения: llama.cpp, без сервера и без сети.
+    /// Какая именно — задаётся один раз в настройках, а не у каждого действия.
+    Local,
 }
 
 impl Provider {
@@ -28,6 +31,7 @@ impl Provider {
             Provider::Gemini => "Gemini",
             Provider::DeepSeek => "DeepSeek",
             Provider::Custom => "Свой адрес",
+            Provider::Local => "Локальная модель",
         }
     }
 
@@ -39,12 +43,14 @@ impl Provider {
             Provider::Gemini => "https://generativelanguage.googleapis.com/v1beta/openai",
             Provider::DeepSeek => "https://api.deepseek.com/v1",
             Provider::Custom => "",
+            // Адреса нет: запрос никуда не уходит.
+            Provider::Local => "",
         }
     }
 
     /// Ollama крутится на своей машине и ключа не спрашивает.
     pub fn needs_key(self) -> bool {
-        !matches!(self, Provider::Ollama)
+        !matches!(self, Provider::Ollama | Provider::Local)
     }
 
     /// Имя записи в связке ключей. У каждого поставщика свой ключ.
@@ -56,6 +62,7 @@ impl Provider {
             Provider::Gemini => "gemini_api_key",
             Provider::DeepSeek => "deepseek_api_key",
             Provider::Custom => "custom_api_key",
+            Provider::Local => "",
         }
     }
 
@@ -66,7 +73,7 @@ impl Provider {
             Provider::OllamaCloud => Some("https://ollama.com/settings/keys"),
             Provider::Gemini => Some("https://aistudio.google.com/apikey"),
             Provider::DeepSeek => Some("https://platform.deepseek.com/api_keys"),
-            Provider::Ollama | Provider::Custom => None,
+            Provider::Ollama | Provider::Custom | Provider::Local => None,
         }
     }
 
@@ -78,16 +85,24 @@ impl Provider {
             Provider::Gemini => "gemini-2.5-flash",
             Provider::DeepSeek => "deepseek-chat",
             Provider::Custom => "",
+            // Модель берётся из общей настройки, у действия её нет.
+            Provider::Local => "",
         }
     }
 
-    pub const ALL: [Provider; 6] = [
+    /// Не требует ни сети, ни ключа — работает всегда.
+    pub fn is_local(self) -> bool {
+        matches!(self, Provider::Local)
+    }
+
+    pub const ALL: [Provider; 7] = [
         Provider::Groq,
         Provider::Ollama,
         Provider::OllamaCloud,
         Provider::Gemini,
         Provider::DeepSeek,
         Provider::Custom,
+        Provider::Local,
     ];
 }
 

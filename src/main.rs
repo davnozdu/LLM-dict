@@ -14,6 +14,7 @@ mod fonts;
 mod history;
 mod hotkey;
 mod insert;
+mod local_llm;
 mod logging;
 mod macos;
 mod models;
@@ -57,9 +58,8 @@ fn run_bench(path: &str, language: Option<&str>) -> eframe::Result<()> {
         let label = engine.label();
         if engine.is_local() {
             let id = match engine {
-                models::Engine::Whisper => &cfg.stt.whisper_model,
                 models::Engine::Parakeet => &cfg.stt.parakeet_model,
-                models::Engine::Cloud => "",
+                models::Engine::Cloud | models::Engine::Llm => "",
             };
             match models::find(id) {
                 Some(spec) if !spec.is_installed() => {
@@ -100,6 +100,68 @@ fn run_bench(path: &str, language: Option<&str>) -> eframe::Result<()> {
 ///
 /// Отвечает на вопрос «дело в клавишах или в самом запросе к модели»: здесь
 /// не нужны ни разрешения, ни выделение — только поставщик, модель и ключ.
+/// Прогон текста через локальную языковую модель.
+///
+/// Пользуется тем же модулем, что и диктовка, — поэтому проверяет ровно то,
+/// что работает в релизе, а не отдельную копию кода.
+fn run_local_test(text: &str) -> eframe::Result<()> {
+    let cfg = config::Config::load().normalized();
+    let id = cfg.local_llm.model.clone();
+    if id.is_empty() {
+        eprintln!("локальная модель не выбрана в настройках");
+        std::process::exit(1);
+    }
+    let Some(spec) = models::find(&id) else {
+        eprintln!("неизвестная модель: {id}");
+        std::process::exit(1);
+    };
+    println!("Модель: {} ({})", spec.title, id);
+    if !spec.is_installed() {
+        eprintln!("модель не скачана: {}", spec.dir().display());
+        std::process::exit(1);
+    }
+
+    // Промпт берём у действия после диктовки — как в настоящем конвейере.
+    let prompt = cfg
+        .actions
+        .iter()
+        .find(|a| a.enabled && a.after_dictation)
+        .map(|a| a.prompt.clone())
+        .unwrap_or_else(|| local_llm::CORRECT_PROMPT.to_string());
+
+    let mut llm = local_llm::LocalLlm::default();
+    let loaded = std::time::Instant::now();
+    if let Err(e) = llm.ensure(&id) {
+        eprintln!("не загрузить: {e}");
+        std::process::exit(1);
+    }
+    println!("Загрузка: {:.2} с", loaded.elapsed().as_secs_f32());
+
+    let started = std::time::Instant::now();
+    match llm.run(&id, &prompt, text) {
+        Ok(out) => {
+            println!("\nБыло:  {text}");
+            println!("Стало: {out}");
+            println!(
+                "\nВремя обработки: {:.2} с",
+                started.elapsed().as_secs_f32()
+            );
+            if out == text {
+                println!("Модель ничего не изменила.");
+            }
+        }
+        Err(e) => {
+            println!("\nБыло:  {text}");
+            println!("Отказ: {e}");
+            println!("В диктовке это означает вставку исходного текста без изменений.");
+        }
+    }
+    println!("Загружена в памяти: {}", llm.is_loaded());
+    llm.unload();
+    println!("После выгрузки: {}", llm.is_loaded());
+    Ok(())
+}
+
 fn run_action_test(name: &str, text: &str) -> eframe::Result<()> {
     let cfg = config::Config::load().normalized();
     let Some(action) = cfg
@@ -213,6 +275,9 @@ fn main() -> eframe::Result<()> {
     }
     if args.len() >= 2 && args[1] == "--watch-keys" {
         return run_watch_keys();
+    }
+    if args.len() >= 3 && args[1] == "--test-local" {
+        return run_local_test(&args[2..].join(" "));
     }
     if args.len() >= 4 && args[1] == "--test-action" {
         return run_action_test(&args[2], &args[3]);
