@@ -87,6 +87,8 @@ pub struct App {
     overlay: crate::overlay::Overlay,
     /// Идущая загрузка модели: её id, прогресс и канал с результатом.
     download: Option<Download>,
+    /// Показывать ключ эндпоинта открытым текстом.
+    show_server_key: bool,
     /// Какое действие сейчас раскрыто в редакторе.
     editing_action: Option<String>,
     /// Для какого действия набирается сочетание.
@@ -164,6 +166,7 @@ impl App {
             key_synced: false,
             overlay: crate::overlay::Overlay::new(),
             download: None,
+            show_server_key: false,
             editing_action: None,
             capturing_action: None,
             provider_models: HashMap::new(),
@@ -1123,6 +1126,62 @@ impl App {
                  память, пока ими не пользуются.",
             );
 
+            // --- свой эндпоинт ---
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("Отдавать модель другим программам").strong());
+            ui.weak(
+                "Поднимает OpenAI-совместимый адрес поверх той же локальной модели. \
+                 Второй копии в памяти не появится.",
+            );
+            ui.add_space(6.0);
+            ui.checkbox(&mut self.cfg.server.enabled, "Включить локальный эндпоинт");
+            if self.cfg.server.enabled {
+                if self.cfg.server.api_key.trim().is_empty() {
+                    self.cfg.server.api_key = crate::server::new_key();
+                }
+                labeled(ui, "Порт", |ui| {
+                    ui.add(egui::DragValue::new(&mut self.cfg.server.port).range(1024..=65535));
+                    ui.weak(format!("http://127.0.0.1:{}/v1", self.cfg.server.port));
+                });
+                labeled(ui, "Ключ", |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.cfg.server.api_key)
+                            .desired_width(300.0)
+                            .password(!self.show_server_key),
+                    );
+                    if ui
+                        .small_button(if self.show_server_key {
+                            "Скрыть"
+                        } else {
+                            "Показать"
+                        })
+                        .clicked()
+                    {
+                        self.show_server_key = !self.show_server_key;
+                    }
+                    if ui.small_button("Копировать").clicked() {
+                        ui.ctx().copy_text(self.cfg.server.api_key.clone());
+                        self.toast("Ключ скопирован");
+                    }
+                    if ui.small_button("Новый").clicked() {
+                        self.cfg.server.api_key = crate::server::new_key();
+                        self.toast("Ключ заменён — обновите его в других программах");
+                    }
+                });
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 130, 40),
+                    "Адрес и порт применяются после перезапуска приложения",
+                );
+                ui.weak(
+                    "Слушает только 127.0.0.1 — из сети не доступен. Пока идёт диктовка, \
+                     внешние запросы получают отказ: программа в первую очередь ваша. \
+                     Чтобы не ждать загрузку модели на каждом холодном запросе, включите \
+                     «Держать модель в памяти постоянно».",
+                );
+            }
+
             ui.add_space(12.0);
             ui.separator();
             ui.add_space(6.0);
@@ -1992,15 +2051,18 @@ impl App {
 
         ui.add_space(6.0);
         let has_context = !self.cfg.actions[pos].context_file.trim().is_empty();
-        ui.add_enabled_ui(!has_context, |ui| {
-            ui.checkbox(
-                &mut self.cfg.actions[pos].fallback_local,
-                "Обработать локальной моделью, если поставщик не ответил",
-            );
-        });
+        ui.checkbox(
+            &mut self.cfg.actions[pos].fallback_local,
+            "Обработать локальной моделью, если поставщик не ответил",
+        );
         if has_context {
-            ui.weak("Недоступно: файл сведений не помещается в контекст локальной модели.");
-        } else if self.cfg.actions[pos].fallback_local {
+            ui.weak(
+                "Файл сведений уйдёт и локальной модели: контекст подбирается под \
+                 запрос. Если файл окажется слишком велик, действие скажет об этом, \
+                 а текст вставится без обработки.",
+            );
+        }
+        if self.cfg.actions[pos].fallback_local {
             if self.cfg.local_llm.model.is_empty() {
                 ui.colored_label(
                     egui::Color32::from_rgb(220, 130, 40),

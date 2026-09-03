@@ -137,6 +137,35 @@ impl Default for LocalLlmConfig {
     }
 }
 
+/// Свой OpenAI-совместимый эндпоинт поверх загруженной локальной модели.
+///
+/// Модель и так живёт в памяти приложения; отдать её другим программам стоит
+/// одного потока. Слушаем только 127.0.0.1 — открывать наружу нечего, а
+/// доступ по сети означал бы, что любой в той же сети гоняет вашу модель.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServerConfig {
+    pub enabled: bool,
+    pub port: u16,
+    /// Ключ для заголовка `Authorization: Bearer`. Создаётся при первом
+    /// включении: пускать без ключа даже на локальный адрес не стоит —
+    /// к нему дотянется любая программа на этой машине, включая вкладку
+    /// браузера.
+    pub api_key: String,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            // Не 11434 и не 1234: занимать порт Ollama или LM Studio значило бы
+            // ссориться с ними за адрес.
+            port: 11435,
+            api_key: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GeneralConfig {
@@ -225,6 +254,7 @@ pub struct Config {
     pub stt: SttConfig,
     pub llm: LlmConfig,
     pub local_llm: LocalLlmConfig,
+    pub server: ServerConfig,
     /// Действия над выделенным текстом со своими сочетаниями клавиш.
     pub actions: Vec<crate::actions::TextAction>,
     /// Заполняется только при включённом `general.key_in_config`.

@@ -544,11 +544,6 @@ fn apply_action(
         }
     }
 
-    // Сведения из файла в контекст локальной модели не помещаются: он
-    // рассчитан на фразу диктовки, а не на справочник.
-    if context.is_some() {
-        anyhow::bail!("файл сведений не помещается в контекст локальной модели");
-    }
     let model_id = cfg.local_llm.model.trim();
     if model_id.is_empty() {
         anyhow::bail!("локальная модель не выбрана в настройках");
@@ -557,11 +552,19 @@ fn apply_action(
     shared.set_stage(Stage::LoadingModel);
     // Инструкция берётся у самого действия: подменять её своей значило бы
     // делать не то, что настроил пользователь.
+    // Правку надиктованного проверяем строго — там выход обязан походить на
+    // вход. Перевод и ответ по данным дают другой текст по замыслу, и такие
+    // проверки забраковали бы исправное.
+    let guard = if action.after_dictation && context.is_none() {
+        crate::local_llm::Guard::Correction
+    } else {
+        crate::local_llm::Guard::FreeForm
+    };
     let out = shared
         .llm
         .lock()
         .unwrap()
-        .run(model_id, &action.prompt, text);
+        .run(model_id, &action.prompt, context, text, guard);
     shared.set_stage(Stage::PostProcessing);
     Ok(Applied {
         text: out?,

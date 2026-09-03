@@ -23,6 +23,7 @@ mod overlay;
 mod permissions;
 mod provider;
 mod providers;
+mod server;
 mod stt;
 mod updater;
 
@@ -100,6 +101,67 @@ fn run_bench(path: &str, language: Option<&str>) -> eframe::Result<()> {
 ///
 /// Отвечает на вопрос «дело в клавишах или в самом запросе к модели»: здесь
 /// не нужны ни разрешения, ни выделение — только поставщик, модель и ключ.
+/// Поднимает OpenAI-совместимый эндпоинт и ждёт.
+///
+/// Проверочный режим: настройки не меняются, ключ при необходимости выдаётся
+/// разовый и печатается — так эндпоинт можно опробовать, не включая его
+/// насовсем.
+fn run_serve() -> eframe::Result<()> {
+    let mut cfg = config::Config::load().normalized();
+    if cfg.server.api_key.trim().is_empty() {
+        cfg.server.api_key = server::new_key();
+        println!(
+            "разовый ключ (в настройки не сохранён): {}",
+            cfg.server.api_key
+        );
+    }
+    println!("адрес: http://127.0.0.1:{}/v1", cfg.server.port);
+    println!("модель: {}", cfg.local_llm.model);
+    let shared = engine::Shared::new(cfg);
+    server::start(shared);
+    println!("работает, Ctrl+C для остановки");
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
+/// Сколько токенов занимает файл у выбранной локальной модели.
+///
+/// Нужен, чтобы отвечать «влезет ли файл сведений» числом, а не на глаз:
+/// в кириллице символов на токен приходится заметно меньше, чем в латинице.
+fn run_count_tokens(path: &str) -> eframe::Result<()> {
+    let cfg = config::Config::load().normalized();
+    let id = cfg.local_llm.model.clone();
+    let Some(spec) = models::find(&id).filter(|s| s.is_installed()) else {
+        eprintln!("локальная модель не выбрана или не скачана");
+        std::process::exit(1);
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("не прочитать {path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let corrector = match local_llm::Corrector::load(&id, &spec.dir().join(spec.files[0].name)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("не загрузить модель: {e}");
+            std::process::exit(1);
+        }
+    };
+    match corrector.count_tokens(&text) {
+        Ok(n) => println!(
+            "{path}\n  {} символов, {} байт\n  {n} токенов у {}",
+            text.chars().count(),
+            text.len(),
+            spec.title
+        ),
+        Err(e) => eprintln!("не посчитать: {e}"),
+    }
+    Ok(())
+}
+
 /// Прогон текста через локальную языковую модель.
 ///
 /// Пользуется тем же модулем, что и диктовка, — поэтому проверяет ровно то,
@@ -138,7 +200,7 @@ fn run_local_test(text: &str) -> eframe::Result<()> {
     println!("Загрузка: {:.2} с", loaded.elapsed().as_secs_f32());
 
     let started = std::time::Instant::now();
-    match llm.run(&id, &prompt, text) {
+    match llm.run(&id, &prompt, None, text, local_llm::Guard::Correction) {
         Ok(out) => {
             println!("\nБыло:  {text}");
             println!("Стало: {out}");
@@ -162,7 +224,7 @@ fn run_local_test(text: &str) -> eframe::Result<()> {
     Ok(())
 }
 
-fn run_action_test(name: &str, text: &str) -> eframe::Result<()> {
+fn run_action_test(name: &str, text: &str, local: bool) -> eframe::Result<()> {
     let cfg = config::Config::load().normalized();
     let Some(action) = cfg
         .actions
@@ -186,7 +248,36 @@ fn run_action_test(name: &str, text: &str) -> eframe::Result<()> {
 
     let started = std::time::Instant::now();
     let key = action.endpoint.api_key(&cfg);
-    let context = action.load_context().unwrap_or(None);
+    let context = match action.load_context() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("файл сведений: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Some(c) = &context {
+        println!("Файл сведений: {} символов", c.chars().count());
+    }
+    if local {
+        let id = cfg.local_llm.model.clone();
+        let mut llm = local_llm::LocalLlm::default();
+        let guard = if action.after_dictation && context.is_none() {
+            local_llm::Guard::Correction
+        } else {
+            local_llm::Guard::FreeForm
+        };
+        match llm.run(&id, &action.prompt, context.as_deref(), text, guard) {
+            Ok(out) => println!(
+                "Локально за {:.2} с:\n{out}",
+                started.elapsed().as_secs_f32()
+            ),
+            Err(e) => {
+                eprintln!("Локальная модель: {e}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
     match providers::run_prompt(
         &action.endpoint,
         &key,
@@ -276,11 +367,20 @@ fn main() -> eframe::Result<()> {
     if args.len() >= 2 && args[1] == "--watch-keys" {
         return run_watch_keys();
     }
+    if args.len() >= 2 && args[1] == "--serve" {
+        return run_serve();
+    }
+    if args.len() >= 3 && args[1] == "--count-tokens" {
+        return run_count_tokens(&args[2]);
+    }
     if args.len() >= 3 && args[1] == "--test-local" {
         return run_local_test(&args[2..].join(" "));
     }
     if args.len() >= 4 && args[1] == "--test-action" {
-        return run_action_test(&args[2], &args[3]);
+        // --local прогоняет действие через локальную модель, минуя облако:
+        // так проверяется именно откат, а не поставщик.
+        let local = args.iter().any(|a| a == "--local");
+        return run_action_test(&args[2], &args[3], local);
     }
 
     let cfg = config::Config::load().normalized();
@@ -302,6 +402,11 @@ fn main() -> eframe::Result<()> {
     // Слушатель клавиши и обработчик поднимаются до окна: диктовка должна
     // работать, даже если окно ни разу не открывали.
     let _hotkey_tx = engine::spawn(shared.clone());
+
+    // Свой OpenAI-совместимый эндпоинт, если включён. Порт читается один
+    // раз: менять его на лету — значит уметь ронять чужие соединения из
+    // окна настроек.
+    server::spawn(shared.clone());
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()

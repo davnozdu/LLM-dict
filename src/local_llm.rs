@@ -21,9 +21,33 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-/// Контекст намеренно маленький: диктовка — это десятки слов, а каждый лишний
-/// токен стоит памяти под KV-кеш.
-const N_CTX: u32 = 4096;
+/// Контекст подбирается под запрос: каждый лишний токен стоит памяти под
+/// KV-кеш, а диктовка — это десятки слов. Но действие может нести файл
+/// сведений на тысячи токенов, и тогда маленького контекста не хватит.
+///
+/// Нижняя граница — обычная диктовка, верхняя выбрана по памяти: сами модели
+/// держат куда больше (у Gemma 4 E2B это 131072), но такой KV-кеш съел бы
+/// больше самой модели.
+const N_CTX_MIN: u32 = 4096;
+const N_CTX_MAX: u32 = 32768;
+
+/// Реплика беседы в том же виде, в каком её присылает клиент OpenAI.
+#[derive(Debug, Clone)]
+pub struct Turn {
+    pub role: String,
+    pub content: String,
+}
+
+/// Насколько строго проверять ответ модели.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Guard {
+    /// Правка надиктованного: на выходе ожидается тот же текст с точностью
+    /// до знаков препинания, поэтому проверяются длина и письменность.
+    Correction,
+    /// Перевод, ответ по данным, пересказ — выход по замыслу не похож на
+    /// вход, и мерить его длиной входа бессмысленно.
+    FreeForm,
+}
 
 /// Инструкция намеренно запретительная. На стенде мягкая формулировка давала
 /// втрое больше испорченных реплик: модели дописывали своё, меняли порядок
@@ -102,57 +126,161 @@ impl Corrector {
         })
     }
 
-    fn build_prompt(&self, system: &str, text: &str) -> Result<String> {
-        let mut instruction = system.to_string();
-        if self.no_think {
-            instruction.push_str(" /no_think");
-        }
+    /// Одна реплика беседы. Роли те же, что у OpenAI: system, user, assistant.
+    fn render_chat(&self, turns: &[Turn]) -> Result<String> {
         if let Some(Family::Gemma4) = self.manual {
-            return Ok(format!(
-                "<bos><|turn>system\n{instruction}<turn|>\n\
-                 <|turn>user\n{text}<turn|>\n<|turn>model\n"
-            ));
+            // Формат Gemma 4: <bos><|turn>роль\n…<turn|>\n, в конце пустая
+            // реплика модели как приглашение к ответу. Встроенный в llama.cpp
+            // движок шаблонов её Jinja с макросами не разбирает.
+            let mut out = String::from("<bos>");
+            for t in turns {
+                let role = if t.role == "assistant" {
+                    "model"
+                } else {
+                    &t.role
+                };
+                out.push_str(&format!("<|turn>{role}\n{}<turn|>\n", t.content));
+            }
+            out.push_str("<|turn>model\n");
+            return Ok(out);
         }
-        let chat = if self.system_role {
-            vec![
-                LlamaChatMessage::new("system".into(), instruction)?,
-                LlamaChatMessage::new("user".into(), text.to_string())?,
-            ]
-        } else {
-            vec![LlamaChatMessage::new(
-                "user".into(),
-                format!("{instruction}\n\n{text}"),
-            )?]
-        };
+
+        // У части моделей (Gemma 3) в шаблоне нет роли system: её содержимое
+        // приклеивается к первой реплике пользователя.
+        let mut chat: Vec<LlamaChatMessage> = Vec::with_capacity(turns.len());
+        let mut pending_system = String::new();
+        for t in turns {
+            if t.role == "system" && !self.system_role {
+                if !pending_system.is_empty() {
+                    pending_system.push_str("\n\n");
+                }
+                pending_system.push_str(&t.content);
+                continue;
+            }
+            let content = if t.role == "user" && !pending_system.is_empty() {
+                let merged = format!("{pending_system}\n\n{}", t.content);
+                pending_system.clear();
+                merged
+            } else {
+                t.content.clone()
+            };
+            chat.push(LlamaChatMessage::new(t.role.clone(), content)?);
+        }
+        // Системная часть без единой реплики пользователя — отправляем как
+        // реплику пользователя, иначе она потерялась бы.
+        if !pending_system.is_empty() {
+            chat.push(LlamaChatMessage::new("user".into(), pending_system)?);
+        }
         self.model
             .apply_chat_template(&self.template, &chat, true)
             .map_err(|e| anyhow!("шаблон чата не применился: {e}"))
     }
 
-    /// Прогоняет текст через модель и возвращает уже проверенный результат.
-    /// Ошибка означает «вставить исходный текст».
-    pub fn correct(&self, system: &str, text: &str) -> Result<String> {
-        let g = self.generate(system, text)?;
-        sanitize(text, &g).map_err(|r| anyhow!("{}", r.explain()))
+    fn build_prompt(&self, system: &str, context: Option<&str>, text: &str) -> Result<String> {
+        let mut instruction = system.to_string();
+        // Сведения идут в ту же системную часть, что и инструкция. Облако
+        // кладёт их отдельным сообщением, но здесь это ничего не меняет:
+        // шаблоны части моделей второе системное сообщение не принимают.
+        if let Some(c) = context.filter(|c| !c.trim().is_empty()) {
+            instruction.push_str("\n\nСведения, на которые нужно опираться:\n\n");
+            instruction.push_str(c.trim());
+        }
+        if self.no_think {
+            instruction.push_str(" /no_think");
+        }
+        self.render_chat(&[
+            Turn {
+                role: "system".into(),
+                content: instruction,
+            },
+            Turn {
+                role: "user".into(),
+                content: text.to_string(),
+            },
+        ])
     }
 
-    fn generate(&self, system: &str, text: &str) -> Result<Generated> {
-        let prompt = self.build_prompt(system, text)?;
+    /// Сколько токенов занимает текст у этой модели.
+    pub fn count_tokens(&self, text: &str) -> Result<usize> {
+        self.model
+            .str_to_token(text, AddBos::Never)
+            .map(|t| t.len())
+            .map_err(|e| anyhow!("токенизация не удалась: {e}"))
+    }
+
+    /// Прогоняет текст через модель и возвращает уже проверенный результат.
+    /// Ошибка означает «оставить исходный текст».
+    pub fn correct(
+        &self,
+        system: &str,
+        context: Option<&str>,
+        text: &str,
+        guard: Guard,
+    ) -> Result<String> {
+        let g = self.generate(system, context, text)?;
+        sanitize(text, &g, guard).map_err(|r| anyhow!("{}", r.explain()))
+    }
+
+    fn generate(&self, system: &str, context: Option<&str>, text: &str) -> Result<Generated> {
+        let prompt = self.build_prompt(system, context, text)?;
+        // Потолок генерации: правка не бывает многократно длиннее входа.
+        let budget = |n: usize| n * 2 + 256;
+        self.run_prompt(prompt, budget, |_| {})
+    }
+
+    /// Беседа произвольной формы: то, что приходит снаружи через
+    /// OpenAI-совместимый эндпоинт.
+    ///
+    /// `on_token` вызывается на каждый готовый кусок текста — им и кормится
+    /// потоковая выдача. Проверки `sanitize` здесь не применяются: они
+    /// написаны для правки надиктованного, а внешний клиент ждёт обычный
+    /// ответ модели.
+    pub fn chat(
+        &self,
+        turns: &[Turn],
+        max_tokens: Option<usize>,
+        on_token: impl FnMut(&str),
+    ) -> Result<Generated> {
+        let prompt = self.render_chat(turns)?;
+        let budget = move |n: usize| max_tokens.unwrap_or(n * 2 + 512);
+        self.run_prompt(prompt, budget, on_token)
+    }
+
+    /// Общий цикл генерации.
+    fn run_prompt(
+        &self,
+        prompt: String,
+        budget_for: impl Fn(usize) -> usize,
+        mut on_token: impl FnMut(&str),
+    ) -> Result<Generated> {
         // BOS не добавляем: если модель его требует, он уже есть в шаблоне.
         let tokens = self
             .model
             .str_to_token(&prompt, AddBos::Never)
             .map_err(|e| anyhow!("токенизация не удалась: {e}"))?;
-        if tokens.len() + 64 >= N_CTX as usize {
-            bail!("текст не влезает в контекст локальной модели");
+        if tokens.is_empty() {
+            bail!("пустой запрос");
         }
-        // Потолок генерации: исправление не бывает заметно длиннее входа.
-        // Без него зациклившаяся модель молотит до конца контекста.
-        let budget = (tokens.len() * 2 + 32).min(N_CTX as usize - tokens.len() - 4);
+        // Без потолка зациклившаяся модель молотит до конца контекста.
+        let budget = budget_for(tokens.len()).max(16);
+
+        // Контекст под конкретный запрос, а не всегда самый большой: KV-кеш
+        // занимает память пропорционально размеру, и держать 32k ради фразы
+        // в двадцать слов незачем.
+        let needed = (tokens.len() + budget + 64) as u32;
+        if needed > N_CTX_MAX {
+            bail!(
+                "запрос не влезает в контекст локальной модели: {} токенов при пределе {}",
+                tokens.len(),
+                N_CTX_MAX
+            );
+        }
+        let n_ctx = needed.max(N_CTX_MIN).next_power_of_two().min(N_CTX_MAX);
+        let budget = budget.min((n_ctx as usize).saturating_sub(tokens.len() + 4));
 
         let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(N_CTX))
-            .with_n_batch(N_CTX);
+            .with_n_ctx(NonZeroU32::new(n_ctx))
+            .with_n_batch(n_ctx);
         let mut ctx = self
             .model
             .new_context(backend()?, ctx_params)
@@ -165,11 +293,14 @@ impl Corrector {
         }
         ctx.decode(&mut batch)?;
 
-        // Жадный выбор: корректура должна быть воспроизводимой.
+        // Жадный выбор: правка должна быть воспроизводимой.
         let mut sampler = LlamaSampler::chain_simple([LlamaSampler::greedy()]);
         // Копим байты, а не строки: один токен может разрезать многобайтовый
         // символ пополам, и посимвольное декодирование ломает кириллицу.
         let mut out: Vec<u8> = Vec::new();
+        // Сколько байтов уже отдано наружу: остаток — незаконченный символ,
+        // который ждёт следующего токена.
+        let mut sent = 0usize;
         let mut n_cur = tokens.len() as i32;
         let mut produced = 0usize;
 
@@ -181,6 +312,15 @@ impl Corrector {
             }
             out.extend_from_slice(&self.model.token_to_piece_bytes(token, 64, false, None)?);
             produced += 1;
+
+            // Отдаём только то, что уже складывается в целые символы.
+            if let Some(chunk) = complete_utf8(&out[sent..]) {
+                if !chunk.is_empty() {
+                    on_token(chunk);
+                    sent += chunk.len();
+                }
+            }
+
             batch.clear();
             batch.add(token, n_cur, &[0], true)?;
             n_cur += 1;
@@ -224,7 +364,7 @@ impl Reject {
 /// Проверки дешёвые, но снимают основную опасность: на стенде модель, которая
 /// вместо правки отвечала на текст, была забракована в 96% случаев — то есть
 /// пользователь получил бы свой текст нетронутым вместо чужого сочинения.
-pub fn sanitize(input: &str, g: &Generated) -> Result<String, Reject> {
+pub fn sanitize(input: &str, g: &Generated, guard: Guard) -> Result<String, Reject> {
     let mut s = g.raw.as_str();
     // Рассуждения вслух: Qwen3 их выдаёт даже с /no_think, если сочтёт задачу
     // сложной.
@@ -255,6 +395,12 @@ pub fn sanitize(input: &str, g: &Generated) -> Result<String, Reject> {
     if g.hit_budget {
         return Err(Reject::Runaway);
     }
+    // Дальше — проверки, осмысленные только для правки: там выход обязан
+    // походить на вход. Для перевода или ответа по данным он по замыслу
+    // другой, и мерить его длиной входа значило бы браковать исправное.
+    if guard == Guard::FreeForm {
+        return Ok(s);
+    }
     // Длина: правка пунктуации не меняет объём текста на треть.
     let (a, b) = (input.chars().count() as f32, s.chars().count() as f32);
     if b < a * 0.7 || b > a * 1.35 {
@@ -284,6 +430,17 @@ fn strip_preamble(s: &str) -> String {
         }
     }
     s.to_string()
+}
+
+/// Самый длинный кусок байтов, который целиком складывается в UTF-8.
+///
+/// Токен может кончиться на середине многобайтового символа: отдать такой
+/// хвост наружу — получить «ромбик с вопросом» в чужом клиенте.
+fn complete_utf8(bytes: &[u8]) -> Option<&str> {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => Some(s),
+        Err(e) => std::str::from_utf8(&bytes[..e.valid_up_to()]).ok(),
+    }
 }
 
 fn is_cyrillic(c: char) -> bool {
@@ -323,14 +480,41 @@ impl LocalLlm {
     }
 
     /// Обрабатывает текст. Ошибка означает «оставить текст как есть».
-    pub fn run(&mut self, model_id: &str, system: &str, text: &str) -> Result<String> {
+    pub fn run(
+        &mut self,
+        model_id: &str,
+        system: &str,
+        context: Option<&str>,
+        text: &str,
+        guard: Guard,
+    ) -> Result<String> {
         self.ensure(model_id)?;
         let out = self
             .loaded
             .as_ref()
             .ok_or_else(|| anyhow!("локальная модель не загружена"))?
-            .correct(system, text);
+            .correct(system, context, text, guard);
         // Отметка ставится и при отказе: модель всё равно в памяти.
+        self.last_used = Some(Instant::now());
+        out
+    }
+
+    /// Беседа произвольной формы для внешнего эндпоинта. Проверки корректуры
+    /// не применяются: клиент ждёт обычный ответ модели, а не правку текста.
+    pub fn chat_raw(
+        &mut self,
+        model_id: &str,
+        turns: &[Turn],
+        max_tokens: Option<usize>,
+        on_token: impl FnMut(&str),
+    ) -> Result<String> {
+        self.ensure(model_id)?;
+        let out = self
+            .loaded
+            .as_ref()
+            .ok_or_else(|| anyhow!("локальная модель не загружена"))?
+            .chat(turns, max_tokens, on_token)
+            .map(|g| g.raw);
         self.last_used = Some(Instant::now());
         out
     }
