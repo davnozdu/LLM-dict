@@ -82,6 +82,9 @@ pub struct App {
     /// Когда список открылся. Нужно на случай, если фокус так и не пришёл:
     /// без него список неуправляем, и висеть ему незачем.
     picker_opened: Instant,
+    /// Когда список закрылся. Сразу после этого окно ещё отчитывается о
+    /// размере списка, и запоминать его как обычный нельзя.
+    picker_closed: Instant,
     /// Список уже получал фокус. До этого ни клавиши не разбираем, ни от
     /// потери фокуса не закрываемся: окно показывается из фонового прохода,
     /// и фокус доходит не в том же кадре.
@@ -174,6 +177,7 @@ impl App {
             picker_return_pid: None,
             picker_opened: long_ago(10),
             picker_focused: false,
+            picker_closed: long_ago(10),
             main_size: egui::vec2(600.0, 680.0),
             capturing_clipboard: false,
             duplicates: Vec::new(),
@@ -548,9 +552,16 @@ impl eframe::App for App {
 
         // Размер обычного окна запоминаем, пока оно обычное: списку оно
         // достаётся перекроенным, и вернуть надо именно то, что было.
-        if let Some(rect) = ctx.input(|i| i.viewport().inner_rect) {
-            if rect.width() > 100.0 && rect.height() > 100.0 {
-                self.main_size = rect.size();
+        //
+        // Не сразу после закрытия списка: окно отчитывается о размере с
+        // задержкой в кадр, и на пути «список открыт → настройки из трея»
+        // мы запомнили бы размер списка как обычный. Дальше окно настроек
+        // так и открывалось бы с него.
+        if self.picker_closed.elapsed() > Duration::from_millis(400) {
+            if let Some(rect) = ctx.input(|i| i.viewport().inner_rect) {
+                if rect.width() > 100.0 && rect.height() > 100.0 {
+                    self.main_size = rect.size();
+                }
             }
         }
 
@@ -1663,7 +1674,10 @@ impl App {
     /// Высота — по числу показываемых записей: список на десять строк не
     /// должен занимать пол-экрана, а на полсотни — ползать в щели.
     fn picker_size(&self) -> egui::Vec2 {
-        let rows = self.cfg.general.clipboard_recent.clamp(1, 100) as f32;
+        // По настройке, но не больше, чем записей на руках: круг из ста при
+        // трёх записях дал бы окно с пустотой на две трети.
+        let have = self.shared.clipboard.entries.lock().unwrap().len().max(1);
+        let rows = self.cfg.general.clipboard_recent.clamp(1, 100).min(have) as f32;
         egui::vec2(560.0, (120.0 + rows * 24.0).clamp(200.0, 560.0))
     }
 
@@ -1685,6 +1699,7 @@ impl App {
 
     fn close_picker(&mut self, ctx: &egui::Context) {
         self.picker = false;
+        self.picker_closed = Instant::now();
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         // Обычный вид возвращаем сразу, пока окно скрыто: иначе настройки,
         // открытые из трея, показались бы плашкой без рамки поверх всего.
@@ -1794,19 +1809,27 @@ impl App {
             search.request_focus();
         }
 
-        let entries = self.shared.clipboard.entries.lock().unwrap().clone();
         let query = self.picker_query.trim().to_lowercase();
         // Без запроса — ровно столько последних записей, сколько попросили в
         // настройках. С запросом ищем по всей истории: иначе поиск отвечал бы
         // «ничего нет» о том, что лежит парой строк ниже предела.
-        let found: Vec<&crate::clipboard::Entry> = if query.is_empty() {
-            entries.iter().take(recent).collect()
-        } else {
-            entries
-                .iter()
-                .filter(|e| e.text.to_lowercase().contains(&query))
-                .take(200)
-                .collect()
+        //
+        // Копируем только то, что покажем. В истории до пятисот записей, а в
+        // одну помещается до 64 КБ; копировать это целиком на каждом кадре
+        // означало бы десятки мегабайт в секунду на ровном месте.
+        let (found, total) = {
+            let entries = self.shared.clipboard.entries.lock().unwrap();
+            let found: Vec<crate::clipboard::Entry> = if query.is_empty() {
+                entries.iter().take(recent).cloned().collect()
+            } else {
+                entries
+                    .iter()
+                    .filter(|e| e.text.to_lowercase().contains(&query))
+                    .take(200)
+                    .cloned()
+                    .collect()
+            };
+            (found, entries.len())
         };
 
         // Пока окно было скрыто, eframe копил ввод и отдаёт его одним махом
@@ -1840,7 +1863,7 @@ impl App {
 
         ui.add_space(6.0);
         if found.is_empty() {
-            ui.label(if entries.is_empty() {
+            ui.label(if total == 0 {
                 "История пуста. Скопируйте что-нибудь, и оно появится здесь."
             } else {
                 "Ничего не нашлось."
@@ -2485,7 +2508,11 @@ impl App {
         });
         ui.add_space(6.0);
 
-        let entries = self.shared.clipboard.entries.lock().unwrap().clone();
+        // Как и в списке выбора: копируем только показываемое.
+        let entries: Vec<crate::clipboard::Entry> = {
+            let guard = self.shared.clipboard.entries.lock().unwrap();
+            guard.iter().take(300).cloned().collect()
+        };
         if entries.is_empty() {
             ui.weak("Пока пусто. Скопируйте что-нибудь, и оно появится здесь.");
             return;
@@ -2493,7 +2520,7 @@ impl App {
 
         let mut copy: Option<String> = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
-            for (i, entry) in entries.iter().take(300).enumerate() {
+            for (i, entry) in entries.iter().enumerate() {
                 ui.push_id(i, |ui| {
                     ui.horizontal(|ui| {
                         let (icon, _) =

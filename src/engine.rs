@@ -435,6 +435,20 @@ struct ClipboardCycle {
     last: Option<Instant>,
 }
 
+/// Куда встать при очередном нажатии.
+///
+/// Первое нажатие в круге пропускает самую свежую запись, если она и так
+/// лежит в буфере: подставлять её же означало бы не сделать ничего. Дальше
+/// идём по кругу — и по остатку от деления, потому что предел мог смениться
+/// в настройках прямо посреди листания.
+fn next_cycle_pos(pos: usize, limit: usize, fresh: bool, newest_in_clipboard: bool) -> usize {
+    if fresh {
+        usize::from(limit > 1 && newest_in_clipboard)
+    } else {
+        (pos + 1) % limit
+    }
+}
+
 /// Кладёт в буфер следующую запись истории и показывает у курсора, какую.
 ///
 /// Окно при этом не открывается: в этом весь смысл режима — руки остаются
@@ -458,14 +472,8 @@ fn cycle_clipboard(shared: &Arc<Shared>, cfg: &Config, cycle: &mut ClipboardCycl
         .last
         .map(|t| t.elapsed() > CYCLE_RESET)
         .unwrap_or(true);
-    if fresh {
-        // Первое нажатие: самая свежая запись обычно и так лежит в буфере,
-        // и подставлять её же значило бы не сделать ничего.
-        let current = insert::read_clipboard();
-        cycle.pos = usize::from(limit > 1 && current.as_deref() == Some(entries[0].text.as_str()));
-    } else {
-        cycle.pos = (cycle.pos + 1) % limit;
-    }
+    let newest_in_clipboard = insert::read_clipboard().as_deref() == Some(entries[0].text.as_str());
+    cycle.pos = next_cycle_pos(cycle.pos, limit, fresh, newest_in_clipboard);
     cycle.last = Some(Instant::now());
 
     let entry = entries[cycle.pos].clone();
@@ -940,5 +948,38 @@ pub fn hotkey_mode_hint(mode: HotKeyMode) -> &'static str {
     match mode {
         HotKeyMode::Hold => "держите клавишу, пока говорите — отпустили, и текст пошёл",
         HotKeyMode::Toggle => "нажали и отпустили, говорите, нажали ещё раз — текст пошёл",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_cycle_pos;
+
+    #[test]
+    fn первое_нажатие_пропускает_то_что_уже_в_буфере() {
+        assert_eq!(next_cycle_pos(0, 10, true, true), 1);
+    }
+
+    #[test]
+    fn первое_нажатие_берёт_свежую_если_в_буфере_чужое() {
+        assert_eq!(next_cycle_pos(0, 10, true, false), 0);
+    }
+
+    #[test]
+    fn единственная_запись_не_пропускается() {
+        // Иначе пропускать было бы некуда, а индекс уехал бы за край.
+        assert_eq!(next_cycle_pos(0, 1, true, true), 0);
+    }
+
+    #[test]
+    fn листание_идёт_по_кругу() {
+        assert_eq!(next_cycle_pos(1, 3, false, true), 2);
+        assert_eq!(next_cycle_pos(2, 3, false, true), 0);
+    }
+
+    #[test]
+    fn уменьшенный_предел_не_оставляет_индекс_за_краем() {
+        // Настройку могли сменить посреди листания.
+        assert!(next_cycle_pos(50, 3, false, true) < 3);
     }
 }

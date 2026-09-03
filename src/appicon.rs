@@ -171,7 +171,6 @@ pub fn kind_of(entry: &Entry) -> Kind {
         "chrome",
         "firefox",
         "edge",
-        "arc",
         "brave",
         "браузер",
         "vivaldi",
@@ -282,5 +281,76 @@ impl Icons {
             egui::FontId::proportional(rect.height() * 0.62),
             egui::Color32::WHITE,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{kind_of, Kind};
+    use crate::clipboard::Entry;
+
+    fn entry(id: Option<&str>, name: Option<&str>) -> Entry {
+        Entry {
+            at: chrono::Local::now(),
+            text: "текст".into(),
+            source: name.map(str::to_string),
+            app_id: id.map(str::to_string),
+            app_path: None,
+        }
+    }
+
+    #[test]
+    fn вид_разбирается_по_идентификатору() {
+        assert_eq!(
+            kind_of(&entry(Some("com.apple.Safari"), None)),
+            Kind::Browser
+        );
+        assert_eq!(
+            kind_of(&entry(Some("com.apple.Terminal"), None)),
+            Kind::Terminal
+        );
+        assert_eq!(kind_of(&entry(Some("com.apple.Notes"), None)), Kind::Notes);
+        assert_eq!(kind_of(&entry(Some("com.apple.mail"), None)), Kind::Mail);
+        assert_eq!(
+            kind_of(&entry(Some("com.microsoft.VSCode"), None)),
+            Kind::Code
+        );
+        assert_eq!(
+            kind_of(&entry(Some("com.tinyspeck.slackmacgap"), None)),
+            Kind::Chat
+        );
+    }
+
+    #[test]
+    fn идентификатор_важнее_имени() {
+        // Имя переводится на язык системы, идентификатор — нет.
+        let e = entry(Some("com.apple.Notes"), Some("Заметки"));
+        assert_eq!(kind_of(&e), Kind::Notes);
+    }
+
+    #[test]
+    fn терминал_на_основе_хрома_не_считается_браузером() {
+        // Порядок проверок важен: у части терминалов в идентификаторе есть
+        // слова, попадающие и в другие списки.
+        assert_eq!(
+            kind_of(&entry(Some("com.googlecode.iterm2"), None)),
+            Kind::Terminal
+        );
+    }
+
+    #[test]
+    fn старые_записи_разбираются_по_имени() {
+        // До версии 0.15.0 идентификатор не сохранялся — остаётся имя.
+        assert_eq!(kind_of(&entry(None, Some("Safari"))), Kind::Browser);
+        assert_eq!(kind_of(&entry(None, Some("Терминал"))), Kind::Terminal);
+        assert_eq!(kind_of(&entry(None, Some("Заметки"))), Kind::Notes);
+    }
+
+    #[test]
+    fn незнакомая_программа_не_выдаёт_себя_за_браузер() {
+        // Короткие куски вроде «arc» ловили бы «Search» и «Charles».
+        assert_eq!(kind_of(&entry(None, Some("Charles"))), Kind::Other);
+        assert_eq!(kind_of(&entry(None, Some("Search"))), Kind::Other);
+        assert_eq!(kind_of(&entry(None, None)), Kind::Other);
     }
 }
