@@ -79,9 +79,13 @@ pub struct App {
     picker_index: usize,
     /// Куда вернуть фокус после выбора.
     picker_return_pid: Option<i32>,
-    /// Когда список открылся. Нужно, чтобы не закрыть его от потери фокуса
-    /// в тот же миг: фокус приходит с задержкой в несколько кадров.
+    /// Когда список открылся. Нужно на случай, если фокус так и не пришёл:
+    /// без него список неуправляем, и висеть ему незачем.
     picker_opened: Instant,
+    /// Список уже получал фокус. До этого ни клавиши не разбираем, ни от
+    /// потери фокуса не закрываемся: окно показывается из фонового прохода,
+    /// и фокус доходит не в том же кадре.
+    picker_focused: bool,
     /// Размер обычного окна, чтобы вернуть его после списка: список
     /// перекраивает то же самое окно, а не заводит своё.
     main_size: egui::Vec2,
@@ -167,6 +171,7 @@ impl App {
             picker_index: 0,
             picker_return_pid: None,
             picker_opened: long_ago(10),
+            picker_focused: false,
             main_size: egui::vec2(600.0, 680.0),
             capturing_clipboard: false,
             duplicates: Vec::new(),
@@ -496,20 +501,38 @@ impl eframe::App for App {
                 _ => {}
             }
         }
+
+        // Список считается открытым, пока его рисует проход интерфейса. Если
+        // окно так и не показалось, рисовать некому — и флаг заблокировал бы
+        // все следующие вызовы, как это уже было со скрытым окном. Снимаем
+        // его сами: лучше не открыть один раз, чем не открывать никогда.
+        if self.picker
+            && !self.picker_focused
+            && self.picker_opened.elapsed() > Duration::from_secs(5)
+        {
+            log::warn!("список буфера не вышел на экран, сбрасываю состояние");
+            self.close_picker(ctx);
+        }
+
+        // Запрос на список буфера приходит из перехватчика клавиш и
+        // разбирается именно здесь, а не в `ui`: пока окно скрыто, eframe не
+        // выполняет ни одного прохода интерфейса, и флаг некому было бы
+        // забрать. Открывалось один раз — пока окно ещё было на экране после
+        // запуска, — а дальше молчало до перезапуска.
+        if self
+            .shared
+            .clipboard_requested
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+            && !self.picker
+        {
+            self.open_picker(ctx);
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
         self.poll_model_check();
-        // Запрос на окно буфера приходит из перехватчика клавиш.
-        if self
-            .shared
-            .clipboard_requested
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
-        {
-            self.open_picker(ctx);
-        }
 
         // Список из буфера занимает всё окно: ни вкладок, ни строки состояния
         // у него нет — только записи на полупрозрачной плашке.
@@ -1617,6 +1640,7 @@ impl App {
         self.picker_query.clear();
         self.picker_index = 0;
         self.picker_opened = Instant::now();
+        self.picker_focused = false;
 
         let size = self.picker_size();
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
@@ -1628,6 +1652,9 @@ impl App {
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         macos::activate();
+        // Показ окна сам по себе прохода интерфейса не гарантирует, а список
+        // рисуется именно там.
+        ctx.request_repaint();
     }
 
     /// Высота — по числу показываемых записей: список на десять строк не
@@ -1696,11 +1723,20 @@ impl App {
     /// Плашка списка: полупрозрачная, со скруглением, без рамки окна.
     fn ui_picker_window(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        // Клик мимо списка должен его убирать. Первые полсекунды потерю
-        // фокуса не считаем: он приходит не в том же кадре, в котором окно
-        // показали, и список закрывался бы сразу после открытия.
+        // Клик мимо списка должен его убирать — но только после того, как
+        // фокус хоть раз пришёл. Окно показывается из фонового прохода, и
+        // до появления на экране оно не сфокусировано; закрываться на этом
+        // основании значило бы закрыться сразу после открытия.
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
-        if !focused && self.picker_opened.elapsed() > Duration::from_millis(600) {
+        self.picker_focused |= focused;
+        if self.picker_focused && !focused {
+            self.close_picker(&ctx);
+            return;
+        }
+        // Фокуса нет и через три секунды — списком всё равно не управлять:
+        // ни Esc, ни стрелки до него не дойдут.
+        if !self.picker_focused && self.picker_opened.elapsed() > Duration::from_secs(3) {
+            log::warn!("список буфера так и не получил фокус, закрываю");
             self.close_picker(&ctx);
             return;
         }
@@ -1770,20 +1806,24 @@ impl App {
                 .collect()
         };
 
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        // Пока окно было скрыто, eframe копил ввод и отдаёт его одним махом
+        // в первом же проходе. Разбирать клавиши до прихода фокуса значило бы
+        // закрыть список чужим Esc, нажатым когда-то раньше.
+        let keys = self.picker_focused;
+        if keys && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.close_picker(&ctx);
             return;
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) && !found.is_empty() {
+        if keys && ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) && !found.is_empty() {
             self.picker_index = (self.picker_index + 1).min(found.len() - 1);
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+        if keys && ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
             self.picker_index = self.picker_index.saturating_sub(1);
         }
         if self.picker_index >= found.len() {
             self.picker_index = found.len().saturating_sub(1);
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+        if keys && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
             if let Some(entry) = found.get(self.picker_index) {
                 let text = entry.text.clone();
                 if ctx.input(|i| i.modifiers.shift) {
