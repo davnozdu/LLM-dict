@@ -412,7 +412,12 @@ fn main() -> eframe::Result<()> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("LLM-dict")
             .with_inner_size([600.0, 680.0])
-            .with_min_inner_size([480.0, 440.0]),
+            .with_min_inner_size([480.0, 440.0])
+            // Прозрачность нужна списку из буфера: он живёт в этом же окне.
+            // Режим смешивания поверхности выбирается при её создании, потом
+            // включить его уже нельзя. Обычное окно от этого не меняется —
+            // оно заливается непрозрачным цветом (см. `App::clear_color`).
+            .with_transparent(true),
         ..Default::default()
     };
 

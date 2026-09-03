@@ -48,6 +48,40 @@ impl PostMode {
     ];
 }
 
+/// Что делает сочетание истории буфера обмена.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClipboardMode {
+    /// Нажали — появился список. Выбор мышью или стрелками, Enter кладёт в буфер.
+    List,
+    /// Окна нет: каждое нажатие подставляет в буфер следующую запись.
+    Cycle,
+}
+
+impl ClipboardMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            ClipboardMode::List => "Показать список",
+            ClipboardMode::Cycle => "Листать нажатиями",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            ClipboardMode::List => {
+                "Поверх экрана появляется полупрозрачный список. Стрелки ↑ ↓ или мышь, \
+                 Enter — запись уходит в буфер, Esc — закрыть."
+            }
+            ClipboardMode::Cycle => {
+                "Окно не открывается. Каждое нажатие кладёт в буфер следующую запись, \
+                 а у курсора видно, какая именно. Через три секунды без нажатий \
+                 отсчёт начинается заново."
+            }
+        }
+    }
+
+    pub const ALL: [ClipboardMode; 2] = [ClipboardMode::List, ClipboardMode::Cycle];
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SttConfig {
@@ -194,6 +228,11 @@ pub struct GeneralConfig {
     pub clipboard_days: u32,
     /// Сочетание, открывающее окно выбора из истории буфера.
     pub clipboard_hotkey: Binding,
+    /// Что это сочетание делает: открывает список или листает записи.
+    pub clipboard_mode: ClipboardMode,
+    /// Сколько последних записей показывать в списке и листать по кругу.
+    /// К поиску не относится: он идёт по всей сохранённой истории.
+    pub clipboard_recent: usize,
     /// Проверять обновления при запуске.
     pub check_updates: bool,
     /// Не пропускать обычную клавишу сочетания дальше в систему.
@@ -238,6 +277,8 @@ impl Default for GeneralConfig {
             clipboard_history: true,
             clipboard_days: 30,
             clipboard_hotkey: Binding::new(Vec::new()),
+            clipboard_mode: ClipboardMode::List,
+            clipboard_recent: 10,
             check_updates: true,
             swallow_hotkey: true,
             actions_initialised: false,

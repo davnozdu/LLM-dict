@@ -2,7 +2,7 @@
 
 use crate::actions::{Output, TextAction};
 use crate::binding::Binding;
-use crate::config::{secrets, Config, HotKeyMode, PostMode};
+use crate::config::{secrets, ClipboardMode, Config, HotKeyMode, PostMode};
 use crate::engine::{self, Shared, Stage};
 use crate::history;
 use crate::insert;
@@ -79,6 +79,12 @@ pub struct App {
     picker_index: usize,
     /// Куда вернуть фокус после выбора.
     picker_return_pid: Option<i32>,
+    /// Когда список открылся. Нужно, чтобы не закрыть его от потери фокуса
+    /// в тот же миг: фокус приходит с задержкой в несколько кадров.
+    picker_opened: Instant,
+    /// Размер обычного окна, чтобы вернуть его после списка: список
+    /// перекраивает то же самое окно, а не заводит своё.
+    main_size: egui::Vec2,
     /// Набирается сочетание именно для окна буфера, а не для действия.
     capturing_clipboard: bool,
     duplicates: Vec<String>,
@@ -160,6 +166,8 @@ impl App {
             picker_query: String::new(),
             picker_index: 0,
             picker_return_pid: None,
+            picker_opened: long_ago(10),
+            main_size: egui::vec2(600.0, 680.0),
             capturing_clipboard: false,
             duplicates: Vec::new(),
             duplicates_checked: long_ago(60),
@@ -475,6 +483,11 @@ impl eframe::App for App {
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             match event.id.as_ref() {
                 MENU_OPEN => {
+                    // Список и настройки живут в одном окне: не закрыв список,
+                    // мы показали бы настройки плашкой без рамки поверх всего.
+                    if self.picker {
+                        self.close_picker(ctx);
+                    }
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     macos::activate();
@@ -496,6 +509,23 @@ impl eframe::App for App {
             .swap(false, std::sync::atomic::Ordering::Relaxed)
         {
             self.open_picker(ctx);
+        }
+
+        // Список из буфера занимает всё окно: ни вкладок, ни строки состояния
+        // у него нет — только записи на полупрозрачной плашке.
+        if self.picker {
+            self.ui_picker_window(ui);
+            self.apply_config();
+            ctx.request_repaint_after(Duration::from_millis(50));
+            return;
+        }
+
+        // Размер обычного окна запоминаем, пока оно обычное: списку оно
+        // достаётся перекроенным, и вернуть надо именно то, что было.
+        if let Some(rect) = ctx.input(|i| i.viewport().inner_rect) {
+            if rect.width() > 100.0 && rect.height() > 100.0 {
+                self.main_size = rect.size();
+            }
         }
 
         self.poll_api_key();
@@ -545,8 +575,13 @@ impl eframe::App for App {
             ui.add_space(3.0);
             ui.horizontal(|ui| {
                 let stage = self.shared.stage();
+                // Слежение за клавишей — это и есть «работает»: без него
+                // приложение висит в памяти и ничего не делает.
+                let listening = self.shared.tap_running.load(Ordering::Relaxed)
+                    && !self.shared.hotkey_state.is_disabled_by_system();
                 let dot = match stage {
-                    Stage::Idle => egui::Color32::from_gray(140),
+                    Stage::Idle if listening => egui::Color32::from_rgb(60, 190, 110),
+                    Stage::Idle => egui::Color32::from_rgb(220, 130, 40),
                     Stage::LoadingModel => egui::Color32::from_rgb(150, 120, 200),
                     Stage::ActionRunning => egui::Color32::from_rgb(90, 140, 240),
                     Stage::Recording => egui::Color32::from_rgb(230, 60, 60),
@@ -559,7 +594,11 @@ impl eframe::App for App {
                 let (rect, _) =
                     ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
                 ui.painter().circle_filled(rect.center(), 4.0, dot);
-                ui.label(stage.label());
+                ui.label(match stage {
+                    Stage::Idle if listening => "Работает",
+                    Stage::Idle => "Не работает",
+                    other => other.label(),
+                });
                 ui.separator();
                 ui.label(format!(
                     "{} · {}",
@@ -582,13 +621,6 @@ impl eframe::App for App {
             ui.add_space(3.0);
         });
 
-        if self.picker {
-            egui::CentralPanel::default().show(ui, |ui| self.ui_picker(ui));
-            self.apply_config();
-            ctx.request_repaint_after(Duration::from_millis(50));
-            return;
-        }
-
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
             Tab::Status => self.ui_status(ui),
             Tab::Actions => self.ui_actions(ui),
@@ -609,6 +641,18 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(60));
         } else {
             ctx.request_repaint_after(Duration::from_millis(500));
+        }
+    }
+
+    /// Окно создано прозрачным — иначе список из буфера не смог бы стать
+    /// полупрозрачным на ходу: режим смешивания выбирается один раз, при
+    /// создании поверхности. В обычном виде заливаем непрозрачным, и окно
+    /// выглядит как всегда.
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        if self.picker {
+            egui::Color32::TRANSPARENT.to_normalized_gamma_f32()
+        } else {
+            visuals.panel_fill.to_opaque().to_normalized_gamma_f32()
         }
     }
 }
@@ -975,6 +1019,31 @@ impl App {
                     }
                 }
             });
+            ui.add_space(4.0);
+            ui.label("Что делает это сочетание:");
+            for m in ClipboardMode::ALL {
+                ui.radio_value(&mut self.cfg.general.clipboard_mode, m, m.label());
+            }
+            ui.weak(self.cfg.general.clipboard_mode.hint());
+            if self.cfg.general.clipboard_mode == ClipboardMode::Cycle
+                && !self.cfg.general.show_overlay
+            {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 130, 40),
+                    "Плашка у курсора выключена — листать придётся вслепую. \
+                     Включите её ниже, в «Поведении».",
+                );
+            }
+            ui.add_space(4.0);
+
+            labeled(ui, "Показывать последние", |ui| {
+                ui.add(egui::DragValue::new(&mut self.cfg.general.clipboard_recent).range(1..=100));
+                ui.weak(match self.cfg.general.clipboard_mode {
+                    ClipboardMode::List => "записей в списке; поиск идёт по всей истории",
+                    ClipboardMode::Cycle => "записей в круге листания",
+                });
+            });
+
             labeled(ui, "Хранить дней", |ui| {
                 ui.add(egui::DragValue::new(&mut self.cfg.general.clipboard_days).range(0..=365));
                 ui.weak(if self.cfg.general.clipboard_days == 0 {
@@ -1223,6 +1292,10 @@ impl App {
             ui.checkbox(
                 &mut self.cfg.general.restore_clipboard,
                 "Возвращать прежнее содержимое буфера обмена",
+            );
+            ui.checkbox(
+                &mut self.cfg.general.show_overlay,
+                "Плашка у курсора: что сейчас происходит",
             );
             if ui
                 .checkbox(&mut self.autostart_on, "Запускать при входе в систему")
@@ -1530,7 +1603,11 @@ impl App {
         self.toast(format!("Проверяю ключ {}…", provider.label()));
     }
 
-    /// Открывает окно выбора из истории буфера.
+    /// Открывает список истории буфера поверх экрана.
+    ///
+    /// Отдельного окна под него нет: главное всё равно скрыто, и проще снять
+    /// с него рамку и поднять наверх, чем заводить второй viewport со своей
+    /// поверхностью отрисовки.
     ///
     /// Запоминает, кто был впереди: после выбора фокус надо вернуть туда,
     /// иначе вставка уйдёт в наше же окно.
@@ -1539,20 +1616,61 @@ impl App {
         self.picker = true;
         self.picker_query.clear();
         self.picker_index = 0;
+        self.picker_opened = Instant::now();
+
+        let size = self.picker_size();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+            egui::WindowLevel::AlwaysOnTop,
+        ));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(self.picker_pos(size)));
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         macos::activate();
     }
 
+    /// Высота — по числу показываемых записей: список на десять строк не
+    /// должен занимать пол-экрана, а на полсотни — ползать в щели.
+    fn picker_size(&self) -> egui::Vec2 {
+        let rows = self.cfg.general.clipboard_recent.clamp(1, 100) as f32;
+        egui::vec2(560.0, (120.0 + rows * 24.0).clamp(200.0, 560.0))
+    }
+
+    /// Ставим список под курсором, но так, чтобы он целиком влез в экран.
+    fn picker_pos(&self, size: egui::Vec2) -> egui::Pos2 {
+        let (sw, sh) = macos::screen_size().unwrap_or((1440.0, 900.0));
+        let (cx, cy) = macos::cursor_position().unwrap_or((sw / 2.0, sh / 3.0));
+        let (x, y) = (cx - size.x / 2.0, cy + 24.0);
+        // Границы известны только для главного экрана. Если курсор не на нём,
+        // подгонка увела бы список на соседний монитор — там ставим как есть.
+        if (0.0..sw).contains(&cx) && (0.0..sh).contains(&cy) {
+            return egui::pos2(
+                x.clamp(12.0, (sw - size.x - 12.0).max(12.0)),
+                y.clamp(12.0, (sh - size.y - 12.0).max(12.0)),
+            );
+        }
+        egui::pos2(x, y)
+    }
+
     fn close_picker(&mut self, ctx: &egui::Context) {
         self.picker = false;
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        // Обычный вид возвращаем сразу, пока окно скрыто: иначе настройки,
+        // открытые из трея, показались бы плашкой без рамки поверх всего.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+            egui::WindowLevel::Normal,
+        ));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(self.main_size));
         if let Some(pid) = self.picker_return_pid.take() {
             macos::activate_app(pid);
         }
     }
 
-    /// Вставляет выбранное туда, откуда пришёл пользователь.
+    /// Кладёт выбранное в буфер и вставляет туда, откуда пришёл пользователь.
+    /// Буфер после вставки не восстанавливается: запись должна остаться в нём,
+    /// чтобы её можно было вставить ещё раз руками.
     fn paste_from_picker(&mut self, ctx: &egui::Context, text: String) {
         self.close_picker(ctx);
         let clipboard = self.shared.clipboard.clone();
@@ -1567,20 +1685,69 @@ impl App {
         });
     }
 
+    /// Только в буфер, без вставки: бывает нужно унести кусок в программу,
+    /// куда ⌘V не проходит.
+    fn copy_from_picker(&mut self, ctx: &egui::Context, text: String) {
+        self.close_picker(ctx);
+        self.shared.clipboard.mark_ours(&text);
+        let _ = insert::write_clipboard(&text);
+    }
+
+    /// Плашка списка: полупрозрачная, со скруглением, без рамки окна.
+    fn ui_picker_window(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        // Клик мимо списка должен его убирать. Первые полсекунды потерю
+        // фокуса не считаем: он приходит не в том же кадре, в котором окно
+        // показали, и список закрывался бы сразу после открытия.
+        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        if !focused && self.picker_opened.elapsed() > Duration::from_millis(600) {
+            self.close_picker(&ctx);
+            return;
+        }
+
+        let frame = egui::Frame::new()
+            .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 24, 234))
+            .stroke(egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 38),
+            ))
+            .corner_radius(egui::CornerRadius::same(14))
+            .inner_margin(egui::Margin::same(12));
+        egui::CentralPanel::default()
+            .frame(frame)
+            .show(ui, |ui| self.ui_picker(ui));
+    }
+
     fn ui_picker(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
 
-        ui.add_space(6.0);
+        // Плашка тёмная всегда, а тема приложения может быть светлой —
+        // цвета текста и полей задаём явно, иначе на тёмном будет тёмное.
+        {
+            let v = &mut ui.style_mut().visuals;
+            v.override_text_color = Some(egui::Color32::from_rgb(232, 232, 238));
+            v.extreme_bg_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18);
+            v.selection.bg_fill = egui::Color32::from_rgb(58, 104, 190);
+            v.widgets.hovered.weak_bg_fill =
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 22);
+        }
+
+        let recent = self.cfg.general.clipboard_recent.clamp(1, 100);
+
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("История буфера обмена").strong());
-            ui.weak("Enter — вставить, Esc — закрыть");
+            ui.label(egui::RichText::new("Буфер обмена").strong());
+            ui.label(
+                egui::RichText::new("↑ ↓ — выбор,  Enter — вставить,  ⇧Enter — в буфер,  Esc")
+                    .size(11.0)
+                    .color(egui::Color32::from_rgb(150, 150, 162)),
+            );
         });
-        ui.add_space(4.0);
+        ui.add_space(6.0);
 
         let search = ui.add(
             egui::TextEdit::singleline(&mut self.picker_query)
                 .desired_width(f32::INFINITY)
-                .hint_text("поиск по тексту"),
+                .hint_text("поиск по всей истории"),
         );
         // Фокус в поле поиска: окно открылось по горячей клавише, и печатать
         // пользователь начнёт сразу.
@@ -1590,11 +1757,18 @@ impl App {
 
         let entries = self.shared.clipboard.entries.lock().unwrap().clone();
         let query = self.picker_query.trim().to_lowercase();
-        let found: Vec<&crate::clipboard::Entry> = entries
-            .iter()
-            .filter(|e| query.is_empty() || e.text.to_lowercase().contains(&query))
-            .take(200)
-            .collect();
+        // Без запроса — ровно столько последних записей, сколько попросили в
+        // настройках. С запросом ищем по всей истории: иначе поиск отвечал бы
+        // «ничего нет» о том, что лежит парой строк ниже предела.
+        let found: Vec<&crate::clipboard::Entry> = if query.is_empty() {
+            entries.iter().take(recent).collect()
+        } else {
+            entries
+                .iter()
+                .filter(|e| e.text.to_lowercase().contains(&query))
+                .take(200)
+                .collect()
+        };
 
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.close_picker(&ctx);
@@ -1612,14 +1786,18 @@ impl App {
         if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
             if let Some(entry) = found.get(self.picker_index) {
                 let text = entry.text.clone();
-                self.paste_from_picker(&ctx, text);
+                if ctx.input(|i| i.modifiers.shift) {
+                    self.copy_from_picker(&ctx, text);
+                } else {
+                    self.paste_from_picker(&ctx, text);
+                }
                 return;
             }
         }
 
         ui.add_space(6.0);
         if found.is_empty() {
-            ui.weak(if entries.is_empty() {
+            ui.label(if entries.is_empty() {
                 "История пуста. Скопируйте что-нибудь, и оно появится здесь."
             } else {
                 "Ничего не нашлось."
@@ -1631,7 +1809,14 @@ impl App {
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (i, entry) in found.iter().enumerate() {
                 let selected = i == self.picker_index;
-                let label = format!("{}   {}", entry.at.format("%d.%m %H:%M"), entry.preview(90));
+                // Номер строки помогает попасть глазом: в списке из десяти
+                // одинаковых на вид обрезков время не отличает одно от другого.
+                let label = format!(
+                    "{:>2}.  {}   {}",
+                    i + 1,
+                    entry.at.format("%d.%m %H:%M"),
+                    entry.preview(84)
+                );
                 let response = ui.selectable_label(selected, label);
                 if response.clicked() {
                     chosen = Some(entry.text.clone());
@@ -1639,7 +1824,11 @@ impl App {
                 if selected {
                     response.scroll_to_me(None);
                     if let Some(source) = &entry.source {
-                        ui.weak(format!("    из {source}"));
+                        ui.label(
+                            egui::RichText::new(format!("       из {source}"))
+                                .size(11.0)
+                                .color(egui::Color32::from_rgb(150, 150, 162)),
+                        );
                     }
                 }
             }

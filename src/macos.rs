@@ -44,6 +44,24 @@ pub fn cursor_position() -> Option<(f32, f32)> {
     Some((p.x as f32, p.y as f32))
 }
 
+/// Размер основного экрана в точках. Нужен, чтобы список из буфера целиком
+/// помещался на экране, а не уезжал за край вслед за курсором.
+pub fn screen_size() -> Option<(f32, f32)> {
+    unsafe {
+        let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+        if screens.is_null() {
+            return None;
+        }
+        let count: usize = msg_send![screens, count];
+        if count == 0 {
+            return None;
+        }
+        let first: *mut AnyObject = msg_send![screens, objectAtIndex: 0usize];
+        let frame: objc2_foundation::NSRect = msg_send![first, frame];
+        Some((frame.size.width as f32, frame.size.height as f32))
+    }
+}
+
 /// Имя программы, которая сейчас впереди. Нужно, чтобы в истории буфера
 /// было видно, откуда взят кусок.
 pub fn frontmost_app_name() -> Option<String> {

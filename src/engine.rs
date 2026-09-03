@@ -2,7 +2,7 @@
 //! пост-обработка → вставка → запись в историю.
 
 use crate::audio;
-use crate::config::{Config, HotKeyMode};
+use crate::config::{ClipboardMode, Config, HotKeyMode};
 use crate::history;
 use crate::hotkey::{self, HotKeyEvent, HotKeyState};
 use crate::insert;
@@ -244,6 +244,7 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
     // Модели живут здесь: загрузка занимает секунды, повторять её на каждую
     // фразу бессмысленно. Владеет ими только этот поток.
     let mut local = LocalEngines::default();
+    let mut cycle = ClipboardCycle::default();
 
     {
         let cfg = shared.config_snapshot();
@@ -341,9 +342,15 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
             }
 
             HotKeyEvent::Action(id) if id == CLIPBOARD_ACTION_ID => {
-                // Окно рисует интерфейс, поэтому здесь только поднимаем флаг.
-                shared.clipboard_requested.store(true, Ordering::Relaxed);
-                shared.wake_ui();
+                let cfg = shared.config_snapshot();
+                match cfg.general.clipboard_mode {
+                    ClipboardMode::List => {
+                        // Окно рисует интерфейс, поэтому здесь только поднимаем флаг.
+                        shared.clipboard_requested.store(true, Ordering::Relaxed);
+                        shared.wake_ui();
+                    }
+                    ClipboardMode::Cycle => cycle_clipboard(&shared, &cfg, &mut cycle),
+                }
             }
 
             HotKeyEvent::Action(id) => {
@@ -414,6 +421,69 @@ fn collect_bindings(cfg: &Config) -> Vec<(String, crate::binding::Binding)> {
         ));
     }
     out
+}
+
+/// Через сколько листание считается законченным. Следующее нажатие после
+/// этого начинает круг заново, а не продолжает с середины: возвращаться к
+/// списку через минуту и попадать на десятую запись — не то, чего ждёшь.
+const CYCLE_RESET: Duration = Duration::from_secs(3);
+
+/// Где мы находимся в листании истории буфера.
+#[derive(Default)]
+struct ClipboardCycle {
+    pos: usize,
+    last: Option<Instant>,
+}
+
+/// Кладёт в буфер следующую запись истории и показывает у курсора, какую.
+///
+/// Окно при этом не открывается: в этом весь смысл режима — руки остаются
+/// на клавишах, а нужный кусок ищется на глаз по плашке.
+fn cycle_clipboard(shared: &Arc<Shared>, cfg: &Config, cycle: &mut ClipboardCycle) {
+    // Сколько записей листаем. Настройка ограничена сверху тем, что реально
+    // сохранено: круг из десяти при трёх записях гонял бы по пустоте.
+    let entries = shared.clipboard.entries.lock().unwrap();
+    let limit = cfg
+        .general
+        .clipboard_recent
+        .clamp(1, 100)
+        .min(entries.len());
+    if limit == 0 {
+        drop(entries);
+        shared.notify("История буфера пуста");
+        return;
+    }
+
+    let fresh = cycle
+        .last
+        .map(|t| t.elapsed() > CYCLE_RESET)
+        .unwrap_or(true);
+    if fresh {
+        // Первое нажатие: самая свежая запись обычно и так лежит в буфере,
+        // и подставлять её же значило бы не сделать ничего.
+        let current = insert::read_clipboard();
+        cycle.pos = usize::from(limit > 1 && current.as_deref() == Some(entries[0].text.as_str()));
+    } else {
+        cycle.pos = (cycle.pos + 1) % limit;
+    }
+    cycle.last = Some(Instant::now());
+
+    let entry = entries[cycle.pos].clone();
+    drop(entries);
+
+    // Своя же запись не должна вернуться в историю новой строкой, иначе
+    // листание перемешивало бы список под собственными руками.
+    shared.clipboard.mark_ours(&entry.text);
+    if let Err(e) = insert::write_clipboard(&entry.text) {
+        shared.notify(format!("Буфер: {e}"));
+        return;
+    }
+    shared.notify(format!(
+        "{}/{}  {}",
+        cycle.pos + 1,
+        limit,
+        entry.preview(48)
+    ));
 }
 
 /// Какие действия применялись после диктовки — для колонки в истории.
