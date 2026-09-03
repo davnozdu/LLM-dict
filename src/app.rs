@@ -95,6 +95,8 @@ pub struct App {
     duplicates_checked: Instant,
     key_synced: bool,
     overlay: crate::overlay::Overlay,
+    /// Значки программ-источников для истории буфера.
+    icons: crate::appicon::Icons,
     /// Идущая загрузка модели: её id, прогресс и канал с результатом.
     download: Option<Download>,
     /// Показывать ключ эндпоинта открытым текстом.
@@ -178,6 +180,7 @@ impl App {
             duplicates_checked: long_ago(60),
             key_synced: false,
             overlay: crate::overlay::Overlay::new(),
+            icons: crate::appicon::Icons::default(),
             download: None,
             show_server_key: false,
             editing_action: None,
@@ -1849,27 +1852,12 @@ impl App {
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (i, entry) in found.iter().enumerate() {
                 let selected = i == self.picker_index;
-                // Номер строки помогает попасть глазом: в списке из десяти
-                // одинаковых на вид обрезков время не отличает одно от другого.
-                let label = format!(
-                    "{:>2}.  {}   {}",
-                    i + 1,
-                    entry.at.format("%d.%m %H:%M"),
-                    entry.preview(84)
-                );
-                let response = ui.selectable_label(selected, label);
+                let response = picker_row(ui, &mut self.icons, entry, i + 1, selected);
                 if response.clicked() {
                     chosen = Some(entry.text.clone());
                 }
                 if selected {
                     response.scroll_to_me(None);
-                    if let Some(source) = &entry.source {
-                        ui.label(
-                            egui::RichText::new(format!("       из {source}"))
-                                .size(11.0)
-                                .color(egui::Color32::from_rgb(150, 150, 162)),
-                        );
-                    }
                 }
             }
         });
@@ -2508,10 +2496,23 @@ impl App {
             for (i, entry) in entries.iter().take(300).enumerate() {
                 ui.push_id(i, |ui| {
                     ui.horizontal(|ui| {
+                        let (icon, _) =
+                            ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                        self.icons.draw(ui, icon, entry);
                         ui.weak(entry.at.format("%d.%m %H:%M").to_string());
-                        if let Some(source) = &entry.source {
-                            ui.weak("·");
-                            ui.weak(source);
+                        let kind = crate::appicon::kind_of(entry);
+                        match &entry.source {
+                            Some(source) => {
+                                ui.weak("·");
+                                // Имя источника цветом своего вида: список
+                                // из полусотни записей так читается взглядом,
+                                // а не вычитывается построчно.
+                                ui.colored_label(kind.color(), source);
+                            }
+                            None => {
+                                ui.weak("·");
+                                ui.weak(kind.label());
+                            }
                         }
                     });
                     ui.label(entry.preview(160));
@@ -2799,6 +2800,81 @@ fn labeled(ui: &mut egui::Ui, label: &str, content: impl FnOnce(&mut egui::Ui)) 
 }
 
 /// Список моделей появляется после успешной проверки ключа; до этого — обычное поле.
+/// Строка списка выбора: значок источника, номер, время и начало текста.
+///
+/// Рисуется вручную, а не через `selectable_label`: картинку тому не задать,
+/// а разложить строку горизонтально значило бы, что клик по значку записи
+/// не выбирает. Здесь вся строка — один отклик.
+fn picker_row(
+    ui: &mut egui::Ui,
+    icons: &mut crate::appicon::Icons,
+    entry: &crate::clipboard::Entry,
+    number: usize,
+    selected: bool,
+) -> egui::Response {
+    let height = 26.0;
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), height),
+        egui::Sense::click(),
+    );
+
+    if selected {
+        ui.painter().rect_filled(
+            rect,
+            egui::CornerRadius::same(6),
+            egui::Color32::from_rgb(58, 104, 190),
+        );
+    } else if response.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            egui::CornerRadius::same(6),
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20),
+        );
+    }
+
+    // Обрезка по строке: превью укорочено по числу знаков, а не по ширине,
+    // и длинное слово иначе вылезло бы за край плашки.
+    let painter = ui.painter().with_clip_rect(rect);
+    let dim = egui::Color32::from_rgb(158, 158, 172);
+    let fg = egui::Color32::from_rgb(232, 232, 238);
+    let mut x = rect.left() + 8.0;
+
+    let number = painter.text(
+        egui::pos2(x, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        format!("{number:>2}"),
+        egui::FontId::proportional(11.0),
+        dim,
+    );
+    x = number.right() + 8.0;
+
+    let icon =
+        egui::Rect::from_center_size(egui::pos2(x + 8.0, rect.center().y), egui::vec2(16.0, 16.0));
+    icons.draw(ui, icon, entry);
+    x = icon.right() + 8.0;
+
+    let time = painter.text(
+        egui::pos2(x, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        entry.at.format("%d.%m %H:%M").to_string(),
+        egui::FontId::proportional(11.0),
+        dim,
+    );
+    painter.text(
+        egui::pos2(time.right() + 10.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        entry.preview(80),
+        egui::FontId::proportional(13.0),
+        fg,
+    );
+
+    let kind = crate::appicon::kind_of(entry).label();
+    match entry.source.as_deref() {
+        Some(source) => response.on_hover_text(format!("из «{source}» — {kind}")),
+        None => response.on_hover_text(format!("источник неизвестен — {kind}")),
+    }
+}
+
 fn model_picker(ui: &mut egui::Ui, id: &str, value: &mut String, models: &[String], filter: &str) {
     if models.is_empty() {
         ui.add(egui::TextEdit::singleline(value).desired_width(320.0));

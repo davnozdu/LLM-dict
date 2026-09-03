@@ -3,6 +3,7 @@
 
 mod actions;
 mod app;
+mod appicon;
 mod audio;
 mod autostart;
 mod binding;
@@ -357,6 +358,61 @@ fn run_watch_keys() -> eframe::Result<()> {
     Ok(())
 }
 
+/// Показывает, что приложение видит об источнике копирования и удаётся ли
+/// достать значок программы.
+///
+/// Проверка без окна: значок вытаскивается рисованием NSImage в свой растр,
+/// и убедиться, что оттуда приходят пиксели, а не прозрачная пустота, лучше
+/// числами, чем разглядыванием списка.
+fn run_icons() -> eframe::Result<()> {
+    let front = macos::frontmost_app();
+    println!("Впереди сейчас:");
+    println!("  имя:          {:?}", front.name);
+    println!("  идентификатор: {:?}", front.id);
+    println!("  путь:         {:?}\n", front.path);
+
+    let mut paths: Vec<String> = front.path.into_iter().collect();
+    for candidate in [
+        "/Applications/Safari.app",
+        "/System/Applications/Notes.app",
+        "/System/Applications/Utilities/Terminal.app",
+        "/System/Applications/Mail.app",
+    ] {
+        if std::path::Path::new(candidate).exists() {
+            paths.push(candidate.to_string());
+        }
+    }
+
+    const SIDE: usize = 64;
+    for path in paths {
+        match macos::app_icon_rgba(&path, SIDE) {
+            Some(rgba) => {
+                let expected = SIDE * SIDE * 4;
+                let opaque = rgba.chunks_exact(4).filter(|p| p[3] > 8).count();
+                let bright: u64 = rgba
+                    .chunks_exact(4)
+                    .map(|p| u64::from(p[0]) + u64::from(p[1]) + u64::from(p[2]))
+                    .sum();
+                let share = opaque as f32 / (SIDE * SIDE) as f32 * 100.0;
+                println!("{path}");
+                println!(
+                    "  байт {} из {expected}, непрозрачных точек {share:.0}%, средняя яркость {}",
+                    rgba.len(),
+                    bright / (SIDE * SIDE * 3) as u64
+                );
+                if rgba.len() != expected {
+                    println!("  ВНИМАНИЕ: размер не совпал");
+                }
+                if opaque == 0 {
+                    println!("  ВНИМАНИЕ: значок пуст — рисование не сработало");
+                }
+            }
+            None => println!("{path}\n  значок не получен"),
+        }
+    }
+    Ok(())
+}
+
 fn main() -> eframe::Result<()> {
     logging::init();
 
@@ -366,6 +422,9 @@ fn main() -> eframe::Result<()> {
     }
     if args.len() >= 2 && args[1] == "--watch-keys" {
         return run_watch_keys();
+    }
+    if args.len() >= 2 && args[1] == "--icons" {
+        return run_icons();
     }
     if args.len() >= 2 && args[1] == "--serve" {
         return run_serve();

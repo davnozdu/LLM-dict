@@ -26,6 +26,14 @@ pub struct Entry {
     /// Откуда скопировано — помогает вспомнить, что это за кусок.
     #[serde(default)]
     pub source: Option<String>,
+    /// Идентификатор бандла программы-источника. По нему разбирается вид
+    /// программы: имя для этого не годится — оно переводится и меняется.
+    #[serde(default)]
+    pub app_id: Option<String>,
+    /// Путь к бандлу: по нему система отдаёт значок. Хранится, а не ищется
+    /// по идентификатору каждый раз, потому что программу могли и перенести.
+    #[serde(default)]
+    pub app_path: Option<String>,
 }
 
 impl Entry {
@@ -173,10 +181,13 @@ pub fn spawn(history: Arc<History>, days: u32) {
             if entries.first().map(|e| e.text.as_str()) == Some(text.as_str()) {
                 continue;
             }
+            let front = crate::macos::frontmost_app();
             let entry = Entry {
                 at: Local::now(),
                 text,
-                source: crate::macos::frontmost_app_name(),
+                source: front.name,
+                app_id: front.id,
+                app_path: front.path,
             };
             let _ = append(&entry);
             entries.insert(0, entry);
