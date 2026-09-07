@@ -264,10 +264,17 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
         }
     }
 
+    // Событие, отложенное до следующего захода. Появляется, когда обрыв
+    // записи по тишине или по пределу длины совпал с нажатием клавиши:
+    // остановку надо разобрать первой, но и нажатие терять нельзя.
+    let mut deferred: Option<HotKeyEvent> = None;
+
     loop {
         // Пока идёт запись, ждём событие с таймаутом: иначе некому проверить,
         // не пора ли оборвать её по тишине или по пределу длины.
-        let event = if recording.is_some() {
+        let event = if let Some(event) = deferred.take() {
+            Some(event)
+        } else if recording.is_some() {
             match rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(e) => Some(e),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
@@ -303,6 +310,10 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
         }
 
         let event = if forced_stop {
+            // Нажатие, пришедшее в этот же заход, откладываем, а не выбрасываем:
+            // раньше действие по горячей клавише молча пропадало, если попало
+            // ровно в момент обрыва записи.
+            deferred = event;
             Some(HotKeyEvent::StopRecording)
         } else {
             event

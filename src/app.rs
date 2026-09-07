@@ -51,6 +51,19 @@ enum HistoryFilter {
 const MENU_OPEN: &str = "open";
 const MENU_QUIT: &str = "quit";
 
+/// Нажатия в меню значка, которые ещё не разобраны.
+///
+/// Своя очередь вместо канала tray-icon нужна из-за того, как eframe спит.
+/// Клик по значку в панели идёт мимо winit: цикл событий о нём не знает и
+/// кадра из-за него не выполняет. Пока окно скрыто и ничего не происходит,
+/// никто не просит перерисовку — цикл стоит в ожидании системного события,
+/// `logic` не вызывается, и разбирать канал некому. Нажатие «Открыть»
+/// оставалось лежать в очереди до следующей диктовки, а «Выход» — до
+/// завершения через «Мониторинг системы».
+///
+/// Обработчик срабатывает прямо в момент нажатия и будит интерфейс сам.
+static MENU_QUEUE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 pub struct App {
     shared: Arc<Shared>,
     cfg: Config,
@@ -146,6 +159,21 @@ impl App {
     pub fn new(shared: Arc<Shared>) -> Self {
         let cfg = shared.config_snapshot();
         let api_key_input = shared.api_key_snapshot();
+
+        // Ставится до создания значка в панели: внутри muda обработчик лежит
+        // в OnceLock, и первое же нажатие при пустом гнезде закрывает его
+        // навсегда — поставить свой позже уже не выйдет.
+        let waker = Arc::clone(&shared);
+        MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+            MENU_QUEUE.lock().unwrap().push(event.id.0.clone());
+            waker.wake_ui();
+        }));
+
+        // Щелчок по значку в Dock — та же история: приходит мимо winit и сам
+        // по себе кадра не вызывает.
+        let waker = Arc::clone(&shared);
+        macos::watch_dock_reopen(Box::new(move || waker.wake_ui()));
+
         Self {
             saved_cfg: cfg.clone(),
             cfg,
@@ -193,6 +221,21 @@ impl App {
             model_fetch: None,
             provider_keys: HashMap::new(),
         }
+    }
+
+    /// Выводит главное окно на экран: из меню в панели или щелчком в Dock.
+    fn show_main_window(&mut self, ctx: &egui::Context) {
+        // Список и настройки живут в одном окне: не закрыв список, мы
+        // показали бы настройки плашкой без рамки поверх всего.
+        if self.picker {
+            self.close_picker(ctx);
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        macos::activate();
+        // Показ окна сам по себе прохода интерфейса не гарантирует, а окно
+        // без него осталось бы пустым.
+        ctx.request_repaint();
     }
 
     fn toast(&mut self, msg: impl Into<String>) {
@@ -492,21 +535,23 @@ impl eframe::App for App {
         self.sync_tray();
         self.update_overlay(ctx);
 
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
-            match event.id.as_ref() {
+        // Очередь освобождаем сразу: обработчик меню пишет в неё с того же
+        // главного потока, и держать замок во время показа окна незачем.
+        let menu_events: Vec<String> = MENU_QUEUE.lock().unwrap().drain(..).collect();
+        for id in menu_events {
+            match id.as_str() {
                 MENU_OPEN => {
-                    // Список и настройки живут в одном окне: не закрыв список,
-                    // мы показали бы настройки плашкой без рамки поверх всего.
-                    if self.picker {
-                        self.close_picker(ctx);
-                    }
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    macos::activate();
+                    log::info!("открываю окно из меню в панели");
+                    self.show_main_window(ctx);
                 }
                 MENU_QUIT => std::process::exit(0),
                 _ => {}
             }
+        }
+
+        if macos::take_dock_reopen() {
+            log::info!("открываю окно по щелчку в Dock");
+            self.show_main_window(ctx);
         }
 
         // Список считается открытым, пока его рисует проход интерфейса. Если

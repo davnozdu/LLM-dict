@@ -1,12 +1,15 @@
 //! Глобальное сочетание клавиш через CGEventTap.
 //!
-//! Тап живёт в отдельном потоке с собственным CFRunLoop и только слушает события
-//! (ListenOnly), ничего не проглатывая — поэтому обычная работа клавиш не ломается.
-//! Требует разрешения «Универсальный доступ».
+//! Тап живёт в отдельном потоке с собственным CFRunLoop. Проглатывает он
+//! только обычные клавиши собранного целиком сочетания и только когда это
+//! включено в настройках; модификаторы уходят дальше всегда, иначе сломались
+//! бы все ⌘C и ⌘V. Требует разрешения «Универсальный доступ».
 
 use crate::binding::{self, Binding};
 use crate::config::HotKeyMode;
-use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
+use core_foundation::runloop::{
+    kCFRunLoopCommonModes, kCFRunLoopDefaultMode, CFRunLoop, CFRunLoopRunResult,
+};
 use core_graphics::event::{
     CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
     CallbackResult, EventField,
@@ -506,8 +509,29 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
         }
         tap.enable();
         log::info!("event tap запущен");
-        CFRunLoop::run_current();
-        true
+
+        // Не `run_current`: из неё уже не выйти, а тап приходится включать
+        // обратно. Система отключает его сама — за обработчик, не уложившийся
+        // в отведённое время, и после сна машины. Раньше в этом месте только
+        // поднимался флаг, и сочетания молча не работали до перезапуска
+        // приложения. Заход по секунде: сотая доля секунды впустую раз в
+        // секунду ничего не стоит, а дольше секунды без клавиш не сидят.
+        loop {
+            let result = CFRunLoop::run_in_mode(
+                unsafe { kCFRunLoopDefaultMode },
+                std::time::Duration::from_secs(1),
+                false,
+            );
+            if state.disabled_by_system.swap(false, Ordering::Relaxed) {
+                log::warn!("система отключила event tap, включаю обратно");
+                tap.enable();
+            }
+            // Источников в цикле не осталось — заход возвращается сразу же,
+            // и без паузы это был бы холостой оборот на всё ядро.
+            if matches!(result, CFRunLoopRunResult::Finished) {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
     })
 }
 

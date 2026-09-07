@@ -2,9 +2,11 @@
 
 use core_graphics::event::CGEvent;
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
-use objc2::runtime::AnyObject;
-use objc2::{class, msg_send};
+use objc2::runtime::{AnyClass, AnyObject, Bool, Sel};
+use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 const POLICY_REGULAR: i64 = 0;
 const POLICY_ACCESSORY: i64 = 1;
@@ -34,6 +36,86 @@ pub fn activate() {
         }
         let _: () = msg_send![app, activateIgnoringOtherApps: true];
     }
+}
+
+/// Пользователь щёлкнул по значку в Dock, а показывать было нечего.
+static REOPEN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Разбудить интерфейс: щелчок по значку приходит мимо winit, и кадр из-за
+/// него не выполняется — как и нажатие в меню верхней панели.
+#[allow(clippy::type_complexity)]
+static REOPEN_WAKE: Mutex<Option<Box<dyn Fn() + Send + Sync>>> = Mutex::new(None);
+
+/// Ответ делегата на щелчок по значку в Dock.
+///
+/// `true` — пусть система делает и своё обычное дело; окно мы показываем
+/// сами, из `logic`, потому что решение зависит от состояния приложения
+/// (открытый список из буфера настройками поверх себя закрывать нельзя).
+extern "C-unwind" fn should_handle_reopen(
+    _this: *mut AnyObject,
+    _cmd: Sel,
+    _sender: *mut AnyObject,
+    _has_visible_windows: Bool,
+) -> Bool {
+    REOPEN_REQUESTED.store(true, Ordering::Relaxed);
+    if let Ok(guard) = REOPEN_WAKE.lock() {
+        if let Some(wake) = guard.as_ref() {
+            wake();
+        }
+    }
+    Bool::YES
+}
+
+/// Учит приложение возвращать окно по щелчку в Dock.
+///
+/// winit `applicationShouldHandleReopen:hasVisibleWindows:` не разбирает
+/// вовсе — у его делегата объявлены только запуск и завершение. Поэтому
+/// программа со скрытым окном на щелчок по значку не отзывалась никак, и
+/// так с самого первого раза, а не «через некоторое время».
+///
+/// Метод добавляется живому делегату во время работы. Подменять ничего не
+/// приходится: место свободно, и если однажды winit займёт его сам,
+/// `class_addMethod` вернёт `false` и мы просто останемся как были.
+pub fn watch_dock_reopen(wake: Box<dyn Fn() + Send + Sync>) -> bool {
+    *REOPEN_WAKE.lock().unwrap() = Some(wake);
+    unsafe {
+        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        if app.is_null() {
+            return false;
+        }
+        let delegate: *mut AnyObject = msg_send![app, delegate];
+        if delegate.is_null() {
+            log::warn!("у приложения нет делегата — щелчок по значку в Dock разобрать некому");
+            return false;
+        }
+        let class: *const AnyClass = objc2::ffi::object_getClass(delegate);
+        if class.is_null() {
+            return false;
+        }
+        // «B@:@B» — возвращает BOOL, принимает self, селектор, отправителя и
+        // BOOL «есть ли видимые окна». На arm64 BOOL — это bool, то есть «B».
+        let imp: objc2::runtime::Imp = std::mem::transmute(
+            should_handle_reopen
+                as extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject, Bool) -> Bool,
+        );
+        let added = objc2::ffi::class_addMethod(
+            class as *mut AnyClass,
+            sel!(applicationShouldHandleReopen:hasVisibleWindows:),
+            imp,
+            c"B@:@B".as_ptr(),
+        );
+        if added.as_bool() {
+            log::info!("щелчок по значку в Dock будет возвращать окно");
+        } else {
+            log::warn!("не удалось перехватить щелчок по значку в Dock");
+        }
+        added.as_bool()
+    }
+}
+
+/// Просили ли вернуть окно щелчком по значку в Dock. Забирает запрос.
+pub fn take_dock_reopen() -> bool {
+    REOPEN_REQUESTED.swap(false, Ordering::Relaxed)
 }
 
 /// Положение указателя мыши в глобальных координатах экрана.
