@@ -22,6 +22,7 @@ mod models;
 mod net;
 mod overlay;
 mod permissions;
+mod persistence;
 mod provider;
 mod providers;
 mod server;
@@ -262,11 +263,7 @@ fn run_action_test(name: &str, text: &str, local: bool) -> eframe::Result<()> {
     if local {
         let id = cfg.local_llm.model.clone();
         let mut llm = local_llm::LocalLlm::default();
-        let guard = if action.after_dictation && context.is_none() {
-            local_llm::Guard::Correction
-        } else {
-            local_llm::Guard::FreeForm
-        };
+        let guard = action.guard();
         match llm.run(&id, &action.prompt, context.as_deref(), text, guard) {
             Ok(out) => println!(
                 "Локально за {:.2} с:\n{out}",

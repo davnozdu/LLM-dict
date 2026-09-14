@@ -30,7 +30,7 @@ jobs:
 
       - name: Проверка
         run: |
-          cargo fmt --check || echo "форматирование не по канону — не блокирую сборку"
+          cargo fmt --check
           cargo clippy --all-targets -- -D warnings
 
       - name: Тесты

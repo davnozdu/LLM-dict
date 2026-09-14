@@ -8,7 +8,7 @@ use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Больше этого в историю не берём: в буфер попадают и целые документы,
@@ -102,7 +102,7 @@ pub fn rotate(days: u32) -> anyhow::Result<()> {
         out.push_str(&serde_json::to_string(e)?);
         out.push('\n');
     }
-    std::fs::write(history_path(), out)?;
+    crate::persistence::atomic_write(&history_path(), out.as_bytes())?;
     Ok(())
 }
 
@@ -118,17 +118,18 @@ pub fn clear() -> anyhow::Result<()> {
 pub struct History {
     pub entries: Mutex<Vec<Entry>>,
     enabled: AtomicBool,
-    /// Текст, который мы сами только что положили в буфер: возвращать его
-    /// в историю не надо, иначе список забьётся собственными вставками.
-    pub ours: Mutex<Option<String>>,
+    days: AtomicU32,
 }
 
 impl History {
-    pub fn new(enabled: bool) -> Arc<Self> {
+    pub fn new(enabled: bool, days: u32) -> Arc<Self> {
+        let _ = rotate(days);
+        let mut entries = load_recent();
+        prune(&mut entries, days);
         Arc::new(Self {
-            entries: Mutex::new(load_recent()),
+            entries: Mutex::new(entries),
             enabled: AtomicBool::new(enabled),
-            ours: Mutex::new(None),
+            days: AtomicU32::new(days),
         })
     }
 
@@ -136,28 +137,43 @@ impl History {
         self.enabled.store(v, Ordering::Relaxed);
     }
 
-    pub fn mark_ours(&self, text: &str) {
-        *self.ours.lock().unwrap() = Some(text.to_string());
+    pub fn set_days(&self, days: u32) {
+        self.days.store(days, Ordering::Relaxed);
+    }
+}
+
+fn prune(entries: &mut Vec<Entry>, days: u32) {
+    if days != 0 {
+        let cutoff = Local::now() - chrono::Duration::days(i64::from(days));
+        entries.retain(|e| e.at > cutoff);
     }
 }
 
 /// Следит за буфером обмена и пополняет историю.
-pub fn spawn(history: Arc<History>, days: u32) {
+pub fn spawn(history: Arc<History>) {
     std::thread::spawn(move || {
         let mut last_change = crate::insert::pasteboard_change_count();
         // Ротация раз в час: чаще незачем, а на старте важно подчистить.
-        let _ = rotate(days);
+        let mut applied_days = history.days.load(Ordering::Relaxed);
         let mut next_rotate = std::time::Instant::now() + std::time::Duration::from_secs(3600);
 
         loop {
             std::thread::sleep(std::time::Duration::from_millis(400));
 
-            if std::time::Instant::now() >= next_rotate {
-                let _ = rotate(days);
+            let days = history.days.load(Ordering::Relaxed);
+            if days != applied_days || std::time::Instant::now() >= next_rotate {
+                let mut entries = history.entries.lock().unwrap();
+                prune(&mut entries, days);
+                if let Err(e) = rotate(days) {
+                    log::warn!("не обновить срок хранения буфера: {e}");
+                } else {
+                    applied_days = days;
+                }
                 next_rotate = std::time::Instant::now() + std::time::Duration::from_secs(3600);
             }
 
             if !history.enabled.load(Ordering::Relaxed) {
+                last_change = crate::insert::pasteboard_change_count();
                 continue;
             }
             let change = crate::insert::pasteboard_change_count();
@@ -173,7 +189,7 @@ pub fn spawn(history: Arc<History>, days: u32) {
                 continue;
             }
             // Своё же не запоминаем.
-            if history.ours.lock().unwrap().as_deref() == Some(text.as_str()) {
+            if crate::insert::is_our_change(change) {
                 continue;
             }
 

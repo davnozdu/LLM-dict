@@ -41,6 +41,7 @@ pub struct HotKeyState {
     mode: AtomicU8,
     /// Идёт ли запись прямо сейчас.
     recording: AtomicBool,
+    busy: AtomicBool,
     /// Режим набора сочетания: события уходят в UI, диктовка не запускается.
     capturing: AtomicBool,
     /// Проглатывать события клавиш сочетания, не пропуская их в систему.
@@ -73,6 +74,7 @@ impl HotKeyState {
             actions: Mutex::new(Vec::new()),
             mode: AtomicU8::new(0),
             recording: AtomicBool::new(false),
+            busy: AtomicBool::new(false),
             capturing: AtomicBool::new(false),
             swallow: AtomicBool::new(false),
             held_now: Mutex::new(Vec::new()),
@@ -101,6 +103,10 @@ impl HotKeyState {
 
     pub fn set_recording(&self, v: bool) {
         self.recording.store(v, Ordering::Relaxed);
+    }
+
+    pub fn set_busy(&self, busy: bool) {
+        self.busy.store(busy, Ordering::Relaxed);
     }
 
     pub fn set_capturing(&self, v: bool) {
@@ -201,6 +207,8 @@ pub struct Matcher {
     /// Действие, уже сработавшее на текущем удержании. KeyDown у обычных
     /// клавиш автоповторяется, и без этого действие запускалось бы очередью.
     fired: Option<String>,
+    dictation_active: bool,
+    suppressed: bool,
 }
 
 impl Matcher {
@@ -229,6 +237,12 @@ impl Matcher {
             .max_by_key(|(_, b)| b.keys.len());
         let action_len = best_action.map(|(_, b)| b.keys.len()).unwrap_or(0);
 
+        let active = dictation_len > 0;
+        let was_active = std::mem::replace(&mut self.dictation_active, active);
+        if !active {
+            self.suppressed = false;
+        }
+
         let mut out = Vec::new();
 
         if action_len > 0 && action_len >= dictation_len {
@@ -240,6 +254,7 @@ impl Matcher {
                         // выставить, и при быстром нажатии диктовка оставалась
                         // включённой. Лишняя отмена безвредна.
                         out.push(HotKeyEvent::CancelRecording);
+                        self.suppressed = active;
                         self.fired = Some(id.clone());
                         out.push(HotKeyEvent::Action(id.clone()));
                     }
@@ -251,19 +266,21 @@ impl Matcher {
         // Сочетание разобрано — следующее нажатие сработает снова.
         self.fired = None;
 
-        let active = dictation_len > 0;
+        if self.suppressed {
+            return out;
+        }
         if toggle {
             // В Toggle реагируем только на момент сборки сочетания.
-            if active && is_down {
+            if active && !was_active && is_down {
                 out.push(if recording {
                     HotKeyEvent::StopRecording
                 } else {
                     HotKeyEvent::StartRecording
                 });
             }
-        } else if active && !recording {
+        } else if active && !was_active && is_down {
             out.push(HotKeyEvent::StartRecording);
-        } else if !active && recording {
+        } else if !active && was_active {
             out.push(HotKeyEvent::StopRecording);
         }
         out
@@ -473,6 +490,18 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
                     .unwrap()
                     .decide(&held, is_down, &binding, &actions, recording, toggle);
                 for event in events {
+                    // Состояние сочетания обновляется даже во время обработки,
+                    // но новые операции тогда не ставятся в очередь.
+                    if cb_state.busy.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    match &event {
+                        HotKeyEvent::StartRecording => cb_state.set_recording(true),
+                        HotKeyEvent::StopRecording | HotKeyEvent::CancelRecording => {
+                            cb_state.set_recording(false);
+                        }
+                        _ => {}
+                    }
                     if let HotKeyEvent::Action(id) = &event {
                         log::info!("сработало действие {id}");
                     }
@@ -770,6 +799,39 @@ mod tests {
             m.decide(&[], false, &dict, &acts, true, false),
             vec![HotKeyEvent::StopRecording]
         );
+    }
+
+    #[test]
+    fn отпускание_до_готовности_микрофона_всё_равно_останавливает_запись() {
+        let mut m = Matcher::default();
+        let dict = Binding::new(vec![R_CMD]);
+        let acts: Vec<(String, Binding)> = Vec::new();
+        assert_eq!(
+            m.decide(&[R_CMD], true, &dict, &acts, false, false),
+            vec![HotKeyEvent::StartRecording]
+        );
+        // Флаг рабочего потока ещё не успел стать true.
+        assert_eq!(
+            m.decide(&[], false, &dict, &acts, false, false),
+            vec![HotKeyEvent::StopRecording]
+        );
+    }
+
+    #[test]
+    fn toggle_ignores_autorepeat_and_unrelated_keys() {
+        let mut m = Matcher::default();
+        let dict = Binding::new(vec![R_CMD]);
+        let acts: Vec<(String, Binding)> = Vec::new();
+        assert_eq!(
+            m.decide(&[R_CMD], true, &dict, &acts, false, true),
+            vec![HotKeyEvent::StartRecording]
+        );
+        assert!(m
+            .decide(&[R_CMD], true, &dict, &acts, true, true)
+            .is_empty());
+        assert!(m
+            .decide(&[KEY_C, R_CMD], true, &dict, &acts, true, true)
+            .is_empty());
     }
 
     /// Посторонние клавиши не должны ничего запускать.

@@ -39,13 +39,6 @@ impl PostMode {
             PostMode::Custom => "Свой промпт",
         }
     }
-
-    pub const ALL: [PostMode; 4] = [
-        PostMode::Raw,
-        PostMode::Correct,
-        PostMode::Translate,
-        PostMode::Custom,
-    ];
 }
 
 /// Что делает сочетание истории буфера обмена.
@@ -245,6 +238,7 @@ pub struct GeneralConfig {
     /// Набор действий уже создавался: пустой список после этого — выбор
     /// пользователя, а не первый запуск.
     pub actions_initialised: bool,
+    pub actions_validation_migrated: bool,
     /// Через сколько минут простоя выгружать локальные модели из памяти.
     ///
     /// Правило общее для распознавания и языковой модели: обе живут в одном
@@ -282,6 +276,7 @@ impl Default for GeneralConfig {
             check_updates: true,
             swallow_hotkey: true,
             actions_initialised: false,
+            actions_validation_migrated: false,
             idle_unload_min: 10,
             key_in_config: false,
         }
@@ -291,6 +286,9 @@ impl Default for GeneralConfig {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Повреждённый исходный файл нельзя затереть значениями по умолчанию.
+    #[serde(skip)]
+    pub load_error: Option<String>,
     pub general: GeneralConfig,
     pub stt: SttConfig,
     pub llm: LlmConfig,
@@ -383,7 +381,10 @@ impl Config {
                         "не разобрать {}: {e}, беру значения по умолчанию",
                         path.display()
                     );
-                    Config::default()
+                    Config {
+                        load_error: Some(format!("Повреждён {}: {e}. Исправьте файл и перезапустите приложение; исходник сохранён.", path.display())),
+                        ..Config::default()
+                    }
                 }
             },
             Err(_) => Config::default(),
@@ -392,6 +393,15 @@ impl Config {
 
     /// Приводит поля к каноническому виду после чтения с диска.
     pub fn normalized(mut self) -> Self {
+        if self.general.key_in_config {
+            if let Some(key) = self.provider_keys.remove("groq_api_key") {
+                self.api_key = key;
+            }
+        } else {
+            // Ключом управляет Keychain; не оставляем старую копию в файле.
+            self.provider_keys.remove("groq_api_key");
+            self.api_key.clear();
+        }
         self.stt.language = normalize_language(&self.stt.language).to_string();
         // Пустой список при первом запуске заполняем набором по умолчанию,
         // а вот осознанно вычищенный трогать нельзя — отсюда флаг.
@@ -418,7 +428,9 @@ impl Config {
             action.name = format!("{} (перенесено)", self.llm.mode.label());
             if let PostMode::Custom = self.llm.mode {
                 action.prompt = self.llm.custom_prompt.clone();
+                action.correction_only = false;
             } else if let PostMode::Translate = self.llm.mode {
+                action.correction_only = false;
                 action.prompt = format!(
                     "Переведи текст пользователя на {}. Выведи только перевод.",
                     self.llm.target_language
@@ -428,14 +440,34 @@ impl Config {
             self.actions.push(action);
             self.llm.mode = PostMode::Raw;
         }
+        if !self.general.actions_validation_migrated {
+            let defaults = crate::actions::defaults();
+            let answer = crate::actions::answer_action(crate::provider::Endpoint::default());
+            for action in &mut self.actions {
+                if action.prompt == crate::local_llm::CORRECT_PROMPT
+                    || defaults
+                        .iter()
+                        .any(|a| a.correction_only && a.prompt == action.prompt)
+                {
+                    action.correction_only = true;
+                }
+                if action.prompt == answer.prompt {
+                    action.require_context = true;
+                }
+            }
+            self.general.actions_validation_migrated = true;
+        }
         self
     }
 
     pub fn save(&self) -> Result<()> {
+        if let Some(error) = &self.load_error {
+            anyhow::bail!("{error}");
+        }
         let dir = config_dir();
         std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
         let text = toml::to_string_pretty(self)?;
-        std::fs::write(config_path(), text)?;
+        crate::persistence::atomic_write(&config_path(), text.as_bytes())?;
         Ok(())
     }
 }
@@ -451,12 +483,11 @@ impl Config {
     /// положенный в файл.
     pub fn key_for(&self, account: &str) -> String {
         if self.general.key_in_config {
-            if let Some(key) = self.provider_keys.get(account) {
-                return key.clone();
-            }
-            // Ключ Groq лежал в отдельном поле до появления словаря.
             if account == "groq_api_key" {
                 return self.api_key.clone();
+            }
+            if let Some(key) = self.provider_keys.get(account) {
+                return key.clone();
             }
             return String::new();
         }
@@ -466,7 +497,7 @@ impl Config {
     pub fn set_key_for(&mut self, account: &str, value: &str) -> anyhow::Result<()> {
         if self.general.key_in_config {
             let _ = secrets::set(account, "");
-            if value.is_empty() {
+            if value.is_empty() || account == "groq_api_key" {
                 self.provider_keys.remove(account);
             } else {
                 self.provider_keys
@@ -477,11 +508,12 @@ impl Config {
             }
             Ok(())
         } else {
+            secrets::set(account, value)?;
             self.provider_keys.remove(account);
             if account == "groq_api_key" {
                 self.api_key.clear();
             }
-            secrets::set(account, value)
+            Ok(())
         }
     }
 }

@@ -2,7 +2,7 @@
 
 use crate::actions::{Output, TextAction};
 use crate::binding::Binding;
-use crate::config::{secrets, ClipboardMode, Config, HotKeyMode, PostMode};
+use crate::config::{ClipboardMode, Config, HotKeyMode};
 use crate::engine::{self, Shared, Stage};
 use crate::history;
 use crate::insert;
@@ -248,6 +248,9 @@ impl App {
         }
         *self.shared.config.write().unwrap() = self.cfg.clone();
         self.shared.sync_hotkey();
+        self.shared
+            .clipboard
+            .set_days(self.cfg.general.clipboard_days);
         if self.cfg.general.show_in_dock != self.saved_cfg.general.show_in_dock {
             macos::set_dock_visible(self.cfg.general.show_in_dock);
         }
@@ -497,21 +500,17 @@ impl App {
     /// подчищается: иначе он остался бы лежать в двух местах сразу.
     fn save_api_key(&mut self) {
         let key = self.api_key_input.trim().to_string();
-        if self.cfg.general.key_in_config {
-            self.cfg.api_key = key.clone();
-            let _ = secrets::set("groq_api_key", "");
-            self.toast("Ключ сохранён в файле настроек");
-        } else {
-            self.cfg.api_key.clear();
-            match secrets::set("groq_api_key", &key) {
-                Ok(()) => self.toast("Ключ сохранён в Keychain"),
-                Err(e) => {
-                    self.toast(format!("Keychain: {e}"));
-                    return;
-                }
+        match self.cfg.set_key_for("groq_api_key", &key) {
+            Ok(()) if self.cfg.general.key_in_config => {
+                self.toast("Ключ сохранён в файле настроек")
+            }
+            Ok(()) => self.toast("Ключ сохранён в Keychain"),
+            Err(e) => {
+                self.toast(format!("Keychain: {e}"));
+                return;
             }
         }
-        *self.shared.api_key.write().unwrap() = key;
+        self.shared.set_api_key(key);
     }
 
     fn start_model_check(&mut self) {
@@ -771,19 +770,7 @@ impl App {
         ui.separator();
         ui.add_space(6.0);
 
-        // Быстрое переключение режима — то, что меняют чаще всего.
-        ui.horizontal(|ui| {
-            ui.label("Режим обработки:");
-            for m in PostMode::ALL {
-                ui.selectable_value(&mut self.cfg.llm.mode, m, m.label());
-            }
-        });
-        if matches!(self.cfg.llm.mode, PostMode::Translate) {
-            ui.horizontal(|ui| {
-                ui.label("Переводить на:");
-                ui.text_edit_singleline(&mut self.cfg.llm.target_language);
-            });
-        }
+        ui.weak("Обработка после диктовки настраивается на вкладке «Действия».");
 
         ui.add_space(8.0);
 
@@ -1645,7 +1632,13 @@ impl App {
             if ui.button("Сохранить ключ").clicked() {
                 let account = provider.key_account();
                 match self.cfg.set_key_for(account, value.trim()) {
-                    Ok(()) => self.toast(format!("Ключ {} сохранён", provider.label())),
+                    Ok(()) => {
+                        if provider == Provider::Groq {
+                            self.api_key_input = value.trim().to_string();
+                            self.shared.set_api_key(self.api_key_input.clone());
+                        }
+                        self.toast(format!("Ключ {} сохранён", provider.label()));
+                    }
                     Err(e) => self.toast(format!("Не сохранить ключ: {e}")),
                 }
             }
@@ -1763,12 +1756,10 @@ impl App {
     /// чтобы её можно было вставить ещё раз руками.
     fn paste_from_picker(&mut self, ctx: &egui::Context, text: String) {
         self.close_picker(ctx);
-        let clipboard = self.shared.clipboard.clone();
         std::thread::spawn(move || {
             // Ждём, пока система вернёт фокус прежней программе: вставка
             // раньше этого уйдёт в никуда.
             std::thread::sleep(Duration::from_millis(220));
-            clipboard.mark_ours(&text);
             if let Err(e) = insert::insert_restoring(&text, None) {
                 log::warn!("вставка из истории буфера: {e}");
             }
@@ -1779,7 +1770,6 @@ impl App {
     /// куда ⌘V не проходит.
     fn copy_from_picker(&mut self, ctx: &egui::Context, text: String) {
         self.close_picker(ctx);
-        self.shared.clipboard.mark_ours(&text);
         let _ = insert::write_clipboard(&text);
     }
 
@@ -2184,49 +2174,48 @@ impl App {
                     );
                 }
             });
-            return;
+        } else {
+            ui.horizontal(|ui| {
+                ui.add_sized([130.0, 20.0], egui::Label::new("Модель"));
+                let known = self
+                    .provider_models
+                    .get(&provider)
+                    .cloned()
+                    .unwrap_or_default();
+                if known.is_empty() {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.cfg.actions[pos].endpoint.model)
+                            .desired_width(240.0),
+                    );
+                } else {
+                    let current = self.cfg.actions[pos].endpoint.model.clone();
+                    egui::ComboBox::from_id_salt(format!("model-{id}"))
+                        .width(240.0)
+                        .selected_text(current)
+                        .show_ui(ui, |ui| {
+                            for m in &known {
+                                ui.selectable_value(
+                                    &mut self.cfg.actions[pos].endpoint.model,
+                                    m.clone(),
+                                    m,
+                                );
+                            }
+                        });
+                }
+                if ui.button("Считать модели").clicked() {
+                    let endpoint = self.cfg.actions[pos].endpoint.clone();
+                    self.fetch_models(&endpoint);
+                }
+            });
+            ui.weak(
+                "Список моделей у части поставщиков отдаётся без ключа, поэтому \
+                 успешное чтение ещё не значит, что ключ рабочий — для этого есть \
+                 отдельная проверка ниже.",
+            );
+
+            ui.add_space(4.0);
+            self.ui_provider_key(ui, provider);
         }
-
-        ui.horizontal(|ui| {
-            ui.add_sized([130.0, 20.0], egui::Label::new("Модель"));
-            let known = self
-                .provider_models
-                .get(&provider)
-                .cloned()
-                .unwrap_or_default();
-            if known.is_empty() {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.cfg.actions[pos].endpoint.model)
-                        .desired_width(240.0),
-                );
-            } else {
-                let current = self.cfg.actions[pos].endpoint.model.clone();
-                egui::ComboBox::from_id_salt(format!("model-{id}"))
-                    .width(240.0)
-                    .selected_text(current)
-                    .show_ui(ui, |ui| {
-                        for m in &known {
-                            ui.selectable_value(
-                                &mut self.cfg.actions[pos].endpoint.model,
-                                m.clone(),
-                                m,
-                            );
-                        }
-                    });
-            }
-            if ui.button("Считать модели").clicked() {
-                let endpoint = self.cfg.actions[pos].endpoint.clone();
-                self.fetch_models(&endpoint);
-            }
-        });
-        ui.weak(
-            "Список моделей у части поставщиков отдаётся без ключа, поэтому \
-             успешное чтение ещё не значит, что ключ рабочий — для этого есть \
-             отдельная проверка ниже.",
-        );
-
-        ui.add_space(4.0);
-        self.ui_provider_key(ui, provider);
 
         // --- промпт и вывод ---
         ui.add_space(8.0);
@@ -2269,13 +2258,19 @@ impl App {
                 self.cfg.actions[pos].context_file.clear();
             }
         });
-        if self.cfg.actions[pos].context_file.trim().is_empty()
-            && self.cfg.actions[pos].prompt.contains("сведения")
-        {
+        ui.checkbox(
+            &mut self.cfg.actions[pos].require_context,
+            "Не запускать без файла данных",
+        );
+        if self.cfg.actions[pos].missing_context() {
             ui.colored_label(
                 egui::Color32::from_rgb(220, 130, 40),
-                "Промпт ссылается на сведения, но файл не выбран — отвечать будет не по чему",
+                "Для этого действия требуется файл данных",
             );
+        } else if self.cfg.actions[pos].context_file.trim().is_empty()
+            && self.cfg.actions[pos].expects_context()
+        {
+            ui.weak("Промпт упоминает сведения; при необходимости включите требование файла выше.");
         }
         // Обратный случай к проверке выше: файл выбран, а промпт про него
         // молчит. Тогда сведения уходят в каждый запрос впустую, а
@@ -2318,6 +2313,10 @@ impl App {
         ui.checkbox(
             &mut self.cfg.actions[pos].after_dictation,
             "Использовать после диктовки",
+        );
+        ui.checkbox(
+            &mut self.cfg.actions[pos].correction_only,
+            "Строго проверять как корректуру",
         );
         ui.weak(
             "Надиктованный текст пройдёт через этот промпт до вставки. Результат \
@@ -2597,7 +2596,6 @@ impl App {
         });
 
         if let Some(text) = copy {
-            self.shared.clipboard.mark_ours(&text);
             let _ = insert::write_clipboard(&text);
             self.toast("Скопировано");
         }

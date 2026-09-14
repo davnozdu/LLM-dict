@@ -86,6 +86,6 @@ pub fn trim(limit: usize) -> Result<()> {
         out.push_str(&serde_json::to_string(e)?);
         out.push('\n');
     }
-    std::fs::write(history_path(), out)?;
+    crate::persistence::atomic_write(&history_path(), out.as_bytes())?;
     Ok(())
 }

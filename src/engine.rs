@@ -93,14 +93,18 @@ impl Shared {
         hotkey_state.set_swallow(config.general.swallow_hotkey);
         hotkey_state.set_actions(collect_bindings(&config));
         let limit = config.general.history_limit;
-        let clipboard = crate::clipboard::History::new(config.general.clipboard_history);
-        crate::clipboard::spawn(clipboard.clone(), config.general.clipboard_days);
+        let clipboard = crate::clipboard::History::new(
+            config.general.clipboard_history,
+            config.general.clipboard_days,
+        );
+        crate::clipboard::spawn(clipboard.clone());
+        let load_error = config.load_error.clone();
         let shared = Arc::new(Self {
             config: RwLock::new(config),
             api_key: RwLock::new(String::new()),
             stage: Mutex::new(Stage::Idle),
             level: Arc::new(audio::Level::default()),
-            last_error: Mutex::new(None),
+            last_error: Mutex::new(load_error),
             last_text: Mutex::new(None),
             history: Mutex::new(history::load(limit)),
             hotkey_state,
@@ -122,8 +126,11 @@ impl Shared {
             let shared = shared.clone();
             std::thread::spawn(move || {
                 let key = shared.config_snapshot().load_api_key();
-                *shared.api_key.write().unwrap() = key;
-                shared.key_loaded.store(true, Ordering::Relaxed);
+                let mut current = shared.api_key.write().unwrap();
+                if !shared.key_loaded.load(Ordering::Relaxed) {
+                    *current = key;
+                    shared.key_loaded.store(true, Ordering::Relaxed);
+                }
                 shared.dirty.store(true, Ordering::Relaxed);
             });
         }
@@ -133,6 +140,22 @@ impl Shared {
 
     pub fn key_loaded(&self) -> bool {
         self.key_loaded.load(Ordering::Relaxed)
+    }
+
+    pub fn set_api_key(&self, key: String) {
+        let mut current = self.api_key.write().unwrap();
+        *current = key;
+        self.key_loaded.store(true, Ordering::Relaxed);
+    }
+
+    fn add_history(&self, entry: history::Entry, limit: usize) {
+        let mut hist = self.history.lock().unwrap();
+        if let Err(e) = history::append(&entry).and_then(|()| history::trim(limit)) {
+            log::warn!("не сохранить историю: {e}");
+        }
+        hist.insert(0, entry);
+        hist.truncate(limit);
+        self.dirty.store(true, Ordering::Relaxed);
     }
 
     pub fn set_wake(&self, f: Box<dyn Fn() + Send + Sync>) {
@@ -170,6 +193,8 @@ impl Shared {
     }
 
     fn set_stage(&self, s: Stage) {
+        self.hotkey_state
+            .set_busy(!matches!(s, Stage::Idle | Stage::Recording));
         *self.stage.lock().unwrap() = s;
         self.dirty.store(true, Ordering::Relaxed);
         self.wake_ui();
@@ -327,10 +352,10 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
                     continue;
                 }
                 let cfg = shared.config_snapshot();
+                shared.set_stage(Stage::Recording);
                 match audio::start(shared.level.clone()) {
                     Ok(rec) => {
                         recording = Some(rec);
-                        shared.hotkey_state.set_recording(true);
                         shared.set_stage(Stage::Recording);
                         shared.set_error(None);
                         if cfg.general.play_sounds {
@@ -338,6 +363,7 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
                         }
                     }
                     Err(e) => {
+                        shared.set_stage(Stage::Idle);
                         shared.hotkey_state.set_recording(false);
                         shared.set_error(Some(format!("Микрофон недоступен: {e}")));
                     }
@@ -373,6 +399,8 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
                     shared.set_stage(Stage::Idle);
                 }
                 run_action(&shared, &id);
+                discard_busy_events(&shared, &rx);
+                shared.set_stage(Stage::Idle);
             }
 
             HotKeyEvent::Captured(keys) => {
@@ -400,10 +428,22 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
                 let spoken = audio::duration_secs(&samples);
                 let result = process(&shared, &mut local, &cfg, samples);
                 record_result(&shared, &cfg, result, started, spoken);
+                discard_busy_events(&shared, &rx);
                 shared.set_stage(Stage::Idle);
             }
         }
     }
+}
+
+/// Нажатия, пришедшие до выставления busy, не должны запускать отложенную
+/// операцию над уже другим выделением. Захваченные настройки сохраняем.
+fn discard_busy_events(shared: &Shared, rx: &Receiver<HotKeyEvent>) {
+    while let Ok(event) = rx.try_recv() {
+        if let HotKeyEvent::Captured(keys) = event {
+            *shared.captured.lock().unwrap() = Some(keys);
+        }
+    }
+    shared.hotkey_state.set_recording(false);
 }
 
 struct Outcome {
@@ -492,7 +532,6 @@ fn cycle_clipboard(shared: &Arc<Shared>, cfg: &Config, cycle: &mut ClipboardCycl
 
     // Своя же запись не должна вернуться в историю новой строкой, иначе
     // листание перемешивало бы список под собственными руками.
-    shared.clipboard.mark_ours(&entry.text);
     if let Err(e) = insert::write_clipboard(&entry.text) {
         shared.notify(format!("Буфер: {e}"));
         return;
@@ -644,11 +683,7 @@ fn apply_action(
     // Правку надиктованного проверяем строго — там выход обязан походить на
     // вход. Перевод и ответ по данным дают другой текст по замыслу, и такие
     // проверки забраковали бы исправное.
-    let guard = if action.after_dictation && context.is_none() {
-        crate::local_llm::Guard::Correction
-    } else {
-        crate::local_llm::Guard::FreeForm
-    };
+    let guard = action.guard();
     let out = shared
         .llm
         .lock()
@@ -683,7 +718,9 @@ fn unload_idle(shared: &Arc<Shared>, local: &mut LocalEngines) {
         local.unload();
     }
     if !cfg.local_llm.keep_loaded {
-        let mut llm = shared.llm.lock().unwrap();
+        let Ok(mut llm) = shared.llm.try_lock() else {
+            return;
+        };
         if llm.idle_secs().is_some_and(|s| s >= limit) {
             llm.unload();
         }
@@ -722,10 +759,14 @@ fn process(
                 shared.notify(format!("«{}»: файл сведений не выбран", action.name));
                 continue;
             }
-            let context = action.load_context().unwrap_or_else(|e| {
-                log::warn!("{}: {e}", action.name);
-                None
-            });
+            let context = match action.load_context() {
+                Ok(context) => context,
+                Err(e) => {
+                    log::warn!("{}: {e}", action.name);
+                    shared.notify(format!("«{}»: {e} — действие пропущено", action.name));
+                    continue;
+                }
+            };
             match apply_action(
                 shared,
                 cfg,
@@ -799,19 +840,13 @@ fn record_result(
         }
     };
 
-    let _ = history::append(&entry);
-    let mut hist = shared.history.lock().unwrap();
-    hist.insert(0, entry);
-    hist.truncate(cfg.general.history_limit);
-    drop(hist);
-    let _ = history::trim(cfg.general.history_limit);
-    shared.dirty.store(true, Ordering::Relaxed);
+    shared.add_history(entry, cfg.general.history_limit);
 }
 
 /// Выполняет действие над выделенным текстом.
 ///
-/// Отдельным потоком: пока модель думает, тап должен продолжать принимать
-/// события, иначе система сочтёт обработчик зависшим и отключит его.
+/// Рабочий поток выполняет операции последовательно. Event tap живёт в
+/// отдельном потоке и продолжает читать клавиатуру во время запроса.
 fn run_action(shared: &Arc<Shared>, id: &str) {
     let cfg = shared.config_snapshot();
     let Some(action) = cfg
@@ -823,9 +858,9 @@ fn run_action(shared: &Arc<Shared>, id: &str) {
         return;
     };
 
-    let shared = shared.clone();
-    std::thread::spawn(move || {
+    {
         shared.set_stage(Stage::ActionRunning);
+        let target = crate::macos::frontmost_app_pid();
         shared.set_error(None);
         if cfg.general.play_sounds {
             insert::play_sound("Tink");
@@ -849,7 +884,11 @@ fn run_action(shared: &Arc<Shared>, id: &str) {
         std::thread::sleep(Duration::from_millis(60));
 
         let started = Instant::now();
+        let mut replaced = false;
         let outcome = (|| -> anyhow::Result<(String, Option<String>, String, bool)> {
+            if target.is_none() || crate::macos::frontmost_app_pid() != target {
+                anyhow::bail!("активное приложение сменилось — повторите действие");
+            }
             let (selection, previous) = insert::copy_selection()?;
             let key = action.endpoint.api_key(&cfg);
             // Молчаливое «не знаю» вместо ответа — самый непонятный отказ:
@@ -864,19 +903,18 @@ fn run_action(shared: &Arc<Shared>, id: &str) {
             // Тот же путь, что и после диктовки: облако, а при подходящем
             // отказе — локальная модель. Раньше здесь отката не было вовсе,
             // и флажок в настройках действия ничего не делал.
-            let done = apply_action(&shared, &cfg, &action, &key, context.as_deref(), &selection)?;
+            let done = apply_action(shared, &cfg, &action, &key, context.as_deref(), &selection)?;
             let result = done.text;
 
             match action.output {
                 crate::actions::Output::Replace => {
                     // Возвращаем в буфер то, что там было до нашего ⌘C,
                     // а не скопированное выделение.
-                    let restore = cfg
-                        .general
-                        .restore_clipboard
-                        .then(|| previous.clone())
-                        .flatten();
-                    insert::insert_restoring(&result, restore)?;
+                    replaced = insert::insert_into(
+                        &result,
+                        cfg.general.restore_clipboard,
+                        target.unwrap(),
+                    )?;
                 }
                 crate::actions::Output::Clipboard => {
                     insert::write_clipboard(&result)?;
@@ -895,7 +933,12 @@ fn run_action(shared: &Arc<Shared>, id: &str) {
                     crate::actions::Output::Clipboard => {
                         format!("{} — в буфере, вставьте ⌘V", action.name)
                     }
-                    crate::actions::Output::Replace => format!("{} — готово", action.name),
+                    crate::actions::Output::Replace if replaced => {
+                        format!("{} — готово", action.name)
+                    }
+                    crate::actions::Output::Replace => {
+                        format!("{} — окно сменилось, результат в буфере", action.name)
+                    }
                 };
                 shared.notify(note);
                 *shared.last_text.lock().unwrap() = Some(text.clone());
@@ -917,8 +960,7 @@ fn run_action(shared: &Arc<Shared>, id: &str) {
                         action.endpoint.provider.label().to_string()
                     }),
                 };
-                let _ = history::append(&entry);
-                shared.history.lock().unwrap().insert(0, entry);
+                shared.add_history(entry, cfg.general.history_limit);
             }
             Err(e) => {
                 let msg = format!("{}: {e}", action.name);
@@ -929,8 +971,7 @@ fn run_action(shared: &Arc<Shared>, id: &str) {
                 }
             }
         }
-        shared.set_stage(Stage::Idle);
-    });
+    }
 }
 
 /// Разрешения, которых не хватает для работы. Для баннера в UI.

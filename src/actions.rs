@@ -61,6 +61,10 @@ pub struct TextAction {
     /// локальная модель потянет, а действие с большим файлом сведений —
     /// нет, оно не влезет в её контекст.
     pub fallback_local: bool,
+    /// Требовать файл данных явно, а не угадывать это по словам промпта.
+    pub require_context: bool,
+    /// Строгая проверка допустима только для корректуры, не для перевода.
+    pub correction_only: bool,
 }
 
 impl Default for TextAction {
@@ -76,6 +80,8 @@ impl Default for TextAction {
             after_dictation: false,
             context_file: String::new(),
             fallback_local: false,
+            require_context: false,
+            correction_only: false,
         }
     }
 }
@@ -119,6 +125,8 @@ pub fn correction_action(endpoint: Endpoint) -> TextAction {
         // короткий текст, узкая задача, и без сети оно иначе просто пропадёт.
         context_file: String::new(),
         fallback_local: true,
+        require_context: false,
+        correction_only: true,
     }
 }
 
@@ -144,6 +152,8 @@ pub fn answer_action(endpoint: Endpoint) -> TextAction {
         after_dictation: false,
         context_file: String::new(),
         fallback_local: false,
+        require_context: true,
+        correction_only: false,
     }
 }
 
@@ -168,6 +178,8 @@ pub fn defaults() -> Vec<TextAction> {
             after_dictation: false,
             context_file: String::new(),
             fallback_local: false,
+            require_context: false,
+            correction_only: false,
         },
         TextAction {
             id: new_id(),
@@ -180,6 +192,8 @@ pub fn defaults() -> Vec<TextAction> {
             after_dictation: false,
             context_file: String::new(),
             fallback_local: false,
+            require_context: false,
+            correction_only: false,
         },
         TextAction {
             id: new_id(),
@@ -192,6 +206,8 @@ pub fn defaults() -> Vec<TextAction> {
             after_dictation: false,
             context_file: String::new(),
             fallback_local: false,
+            require_context: false,
+            correction_only: false,
         },
         TextAction {
             id: new_id(),
@@ -207,6 +223,8 @@ pub fn defaults() -> Vec<TextAction> {
             after_dictation: false,
             context_file: String::new(),
             fallback_local: false,
+            require_context: false,
+            correction_only: true,
         },
     ]
 }
@@ -231,12 +249,23 @@ impl TextAction {
 
     /// Действие ждёт сведений, но файл не выбран.
     pub fn missing_context(&self) -> bool {
-        self.context_file.trim().is_empty() && self.expects_context()
+        self.require_context && self.context_file.trim().is_empty()
+    }
+
+    pub fn guard(&self) -> crate::local_llm::Guard {
+        if self.correction_only {
+            crate::local_llm::Guard::Correction
+        } else {
+            crate::local_llm::Guard::FreeForm
+        }
     }
 
     pub fn load_context(&self) -> anyhow::Result<Option<String>> {
         let path = self.context_file.trim();
         if path.is_empty() {
+            if self.require_context {
+                anyhow::bail!("для этого действия требуется файл данных");
+            }
             return Ok(None);
         }
         let meta = std::fs::metadata(path)
@@ -249,6 +278,32 @@ impl TextAction {
         }
         let text = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("не прочитать файл данных {path}: {e}"))?;
+        if text.trim().is_empty() {
+            anyhow::bail!("файл данных пуст: {path}");
+        }
         Ok(Some(text))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TextAction;
+
+    #[test]
+    fn ordinary_prompt_does_not_require_external_context() {
+        let action = TextAction {
+            prompt: "Сократи текст, сохрани всю информацию.".into(),
+            ..Default::default()
+        };
+        assert!(!action.missing_context());
+    }
+
+    #[test]
+    fn explicit_context_requirement_is_enforced() {
+        let action = TextAction {
+            require_context: true,
+            ..Default::default()
+        };
+        assert!(action.missing_context());
     }
 }

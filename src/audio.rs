@@ -75,6 +75,7 @@ struct Downmix {
     pos: f64,
     acc: f32,
     acc_n: u32,
+    previous: Option<f32>,
 }
 
 impl Downmix {
@@ -85,12 +86,26 @@ impl Downmix {
             pos: 0.0,
             acc: 0.0,
             acc_n: 0,
+            previous: None,
         }
     }
 
     fn push(&mut self, interleaved: &[f32], out: &mut Vec<f32>) {
         for frame in interleaved.chunks(self.channels) {
             let mono = frame.iter().sum::<f32>() / self.channels as f32;
+            if self.ratio > 1.0 {
+                // Линейная интерполяция при повышении частоты. Число выходных
+                // сэмплов определяется отношением частот, в том числе дробным.
+                let previous = self.previous.unwrap_or(mono);
+                self.pos += self.ratio;
+                while self.pos >= 1.0 {
+                    self.pos -= 1.0;
+                    let t = (1.0 - self.pos / self.ratio) as f32;
+                    out.push(previous + (mono - previous) * t);
+                }
+                self.previous = Some(mono);
+                continue;
+            }
             self.acc += mono;
             self.acc_n += 1;
             self.pos += self.ratio;
@@ -265,4 +280,17 @@ pub fn read_wav(path: &str) -> Result<Vec<f32>> {
     let mut out = Vec::new();
     dm.push(&raw, &mut out);
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Downmix;
+
+    #[test]
+    fn upsampling_preserves_duration() {
+        let mut downmix = Downmix::new(8_000, 1);
+        let mut output = Vec::new();
+        downmix.push(&[0.0; 8_000], &mut output);
+        assert_eq!(output.len(), 16_000);
+    }
 }

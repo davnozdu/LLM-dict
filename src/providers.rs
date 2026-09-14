@@ -146,6 +146,7 @@ fn require_network(base_url: &str) -> Result<()> {
 
 /// Распознавание речи: POST /audio/transcriptions (multipart).
 pub fn transcribe(cfg: &SttConfig, api_key: &str, wav: Vec<u8>) -> Result<String> {
+    require_key(api_key, &cfg.base_url)?;
     require_network(&cfg.base_url)?;
     let url = format!(
         "{}/audio/transcriptions",

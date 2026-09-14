@@ -7,10 +7,46 @@
 use anyhow::Result;
 use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+use std::sync::{
+    atomic::{AtomicI64, Ordering},
+    Mutex,
+};
 use std::time::Duration;
 
 const KEYCODE_V: u16 = 9;
 const KEYCODE_C: u16 = 8;
+static PASTEBOARD: Mutex<()> = Mutex::new(());
+static OUR_CHANGE: AtomicI64 = AtomicI64::new(-1);
+
+pub fn is_our_change(change: i64) -> bool {
+    owns_change(OUR_CHANGE.load(Ordering::Relaxed), change)
+}
+
+fn owns_change(owned: i64, current: i64) -> bool {
+    owned >= 0 && owned == current
+}
+
+fn write_unlocked(text: &str) -> Result<i64> {
+    arboard::Clipboard::new()?.set_text(text.to_string())?;
+    let change = pasteboard_change_count();
+    OUR_CHANGE.store(change, Ordering::Relaxed);
+    Ok(change)
+}
+
+fn restore_unlocked(previous: Option<&str>, expected: i64) -> Result<()> {
+    if owns_change(expected, pasteboard_change_count()) {
+        match previous {
+            Some(text) => {
+                write_unlocked(text)?;
+            }
+            None => {
+                arboard::Clipboard::new()?.clear()?;
+                OUR_CHANGE.store(pasteboard_change_count(), Ordering::Relaxed);
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Что лежало в буфере до вставки — чтобы показать в истории и вернуть обратно.
 pub fn read_clipboard() -> Option<String> {
@@ -18,7 +54,8 @@ pub fn read_clipboard() -> Option<String> {
 }
 
 pub fn write_clipboard(text: &str) -> Result<()> {
-    arboard::Clipboard::new()?.set_text(text.to_string())?;
+    let _lock = PASTEBOARD.lock().unwrap();
+    write_unlocked(text)?;
     Ok(())
 }
 
@@ -60,6 +97,7 @@ fn press_cmd(keycode: u16) -> Result<()> {
 /// приходится изображать. Прежнее содержимое буфера возвращается вызывающим:
 /// он сам решает, что положить туда в итоге.
 pub fn copy_selection() -> Result<(String, Option<String>)> {
+    let _lock = PASTEBOARD.lock().unwrap();
     let previous = read_clipboard();
 
     // Две попытки: первая может уйти в момент, когда программа-получатель ещё
@@ -73,7 +111,11 @@ pub fn copy_selection() -> Result<(String, Option<String>)> {
         while std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
             if pasteboard_change_count() != before {
+                let copied = pasteboard_change_count();
                 let text = read_clipboard().unwrap_or_default();
+                // Cmd+C — временная операция. Возвращаем буфер до запроса к
+                // модели, поэтому любой последующий отказ уже не теряет его.
+                restore_unlocked(previous.as_deref(), copied)?;
                 if text.trim().is_empty() {
                     anyhow::bail!("выделенный текст пустой");
                 }
@@ -99,16 +141,17 @@ fn press_cmd_v() -> Result<()> {
 
 /// Вставляет текст под курсором. Возвращает прежнее содержимое буфера.
 pub fn insert(text: &str, restore_clipboard: bool) -> Result<Option<String>> {
+    let _lock = PASTEBOARD.lock().unwrap();
     let previous = read_clipboard();
-    insert_restoring(
-        text,
-        if restore_clipboard {
-            previous.clone()
-        } else {
-            None
-        },
-    )?;
+    paste_unlocked(text, restore_clipboard.then(|| previous.clone()), None)?;
     Ok(previous)
+}
+
+/// При смене приложения результат остаётся в буфере; чужое окно не меняем.
+pub fn insert_into(text: &str, restore: bool, target: i32) -> Result<bool> {
+    let _lock = PASTEBOARD.lock().unwrap();
+    let previous = restore.then(read_clipboard);
+    paste_unlocked(text, previous, Some(target))
 }
 
 /// То же, но возвращает в буфер заданное значение, а не то, что там было
@@ -118,20 +161,42 @@ pub fn insert(text: &str, restore_clipboard: bool) -> Result<Option<String>> {
 /// выделение, скопированное нами же, а вернуть надо то, что было у
 /// пользователя до всей операции.
 pub fn insert_restoring(text: &str, restore: Option<String>) -> Result<()> {
-    write_clipboard(text)?;
+    let _lock = PASTEBOARD.lock().unwrap();
+    paste_unlocked(text, restore.map(Some), None)?;
+    Ok(())
+}
+
+fn paste_unlocked(
+    text: &str,
+    restore: Option<Option<String>>,
+    target: Option<i32>,
+) -> Result<bool> {
+    let change = write_unlocked(text)?;
 
     // Пастборд обновляется асинхронно, без паузы приложение-получатель
     // успевает вставить старое содержимое.
     std::thread::sleep(Duration::from_millis(60));
-    press_cmd_v()?;
+    if !owns_change(change, pasteboard_change_count()) {
+        anyhow::bail!("буфер изменился до вставки; текст не вставлен");
+    }
+    if target.is_some_and(|pid| crate::macos::frontmost_app_pid() != Some(pid)) {
+        return Ok(false);
+    }
+    if let Err(e) = press_cmd_v() {
+        if let Some(previous) = &restore {
+            let _ = restore_unlocked(previous.as_deref(), change);
+        }
+        return Err(e);
+    }
 
     if let Some(prev) = restore {
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(400));
-            let _ = write_clipboard(&prev);
+            let _lock = PASTEBOARD.lock().unwrap();
+            let _ = restore_unlocked(prev.as_deref(), change);
         });
     }
-    Ok(())
+    Ok(true)
 }
 
 pub fn play_sound(name: &str) {
@@ -139,4 +204,16 @@ pub fn play_sound(name: &str) {
     let _ = std::process::Command::new("/usr/bin/afplay")
         .arg(path)
         .spawn();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::owns_change;
+
+    #[test]
+    fn restore_only_our_unchanged_pasteboard() {
+        assert!(owns_change(10, 10));
+        assert!(!owns_change(10, 11)); // В том числе повторное копирование того же текста.
+        assert!(!owns_change(-1, -1));
+    }
 }
