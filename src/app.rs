@@ -741,30 +741,56 @@ impl eframe::App for App {
 impl App {
     fn ui_status(&mut self, ui: &mut egui::Ui) {
         let stage = self.shared.stage();
-
-        ui.add_space(6.0);
-        ui.heading(stage.label());
-        ui.add_space(4.0);
-
-        if matches!(stage, Stage::Idle) {
-            ui.label(format!(
-                "{} — {}. Текст встанет туда, где стоит курсор.",
-                self.cfg.general.hotkey.label(),
-                engine::hotkey_mode_hint(self.cfg.general.hotkey_mode)
-            ));
-        }
+        let hotkey_hint = format!(
+            "{} — {}. Текст встанет туда, где стоит курсор.",
+            self.cfg.general.hotkey.label(),
+            engine::hotkey_mode_hint(self.cfg.general.hotkey_mode)
+        );
+        let level = self.shared.level.get();
+        let listening = self.shared.tap_running.load(Ordering::Relaxed)
+            && !self.shared.hotkey_state.is_disabled_by_system();
+        let status_color = match stage {
+            Stage::Idle if listening => egui::Color32::from_rgb(56, 193, 133),
+            Stage::Idle => egui::Color32::from_rgb(246, 177, 75),
+            Stage::Recording => egui::Color32::from_rgb(255, 103, 119),
+            Stage::LoadingModel | Stage::PostProcessing | Stage::ActionRunning => {
+                egui::Color32::from_rgb(96, 184, 255)
+            }
+            Stage::Transcribing => egui::Color32::from_rgb(246, 177, 75),
+            Stage::Inserting => egui::Color32::from_rgb(56, 193, 133),
+        };
 
         ui.add_space(8.0);
-        let level = self.shared.level.get();
-        ui.add(
-            egui::ProgressBar::new(level.min(1.0))
-                .desired_width(ui.available_width())
-                .text(if matches!(stage, Stage::Recording) {
-                    "уровень сигнала"
-                } else {
-                    ""
-                }),
-        );
+        egui::Frame::new()
+            .fill(egui::Color32::from_rgb(28, 35, 43))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(53, 67, 82)))
+            .corner_radius(egui::CornerRadius::same(12))
+            .inner_margin(egui::Margin::same(14))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let (dot, _) =
+                        ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 5.0, status_color);
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new("Состояние").small().weak());
+                        ui.heading(stage.label());
+                    });
+                });
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(hotkey_hint).color(egui::Color32::from_rgb(188, 201, 214)),
+                );
+                ui.add_space(10.0);
+                ui.add(
+                    egui::ProgressBar::new(level.min(1.0))
+                        .desired_width(ui.available_width())
+                        .text(if matches!(stage, Stage::Recording) {
+                            "уровень сигнала"
+                        } else {
+                            ""
+                        }),
+                );
+            });
 
         ui.add_space(10.0);
         ui.separator();

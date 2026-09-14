@@ -27,6 +27,7 @@ mod provider;
 mod providers;
 mod server;
 mod stt;
+mod theme;
 mod updater;
 
 use std::sync::Arc;
@@ -482,6 +483,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             fonts::install(&cc.egui_ctx);
+            theme::install(&cc.egui_ctx);
             macos::set_dock_visible(show_in_dock);
             // Рабочие потоки должны уметь разбудить интерфейс: пока окно
             // скрыто, eframe сам кадры не выполняет, а плашку рисовать надо.
