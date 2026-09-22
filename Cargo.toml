@@ -1,6 +1,6 @@
 [package]
 name = "llm-dict"
-version = "0.15.4"
+version = "0.16.0"
 edition = "2021"
 rust-version = "1.82"
 description = "Диктовка через LLM: горячая клавиша, распознавание речи в облаке, вставка под курсором"
@@ -35,6 +35,11 @@ log = "0.4"
 # ggml — это держалось на везении. Parakeet работает на ONNX и ggml не тянет,
 # поэтому копия остаётся ровно одна.
 parakeet-rs = "0.3"
+
+# GigaAM считается своим кодом поверх той же onnxruntime, что уже слинкована
+# внутри parakeet-rs. Версия обязана совпадать с его зависимостью, иначе в
+# бинарнике окажутся две копии среды выполнения.
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["std"] }
 
 # Локальная языковая модель. Собирается статически, как и whisper.cpp.
 llama-cpp-2 = { version = "0.1.155", default-features = false, features = ["metal"] }

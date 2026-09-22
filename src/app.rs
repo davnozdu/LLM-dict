@@ -1211,6 +1211,11 @@ impl App {
                     "Parakeet определяет язык сам и выбор здесь не учитывает — \
                      он влияет только на облачное распознавание.",
                 );
+            } else if self.cfg.stt.engine == Engine::GigaAm {
+                ui.weak(
+                    "GigaAM знает русский и английский и выбор здесь не учитывает — \
+                     он влияет только на облачное распознавание.",
+                );
             } else if self.cfg.stt.language == "auto" {
                 ui.weak(
                     "Автоопределение стоит лишнего прохода по записи и иногда ошибается \
@@ -1499,6 +1504,7 @@ impl App {
             // Радиокнопка выбирает модель внутри своего движка, а не движок.
             let selected = match spec.engine {
                 Engine::Parakeet => self.cfg.stt.parakeet_model == spec.id,
+                Engine::GigaAm => self.cfg.stt.gigaam_model == spec.id,
                 Engine::Llm => self.cfg.local_llm.model == spec.id,
                 Engine::Cloud => false,
             };
@@ -1508,11 +1514,18 @@ impl App {
                     if ui.radio(selected, spec.title).clicked() {
                         match spec.engine {
                             Engine::Parakeet => self.cfg.stt.parakeet_model = spec.id.to_string(),
+                            Engine::GigaAm => self.cfg.stt.gigaam_model = spec.id.to_string(),
                             Engine::Llm => self.cfg.local_llm.model = spec.id.to_string(),
                             Engine::Cloud => {}
                         }
                     }
                     ui.weak(models::human_size(spec.total_size()));
+                    // В списке распознавания теперь два движка, и по одному
+                    // названию модели не видно, к какому она относится, —
+                    // а выбор в каждом движке свой.
+                    if matches!(spec.engine, Engine::GigaAm | Engine::Parakeet) {
+                        ui.weak(spec.engine.label());
+                    }
                     if installed {
                         ui.colored_label(egui::Color32::from_rgb(60, 160, 90), "скачана");
                     }

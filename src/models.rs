@@ -22,6 +22,10 @@ pub enum Engine {
     /// сбросив заодно всё остальное. Такие конфиги молча переезжают сюда.
     #[serde(alias = "Whisper")]
     Parakeet,
+    /// GigaAM v3 e2e CTC через ONNX Runtime: только русский и английский,
+    /// зато на русском заметно точнее Parakeet и сам расставляет знаки
+    /// препинания. Считается своим кодом — см. `gigaam.rs`.
+    GigaAm,
     /// Локальная языковая модель через llama.cpp. Не распознаёт речь —
     /// обрабатывает уже распознанный текст, поэтому в списке движков
     /// распознавания (`ALL`) её нет.
@@ -33,6 +37,7 @@ impl Engine {
         match self {
             Engine::Cloud => "Groq (облако)",
             Engine::Parakeet => "Parakeet (локально)",
+            Engine::GigaAm => "GigaAM (локально)",
             Engine::Llm => "Локальная языковая модель",
         }
     }
@@ -41,7 +46,7 @@ impl Engine {
         !matches!(self, Engine::Cloud)
     }
 
-    pub const ALL: [Engine; 2] = [Engine::Cloud, Engine::Parakeet];
+    pub const ALL: [Engine; 3] = [Engine::Cloud, Engine::GigaAm, Engine::Parakeet];
 }
 
 pub struct ModelFile {
@@ -88,39 +93,66 @@ impl ModelSpec {
     }
 }
 
-pub static CATALOG: &[ModelSpec] = &[ModelSpec {
-    id: "parakeet-tdt-0.6b-v3-int8",
-    engine: Engine::Parakeet,
-    title: "Parakeet TDT 0.6B v3 (int8)",
-    note: "25 языков с автоопределением, включая русский. \
+pub static CATALOG: &[ModelSpec] = &[
+    ModelSpec {
+        id: "gigaam-v3-e2e-ctc-int8",
+        engine: Engine::GigaAm,
+        title: "GigaAM v3 e2e CTC (int8)",
+        note: "Только русский и английский, зато на русском ошибается втрое реже \
+               Parakeet и сама ставит знаки препинания. Самая быстрая из локальных.",
+        files: &[
+            ModelFile {
+                name: "v3_e2e_ctc.int8.onnx",
+                url: concat!(
+                    "https://huggingface.co/istupakov/gigaam-v3-onnx/resolve/",
+                    "322c3b29492673eb7d0b434bfa9dfb8653e34d02/v3_e2e_ctc.int8.onnx"
+                ),
+                size: 224_893_347,
+            },
+            ModelFile {
+                name: "v3_e2e_ctc_vocab.txt",
+                url: concat!(
+                    "https://huggingface.co/istupakov/gigaam-v3-onnx/resolve/",
+                    "322c3b29492673eb7d0b434bfa9dfb8653e34d02/v3_e2e_ctc_vocab.txt"
+                ),
+                size: 2_007,
+            },
+        ],
+    },
+    ModelSpec {
+        id: "parakeet-tdt-0.6b-v3-int8",
+        engine: Engine::Parakeet,
+        title: "Parakeet TDT 0.6B v3 (int8)",
+        note: "25 языков с автоопределением, включая русский. \
                Считает только реальную длину записи, поэтому на коротких фразах отвечает быстро.",
-    files: &[
-        ModelFile {
-            name: "encoder-model.int8.onnx",
-            url: concat!(
-                "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main",
-                "/encoder-model.int8.onnx"
-            ),
-            size: 652_183_999,
-        },
-        ModelFile {
-            name: "decoder_joint-model.int8.onnx",
-            url: concat!(
-                "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main",
-                "/decoder_joint-model.int8.onnx"
-            ),
-            size: 18_202_004,
-        },
-        ModelFile {
-            name: "vocab.txt",
-            url: concat!(
-                "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main",
-                "/vocab.txt"
-            ),
-            size: 93_939,
-        },
-    ],
-}];
+        files: &[
+            ModelFile {
+                name: "encoder-model.int8.onnx",
+                url: concat!(
+                    "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main",
+                    "/encoder-model.int8.onnx"
+                ),
+                size: 652_183_999,
+            },
+            ModelFile {
+                name: "decoder_joint-model.int8.onnx",
+                url: concat!(
+                    "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main",
+                    "/decoder_joint-model.int8.onnx"
+                ),
+                size: 18_202_004,
+            },
+            ModelFile {
+                name: "vocab.txt",
+                url: concat!(
+                    "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main",
+                    "/vocab.txt"
+                ),
+                size: 93_939,
+            },
+        ],
+    },
+];
 
 /// Языковые модели для локальной обработки текста.
 ///
@@ -289,6 +321,27 @@ mod tests {
     fn старый_выбор_whisper_переезжает_на_parakeet() {
         let engine: Engine = serde_json::from_str("\"Whisper\"").expect("должно читаться");
         assert_eq!(engine, Engine::Parakeet);
+    }
+
+    #[test]
+    fn гигаам_читается_из_настроек() {
+        let engine: Engine = serde_json::from_str("\"GigaAm\"").unwrap();
+        assert_eq!(engine, Engine::GigaAm);
+    }
+
+    /// У каждого локального движка своя загрузка, и модель одного движка в
+    /// другом не заработает: перепутанный движок в каталоге означал бы
+    /// падение при загрузке.
+    #[test]
+    fn модель_гигаам_числится_за_своим_движком() {
+        let spec = find("gigaam-v3-e2e-ctc-int8").expect("модели нет в каталоге");
+        assert_eq!(spec.engine, Engine::GigaAm);
+        let names: Vec<&str> = spec.files.iter().map(|f| f.name).collect();
+        assert!(
+            names.contains(&crate::gigaam::MODEL_FILE),
+            "нет файла модели"
+        );
+        assert!(names.contains(&crate::gigaam::VOCAB_FILE), "нет словаря");
     }
 
     #[test]

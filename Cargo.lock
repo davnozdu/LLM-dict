@@ -2795,7 +2795,7 @@ dependencies = [
 
 [[package]]
 name = "llm-dict"
-version = "0.15.4"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2814,6 +2814,7 @@ dependencies = [
  "objc2 0.6.4",
  "objc2-foundation 0.3.2",
  "open",
+ "ort",
  "parakeet-rs",
  "reqwest",
  "rfd",

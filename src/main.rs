@@ -12,6 +12,7 @@ mod config;
 mod conflicts;
 mod engine;
 mod fonts;
+mod gigaam;
 mod history;
 mod hotkey;
 mod insert;
@@ -61,10 +62,7 @@ fn run_bench(path: &str, language: Option<&str>) -> eframe::Result<()> {
     for engine in models::Engine::ALL {
         let label = engine.label();
         if engine.is_local() {
-            let id = match engine {
-                models::Engine::Parakeet => &cfg.stt.parakeet_model,
-                models::Engine::Cloud | models::Engine::Llm => "",
-            };
+            let id = stt::model_id_for(&cfg.stt, engine);
             match models::find(id) {
                 Some(spec) if !spec.is_installed() => {
                     println!("{label}: модель {id} не скачана, пропускаю\n");

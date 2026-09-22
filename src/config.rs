@@ -86,16 +86,19 @@ pub struct SttConfig {
     /// OpenAI-совместимый эндпоинт. Для локального сервера поменять на http://localhost:...
     pub base_url: String,
     pub model: String,
-    /// Код языка или `auto`. Parakeet его игнорирует — он всегда определяет сам.
+    /// Код языка или `auto`. Локальные движки его игнорируют: Parakeet
+    /// определяет язык сам, GigaAM знает только русский и английский.
     pub language: String,
     /// Подсказка для облачного распознавания: имена, термины, стиль
-    /// пунктуации. Parakeet её не принимает.
+    /// пунктуации. Локальные движки её не принимают.
     pub prompt: String,
     /// Выбранная локальная модель распознавания.
     ///
     /// Старое поле `whisper_model` из прежних настроек просто игнорируется:
     /// serde пропускает незнакомые ключи, и при первом сохранении оно уйдёт.
     pub parakeet_model: String,
+    /// Выбранная модель движка GigaAM.
+    pub gigaam_model: String,
     /// Загружать локальную модель при запуске, не дожидаясь первой диктовки.
     pub preload_local: bool,
 }
@@ -110,6 +113,7 @@ impl Default for SttConfig {
             language: "ru".into(),
             prompt: String::new(),
             parakeet_model: "parakeet-tdt-0.6b-v3-int8".into(),
+            gigaam_model: "gigaam-v3-e2e-ctc-int8".into(),
             preload_local: true,
         }
     }

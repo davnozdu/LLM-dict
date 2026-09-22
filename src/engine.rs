@@ -274,12 +274,9 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
     {
         let cfg = shared.config_snapshot();
         if cfg.stt.preload_local && cfg.stt.engine.is_local() {
-            let id = match cfg.stt.engine {
-                Engine::Parakeet => cfg.stt.parakeet_model.clone(),
-                Engine::Cloud | Engine::Llm => String::new(),
-            };
+            let (engine, id) = crate::stt::selected(&cfg.stt);
             shared.set_stage(Stage::LoadingModel);
-            local.preload(cfg.stt.engine, &id);
+            local.preload(engine, id);
             shared.set_stage(Stage::Idle);
         }
         if cfg.local_llm.keep_loaded && !cfg.local_llm.model.is_empty() {
@@ -312,6 +309,7 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
             match rx.recv_timeout(Duration::from_secs(30)) {
                 Ok(e) => Some(e),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    drop_stale_model(&shared, &mut local);
                     unload_idle(&shared, &mut local);
                     None
                 }
@@ -695,6 +693,28 @@ fn apply_action(
         model: model_id.to_string(),
         local: true,
     })
+}
+
+/// Убирает из памяти модель, которую в настройках больше не выбирают.
+///
+/// Без этого прежняя модель жила бы до таймаута простоя или до следующей
+/// диктовки: сменив движок, пользователь продолжал бы платить за старый
+/// сотнями мегабайт. Порог простоя здесь ни при чём — эта модель не нужна
+/// уже сейчас, сколько бы ей ни оставалось.
+fn drop_stale_model(shared: &Arc<Shared>, local: &mut LocalEngines) {
+    let cfg = shared.config_snapshot();
+    if !local.drop_if_stale(&cfg.stt) {
+        return;
+    }
+
+    // Выбранную модель просили держать наготове — значит, и новую тоже.
+    // Поток всё равно ничем не занят: событие ждали полминуты и не дождались.
+    let (engine, model_id) = crate::stt::selected(&cfg.stt);
+    if cfg.stt.preload_local && engine.is_local() {
+        shared.set_stage(Stage::LoadingModel);
+        local.preload(engine, model_id);
+        shared.set_stage(Stage::Idle);
+    }
 }
 
 /// Выгружает локальные модели, если ими давно не пользовались.
