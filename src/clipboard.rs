@@ -140,6 +140,13 @@ impl History {
     pub fn set_days(&self, days: u32) {
         self.days.store(days, Ordering::Relaxed);
     }
+
+    pub fn clear(&self) -> anyhow::Result<()> {
+        let mut entries = self.entries.lock().unwrap();
+        clear()?;
+        entries.clear();
+        Ok(())
+    }
 }
 
 fn prune(entries: &mut Vec<Entry>, days: u32) {

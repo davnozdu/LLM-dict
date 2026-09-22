@@ -4,6 +4,7 @@
 //! обмена, отправляется синтетическое ⌘V, затем прежнее содержимое буфера
 //! возвращается на место. Требует разрешения «Универсальный доступ».
 
+use crate::pasteboard::Snapshot;
 use anyhow::Result;
 use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
@@ -33,16 +34,10 @@ fn write_unlocked(text: &str) -> Result<i64> {
     Ok(change)
 }
 
-fn restore_unlocked(previous: Option<&str>, expected: i64) -> Result<()> {
+fn restore_unlocked(previous: &Snapshot, expected: i64) -> Result<()> {
     if owns_change(expected, pasteboard_change_count()) {
-        match previous {
-            Some(text) => {
-                write_unlocked(text)?;
-            }
-            None => {
-                arboard::Clipboard::new()?.clear()?;
-                OUR_CHANGE.store(pasteboard_change_count(), Ordering::Relaxed);
-            }
+        if let Some(change) = previous.restore(expected)? {
+            OUR_CHANGE.store(change, Ordering::Relaxed);
         }
     }
     Ok(())
@@ -98,6 +93,7 @@ fn press_cmd(keycode: u16) -> Result<()> {
 /// он сам решает, что положить туда в итоге.
 pub fn copy_selection() -> Result<(String, Option<String>)> {
     let _lock = PASTEBOARD.lock().unwrap();
+    let snapshot = Snapshot::capture()?;
     let previous = read_clipboard();
 
     // Две попытки: первая может уйти в момент, когда программа-получатель ещё
@@ -115,7 +111,7 @@ pub fn copy_selection() -> Result<(String, Option<String>)> {
                 let text = read_clipboard().unwrap_or_default();
                 // Cmd+C — временная операция. Возвращаем буфер до запроса к
                 // модели, поэтому любой последующий отказ уже не теряет его.
-                restore_unlocked(previous.as_deref(), copied)?;
+                restore_unlocked(&snapshot, copied)?;
                 if text.trim().is_empty() {
                     anyhow::bail!("выделенный текст пустой");
                 }
@@ -142,15 +138,16 @@ fn press_cmd_v() -> Result<()> {
 /// Вставляет текст под курсором. Возвращает прежнее содержимое буфера.
 pub fn insert(text: &str, restore_clipboard: bool) -> Result<Option<String>> {
     let _lock = PASTEBOARD.lock().unwrap();
+    let snapshot = restore_clipboard.then(Snapshot::capture).transpose()?;
     let previous = read_clipboard();
-    paste_unlocked(text, restore_clipboard.then(|| previous.clone()), None)?;
+    paste_unlocked(text, snapshot, None)?;
     Ok(previous)
 }
 
 /// При смене приложения результат остаётся в буфере; чужое окно не меняем.
-pub fn insert_into(text: &str, restore: bool, target: i32) -> Result<bool> {
+pub fn insert_into(text: &str, restore: bool, target: &crate::focus::Target) -> Result<bool> {
     let _lock = PASTEBOARD.lock().unwrap();
-    let previous = restore.then(read_clipboard);
+    let previous = restore.then(Snapshot::capture).transpose()?;
     paste_unlocked(text, previous, Some(target))
 }
 
@@ -160,16 +157,10 @@ pub fn insert_into(text: &str, restore: bool, target: i32) -> Result<bool> {
 /// Нужно для замены выделенного: к этому моменту в буфере лежит само
 /// выделение, скопированное нами же, а вернуть надо то, что было у
 /// пользователя до всей операции.
-pub fn insert_restoring(text: &str, restore: Option<String>) -> Result<()> {
-    let _lock = PASTEBOARD.lock().unwrap();
-    paste_unlocked(text, restore.map(Some), None)?;
-    Ok(())
-}
-
 fn paste_unlocked(
     text: &str,
-    restore: Option<Option<String>>,
-    target: Option<i32>,
+    restore: Option<Snapshot>,
+    target: Option<&crate::focus::Target>,
 ) -> Result<bool> {
     let change = write_unlocked(text)?;
 
@@ -179,12 +170,12 @@ fn paste_unlocked(
     if !owns_change(change, pasteboard_change_count()) {
         anyhow::bail!("буфер изменился до вставки; текст не вставлен");
     }
-    if target.is_some_and(|pid| crate::macos::frontmost_app_pid() != Some(pid)) {
+    if target.is_some_and(|target| !target.is_current()) {
         return Ok(false);
     }
     if let Err(e) = press_cmd_v() {
         if let Some(previous) = &restore {
-            let _ = restore_unlocked(previous.as_deref(), change);
+            let _ = restore_unlocked(previous, change);
         }
         return Err(e);
     }
@@ -193,7 +184,7 @@ fn paste_unlocked(
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(400));
             let _lock = PASTEBOARD.lock().unwrap();
-            let _ = restore_unlocked(prev.as_deref(), change);
+            let _ = restore_unlocked(&prev, change);
         });
     }
     Ok(true)

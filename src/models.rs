@@ -5,7 +5,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -242,58 +242,85 @@ impl Progress {
 /// перекачивает целиком — докачка по диапазонам у зеркал HuggingFace
 /// работает не всегда, а тихо получить обрезанный файл хуже, чем подождать.
 pub fn download(spec: &ModelSpec, progress: Arc<Progress>) -> Result<()> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(download_async(spec, &progress))
+}
+
+/// Отмена проверяется и при отсутствии байтов от сервера. Таймаут считается
+/// заново для каждого чтения, поэтому большая загрузка не ограничена целиком.
+async fn interruptible<F: std::future::Future>(
+    future: F,
+    progress: &Progress,
+    timeout: std::time::Duration,
+) -> Result<F::Output> {
+    let mut future = std::pin::pin!(future);
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if progress.cancel.load(Ordering::Relaxed) {
+            bail!("загрузка отменена");
+        }
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .ok_or_else(|| anyhow!("сервер загрузки не передаёт данные"))?;
+        let poll = remaining.min(std::time::Duration::from_millis(100));
+        if let Ok(result) = tokio::time::timeout(poll, future.as_mut()).await {
+            if progress.cancel.load(Ordering::Relaxed) {
+                bail!("загрузка отменена");
+            }
+            return Ok(result);
+        }
+    }
+}
+
+async fn download_async(spec: &ModelSpec, progress: &Progress) -> Result<()> {
     let dir = spec.dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
-
     progress.total.store(spec.total_size(), Ordering::Relaxed);
     progress.downloaded.store(0, Ordering::Relaxed);
-
-    let client = reqwest::blocking::Client::builder()
-        .timeout(None)
-        .connect_timeout(std::time::Duration::from_secs(30))
+    let timeout = std::time::Duration::from_secs(30);
+    let client = reqwest::Client::builder()
+        .connect_timeout(timeout)
         .user_agent(concat!("LLM-dict/", env!("CARGO_PKG_VERSION")))
         .build()?;
-
     for file in spec.files {
+        if progress.cancel.load(Ordering::Relaxed) {
+            bail!("загрузка отменена");
+        }
         let target = dir.join(file.name);
         let done = std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
         if file.size > 0 && done == file.size {
             progress.downloaded.fetch_add(file.size, Ordering::Relaxed);
             continue;
         }
-
-        let tmp = target.with_extension("part");
-        let mut resp = client.get(file.url).send()?.error_for_status()?;
-        let mut out =
-            std::fs::File::create(&tmp).with_context(|| format!("создать {}", tmp.display()))?;
-
-        let mut buf = vec![0u8; 1 << 20];
-        loop {
-            if progress.cancel.load(Ordering::Relaxed) {
-                drop(out);
-                let _ = std::fs::remove_file(&tmp);
-                bail!("загрузка отменена");
+        let mut resp = interruptible(client.get(file.url).send(), progress, timeout)
+            .await??
+            .error_for_status()?;
+        // RAII удаляет неполный файл при отмене, таймауте и ошибке диска.
+        let mut out = tempfile::NamedTempFile::new_in(&dir)?;
+        let mut got = 0u64;
+        while let Some(bytes) = interruptible(resp.chunk(), progress, timeout).await?? {
+            got += bytes.len() as u64;
+            if file.size > 0 && got > file.size {
+                bail!("{}: сервер передал больше ожидаемого размера", file.name);
             }
-            let n = resp.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            out.write_all(&buf[..n])?;
-            progress.downloaded.fetch_add(n as u64, Ordering::Relaxed);
+            out.write_all(&bytes)?;
+            progress
+                .downloaded
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         }
-        out.flush()?;
-        drop(out);
-
-        let got = std::fs::metadata(&tmp)?.len();
         if file.size > 0 && got != file.size {
-            let _ = std::fs::remove_file(&tmp);
             bail!("{}: получено {} байт вместо {}", file.name, got, file.size);
         }
-        std::fs::rename(&tmp, &target)?;
+        out.as_file().sync_all()?;
+        if progress.cancel.load(Ordering::Relaxed) {
+            bail!("загрузка отменена");
+        }
+        out.persist(&target).map_err(|e| e.error)?;
     }
-
     if !spec.is_installed() {
-        return Err(anyhow!("после загрузки часть файлов модели отсутствует"));
+        bail!("после загрузки часть файлов модели отсутствует");
     }
     Ok(())
 }
@@ -311,6 +338,37 @@ pub fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stalled_download_can_be_cancelled_or_time_out() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let progress = Arc::new(Progress::default());
+        let cancel = progress.clone();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            cancel.cancel();
+        });
+        let error = rt
+            .block_on(interruptible(
+                std::future::pending::<()>(),
+                &progress,
+                std::time::Duration::from_secs(1),
+            ))
+            .unwrap_err();
+        worker.join().unwrap();
+        assert!(error.to_string().contains("отменена"));
+        let error = rt
+            .block_on(interruptible(
+                std::future::pending::<()>(),
+                &Progress::default(),
+                std::time::Duration::from_millis(10),
+            ))
+            .unwrap_err();
+        assert!(error.to_string().contains("не передаёт"));
+    }
 
     /// Настройки, сделанные до удаления whisper.cpp, должны читаться.
     ///

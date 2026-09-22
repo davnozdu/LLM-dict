@@ -232,7 +232,7 @@ pub fn run_prompt(
     // Данные идут отдельным системным сообщением, а не внутри промпта: так
     // видно, где инструкция, а где сведения, и промпт остаётся читаемым.
     let mut messages = vec![serde_json::json!({
-        "role": "system", "content": system_prompt
+        "role": "system", "content": crate::typography::prompt(system_prompt)
     })];
     if let Some(context) = context.filter(|c| !c.trim().is_empty()) {
         messages.push(serde_json::json!({
@@ -288,7 +288,7 @@ pub fn run_prompt(
         .choices
         .into_iter()
         .next()
-        .map(|c| c.message.content.trim().to_string())
+        .map(|c| crate::typography::normalize(c.message.content.trim()))
         .filter(|s| !s.is_empty())
         .ok_or_else(|| PromptError::unavailable(anyhow!("модель вернула пустой ответ")))
 }

@@ -92,6 +92,7 @@ pub struct App {
     picker_index: usize,
     /// Куда вернуть фокус после выбора.
     picker_return_pid: Option<i32>,
+    picker_target: Option<crate::focus::Target>,
     /// Когда список открылся. Нужно на случай, если фокус так и не пришёл:
     /// без него список неуправляем, и висеть ему незачем.
     picker_opened: Instant,
@@ -203,6 +204,7 @@ impl App {
             picker_query: String::new(),
             picker_index: 0,
             picker_return_pid: None,
+            picker_target: None,
             picker_opened: long_ago(10),
             picker_focused: false,
             picker_closed: long_ago(10),
@@ -1579,7 +1581,7 @@ impl App {
             }
         }
         if cancel {
-            self.toast("Загрузка отменена");
+            self.toast("Отменяю загрузку...");
         }
 
         ui.weak(format!("Папка моделей: {}", models::models_dir().display()));
@@ -1727,6 +1729,7 @@ impl App {
     /// иначе вставка уйдёт в наше же окно.
     fn open_picker(&mut self, ctx: &egui::Context) {
         self.picker_return_pid = macos::frontmost_app_pid();
+        self.picker_target = crate::focus::Target::capture();
         self.picker = true;
         self.picker_query.clear();
         self.picker_index = 0;
@@ -1794,13 +1797,29 @@ impl App {
     /// Буфер после вставки не восстанавливается: запись должна остаться в нём,
     /// чтобы её можно было вставить ещё раз руками.
     fn paste_from_picker(&mut self, ctx: &egui::Context, text: String) {
+        let target = self.picker_target.take();
         self.close_picker(ctx);
+        let shared = self.shared.clone();
         std::thread::spawn(move || {
             // Ждём, пока система вернёт фокус прежней программе: вставка
             // раньше этого уйдёт в никуда.
-            std::thread::sleep(Duration::from_millis(220));
-            if let Err(e) = insert::insert_restoring(&text, None) {
-                log::warn!("вставка из истории буфера: {e}");
+            let result = (|| -> anyhow::Result<bool> {
+                if let Some(target) = target {
+                    let deadline = Instant::now() + Duration::from_millis(700);
+                    while Instant::now() < deadline {
+                        if target.is_current() {
+                            return insert::insert_into(&text, false, &target);
+                        }
+                        std::thread::sleep(Duration::from_millis(30));
+                    }
+                }
+                insert::write_clipboard(&text)?;
+                Ok(false)
+            })();
+            match result {
+                Ok(true) => {}
+                Ok(false) => shared.notify("Цель вставки не подтверждена, текст в буфере"),
+                Err(e) => shared.notify(format!("Не вставить из истории: {e}")),
             }
         });
     }
@@ -2488,9 +2507,10 @@ impl App {
             ui.selectable_value(&mut self.filter, HistoryFilter::Errors, "Ошибки");
             ui.separator();
             if ui.button("Очистить историю").clicked() {
-                let _ = history::clear();
-                self.shared.history.lock().unwrap().clear();
-                self.toast("История очищена");
+                match self.shared.clear_history() {
+                    Ok(()) => self.toast("История очищена"),
+                    Err(e) => self.toast(format!("Не очистить историю: {e}")),
+                }
             }
         });
         ui.add_space(6.0);
@@ -2530,7 +2550,8 @@ impl App {
 
                     if let Some(err) = &e.error {
                         ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
-                    } else {
+                    }
+                    if !e.final_text.is_empty() {
                         ui.label(&e.final_text);
                         if e.was_transformed() {
                             ui.collapsing("Исходное распознавание", |ui| {
@@ -2580,9 +2601,10 @@ impl App {
 
         ui.horizontal(|ui| {
             if ui.button("Очистить историю").clicked() {
-                let _ = crate::clipboard::clear();
-                self.shared.clipboard.entries.lock().unwrap().clear();
-                self.toast("История буфера очищена");
+                match self.shared.clipboard.clear() {
+                    Ok(()) => self.toast("История буфера очищена"),
+                    Err(e) => self.toast(format!("Не очистить историю буфера: {e}")),
+                }
             }
             let days = self.cfg.general.clipboard_days;
             if days > 0 {

@@ -96,5 +96,39 @@ pub fn mark_offline() {
 
 /// Локальный адрес работает и без сети.
 pub fn is_local_url(url: &str) -> bool {
-    url.contains("localhost") || url.contains("127.0.0.1") || url.contains("0.0.0.0")
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") || host.eq_ignore_ascii_case("localhost.") {
+        return true;
+    }
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn locality_uses_host_including_ipv6() {
+        for url in [
+            "http://[::1]:11434/v1",
+            "http://127.0.0.2/v1",
+            "http://localhost/v1",
+        ] {
+            assert!(super::is_local_url(url), "{url}");
+        }
+        for url in [
+            "https://localhost.example.com/v1",
+            "https://example.com/127.0.0.1",
+            "https://localhost@example.com/v1",
+            "not a URL",
+        ] {
+            assert!(!super::is_local_url(url), "{url}");
+        }
+    }
 }

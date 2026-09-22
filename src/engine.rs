@@ -158,6 +158,13 @@ impl Shared {
         self.dirty.store(true, Ordering::Relaxed);
     }
 
+    pub fn clear_history(&self) -> anyhow::Result<()> {
+        let mut history = self.history.lock().unwrap();
+        crate::history::clear()?;
+        history.clear();
+        Ok(())
+    }
+
     pub fn set_wake(&self, f: Box<dyn Fn() + Send + Sync>) {
         *self.wake.lock().unwrap() = Some(f);
     }
@@ -453,6 +460,7 @@ struct Outcome {
     /// Чем обработан текст после распознавания. При откате это локальная
     /// модель, и по истории должно быть видно, что сработал именно откат.
     llm_model: Option<String>,
+    insertion_error: Option<String>,
 }
 
 /// Все сочетания, кроме диктовки: действия над текстом и окно буфера.
@@ -808,8 +816,18 @@ fn process(
         }
     }
 
+    // Применяется и без LLM, и при отказе обработки с возвратом к STT.
+    // Исходное распознавание остаётся в истории без изменений.
+    let final_text = crate::typography::normalize(&final_text);
     shared.set_stage(Stage::Inserting);
-    let clipboard_before = insert::insert(&final_text, cfg.general.restore_clipboard)?;
+    let (clipboard_before, insertion_error) =
+        match insert::insert(&final_text, cfg.general.restore_clipboard) {
+            Ok(previous) => (previous, None),
+            Err(e) => (
+                None,
+                Some(format!("Текст сохранён в истории, но не вставлен: {e}")),
+            ),
+        };
 
     Ok(Outcome {
         raw_text,
@@ -818,6 +836,7 @@ fn process(
         clipboard_before,
         engine: used_engine,
         llm_model: used_llm,
+        insertion_error,
     })
 }
 
@@ -832,7 +851,10 @@ fn record_result(
     let entry = match result {
         Ok(out) => {
             *shared.last_text.lock().unwrap() = Some(out.final_text.clone());
-            shared.set_error(None);
+            shared.set_error(out.insertion_error.clone());
+            if let Some(error) = &out.insertion_error {
+                shared.notify(error.clone());
+            }
             history::Entry {
                 at: chrono::Local::now(),
                 duration_secs: out.duration_secs,
@@ -846,7 +868,7 @@ fn record_result(
                 llm_model: out.llm_model,
                 latency_ms,
                 clipboard_before: out.clipboard_before,
-                error: None,
+                error: out.insertion_error,
                 engine: Some(out.engine.label().to_string()),
             }
         }
@@ -881,6 +903,7 @@ fn run_action(shared: &Arc<Shared>, id: &str) {
     {
         shared.set_stage(Stage::ActionRunning);
         let target = crate::macos::frontmost_app_pid();
+        let selection_target = crate::focus::Target::capture();
         shared.set_error(None);
         if cfg.general.play_sounds {
             insert::play_sound("Tink");
@@ -930,11 +953,13 @@ fn run_action(shared: &Arc<Shared>, id: &str) {
                 crate::actions::Output::Replace => {
                     // Возвращаем в буфер то, что там было до нашего ⌘C,
                     // а не скопированное выделение.
-                    replaced = insert::insert_into(
-                        &result,
-                        cfg.general.restore_clipboard,
-                        target.unwrap(),
-                    )?;
+                    if let Some(target) = &selection_target {
+                        replaced =
+                            insert::insert_into(&result, cfg.general.restore_clipboard, target)?;
+                    } else {
+                        // Нельзя подтвердить выделение через Accessibility.
+                        insert::write_clipboard(&result)?;
+                    }
                 }
                 crate::actions::Output::Clipboard => {
                     insert::write_clipboard(&result)?;
@@ -957,7 +982,10 @@ fn run_action(shared: &Arc<Shared>, id: &str) {
                         format!("{} — готово", action.name)
                     }
                     crate::actions::Output::Replace => {
-                        format!("{} — окно сменилось, результат в буфере", action.name)
+                        format!(
+                            "{}: цель вставки не подтверждена, результат в буфере",
+                            action.name
+                        )
                     }
                 };
                 shared.notify(note);

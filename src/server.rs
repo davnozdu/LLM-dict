@@ -87,17 +87,31 @@ pub fn start(shared: Arc<Shared>) {
     };
     log::info!("локальный эндпоинт слушает http://{addr}/v1");
 
+    // Ограниченный пул: запросы не создают неограниченное число потоков.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Request>(4);
+    let rx = Arc::new(std::sync::Mutex::new(rx));
+    for _ in 0..4 {
+        let shared = shared.clone();
+        let rx = rx.clone();
+        std::thread::spawn(move || loop {
+            let request = { rx.lock().unwrap().recv() };
+            let Ok(request) = request else {
+                break;
+            };
+            if let Err(e) = handle(&shared, request) {
+                log::warn!("локальный эндпоинт: {e}");
+            }
+        });
+    }
     std::thread::spawn(move || {
         for request in server.incoming_requests() {
-            let shared = shared.clone();
-            // Каждый запрос в своём потоке, но модель под общим мьютексом:
-            // очередь всё равно одна, зато медленный клиент не мешает
-            // остальным получить отказ.
-            std::thread::spawn(move || {
-                if let Err(e) = handle(&shared, request) {
-                    log::warn!("локальный эндпоинт: {e}");
-                }
-            });
+            if let Err(e) = tx.try_send(request) {
+                let request = match e {
+                    std::sync::mpsc::TrySendError::Full(r)
+                    | std::sync::mpsc::TrySendError::Disconnected(r) => r,
+                };
+                let _ = request.respond(error_response(503, "очередь сервера заполнена"));
+            }
         }
     });
 }
@@ -204,12 +218,26 @@ fn now() -> u64 {
 }
 
 fn chat(shared: &Arc<Shared>, mut request: Request, model_id: &str) -> anyhow::Result<()> {
+    use std::io::Read;
+    const MAX_BODY: usize = 1024 * 1024;
+    if request.body_length().is_some_and(|n| n > MAX_BODY) {
+        return Ok(request.respond(error_response(413, "слишком большой запрос"))?);
+    }
     let mut body = String::new();
-    request.as_reader().read_to_string(&mut body)?;
+    request
+        .as_reader()
+        .take((MAX_BODY + 1) as u64)
+        .read_to_string(&mut body)?;
+    if body.len() > MAX_BODY {
+        return Ok(request.respond(error_response(413, "слишком большой запрос"))?);
+    }
     let parsed: ChatRequest = match serde_json::from_str(&body) {
         Ok(p) => p,
         Err(e) => return Ok(request.respond(error_response(400, &format!("разбор запроса: {e}")))?),
     };
+    if parsed.max_tokens.is_some_and(|n| n == 0 || n > 32768) {
+        return Ok(request.respond(error_response(400, "max_tokens должен быть от 1 до 32768"))?);
+    }
     if parsed.messages.is_empty() {
         return Ok(request.respond(error_response(400, "пустой список сообщений"))?);
     }
@@ -232,26 +260,31 @@ fn chat(shared: &Arc<Shared>, mut request: Request, model_id: &str) -> anyhow::R
         ))?);
     }
 
-    let mut llm = shared.llm.lock().unwrap();
-    if let Err(e) = llm.ensure(model_id) {
-        return Ok(request.respond(error_response(503, &e.to_string()))?);
-    }
-
     if parsed.stream {
-        stream_response(&mut llm, request, model_id, &turns, parsed.max_tokens)
+        stream_response(shared, request, model_id, &turns, parsed.max_tokens)
     } else {
-        let out = llm.chat_raw(model_id, &turns, parsed.max_tokens, |_| {});
+        let Ok(mut llm) = shared.llm.try_lock() else {
+            return Ok(request.respond(error_response(503, "модель занята, повторите запрос"))?);
+        };
+        if shared.stage() != Stage::Idle {
+            drop(llm);
+            return Ok(request.respond(error_response(503, "приложение занято"))?);
+        }
+        let out = llm.chat_raw(model_id, &turns, parsed.max_tokens, |_| {
+            shared.stage() == Stage::Idle
+        });
+        drop(llm); // Сеть никогда не удерживает модель.
         match out {
-            Ok(text) => {
-                let body = completion_json(model_id, &text);
+            Ok(out) => {
+                let body = completion_json(model_id, &out);
                 Ok(request.respond(Response::from_string(body).with_header(json_header()))?)
             }
-            Err(e) => Ok(request.respond(error_response(500, &e.to_string()))?),
+            Err(e) => Ok(request.respond(error_response(503, &e.to_string()))?),
         }
     }
 }
 
-fn completion_json(model_id: &str, text: &str) -> String {
+fn completion_json(model_id: &str, out: &crate::local_llm::Generated) -> String {
     serde_json::json!({
         "id": format!("chatcmpl-{}", now()),
         "object": "chat.completion",
@@ -259,8 +292,8 @@ fn completion_json(model_id: &str, text: &str) -> String {
         "model": model_id,
         "choices": [{
             "index": 0,
-            "message": { "role": "assistant", "content": text },
-            "finish_reason": "stop",
+            "message": { "role": "assistant", "content": out.raw },
+            "finish_reason": out.finish_reason(),
         }],
     })
     .to_string()
@@ -271,27 +304,33 @@ fn completion_json(model_id: &str, text: &str) -> String {
 /// Пишем прямо в сокет: держать весь ответ в памяти и отдать разом означало бы
 /// потерять смысл потока.
 fn stream_response(
-    llm: &mut crate::local_llm::LocalLlm,
+    shared: &Arc<Shared>,
     request: Request,
     model_id: &str,
     turns: &[Turn],
     max_tokens: Option<usize>,
 ) -> anyhow::Result<()> {
     use std::io::Write;
-
+    let Ok(mut llm) = shared.llm.try_lock() else {
+        return Ok(request.respond(error_response(503, "модель занята, повторите запрос"))?);
+    };
+    if shared.stage() != Stage::Idle {
+        drop(llm);
+        return Ok(request.respond(error_response(503, "приложение занято"))?);
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel::<String>(64);
     let mut writer = request.into_writer();
-    let head = "HTTP/1.1 200 OK\r\n\
-                Content-Type: text/event-stream; charset=utf-8\r\n\
-                Cache-Control: no-cache\r\n\
-                Connection: close\r\n\r\n";
-    writer.write_all(head.as_bytes())?;
-    writer.flush()?;
-
+    let sender = std::thread::spawn(move || -> std::io::Result<()> {
+        writer.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
+        writer.flush()?;
+        for chunk in rx {
+            writer.write_all(chunk.as_bytes())?;
+            writer.flush()?;
+        }
+        Ok(())
+    });
     let id = format!("chatcmpl-{}", now());
     let created = now();
-    let mut failed: Option<std::io::Error> = None;
-
-    // Первый кусок несёт роль — этого ждут клиенты OpenAI.
     let opening = sse_chunk(
         &id,
         created,
@@ -299,49 +338,43 @@ fn stream_response(
         serde_json::json!({"role": "assistant"}),
         None,
     );
-    if let Err(e) = writer.write_all(opening.as_bytes()) {
-        failed = Some(e);
-    }
-
+    let _ = tx.try_send(opening);
     let result = llm.chat_raw(model_id, turns, max_tokens, |piece| {
-        if failed.is_some() {
-            return;
+        if shared.stage() != Stage::Idle || sender.is_finished() {
+            return false;
         }
-        let chunk = sse_chunk(
+        piece.is_empty()
+            || tx
+                .try_send(sse_chunk(
+                    &id,
+                    created,
+                    model_id,
+                    serde_json::json!({"content": piece}),
+                    None,
+                ))
+                .is_ok()
+    });
+    drop(llm);
+    let closing = match result {
+        Ok(out) => sse_chunk(
             &id,
             created,
             model_id,
-            serde_json::json!({ "content": piece }),
-            None,
-        );
-        if let Err(e) = writer
-            .write_all(chunk.as_bytes())
-            .and_then(|()| writer.flush())
-        {
-            // Клиент отвалился — дописывать некуда, но генерацию оборвать
-            // отсюда нельзя: она докрутит до конца и просто никому не уйдёт.
-            failed = Some(e);
-        }
-    });
-
-    if let Some(e) = failed {
-        log::info!("клиент закрыл поток: {e}");
-        return Ok(());
+            serde_json::json!({}),
+            Some(out.finish_reason()),
+        ),
+        Err(e) => format!(
+            "data: {}\n\n",
+            serde_json::json!({"error": {"message": e.to_string()}})
+        ),
+    };
+    // Очередь уже не держит модель. Закрытый/медленный клиент не мешает диктовке.
+    let _ = tx.try_send(format!("{closing}data: [DONE]\n\n"));
+    drop(tx);
+    match sender.join() {
+        Ok(result) => Ok(result?),
+        Err(_) => anyhow::bail!("поток отправки ответа завершился аварийно"),
     }
-    if let Err(e) = result {
-        // Ошибку в уже начатом потоке передать нечем, кроме как событием.
-        let msg = serde_json::json!({ "error": { "message": e.to_string() } }).to_string();
-        let _ = writer.write_all(format!("data: {msg}\n\n").as_bytes());
-        let _ = writer.write_all(b"data: [DONE]\n\n");
-        let _ = writer.flush();
-        return Ok(());
-    }
-
-    let closing = sse_chunk(&id, created, model_id, serde_json::json!({}), Some("stop"));
-    writer.write_all(closing.as_bytes())?;
-    writer.write_all(b"data: [DONE]\n\n")?;
-    writer.flush()?;
-    Ok(())
 }
 
 fn sse_chunk(
@@ -359,4 +392,32 @@ fn sse_chunk(
         "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }],
     });
     format!("data: {payload}\n\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reports_truncation_in_json_and_stream() {
+        for (hit_budget, reason) in [(false, "stop"), (true, "length")] {
+            let out = crate::local_llm::Generated {
+                raw: "текст".into(),
+                hit_budget,
+            };
+            let json: serde_json::Value =
+                serde_json::from_str(&completion_json("test", &out)).unwrap();
+            assert_eq!(json["choices"][0]["finish_reason"], reason);
+            let chunk = sse_chunk(
+                "test",
+                1,
+                "test",
+                serde_json::json!({}),
+                Some(out.finish_reason()),
+            );
+            let json: serde_json::Value =
+                serde_json::from_str(chunk.trim().strip_prefix("data: ").unwrap()).unwrap();
+            assert_eq!(json["choices"][0]["finish_reason"], reason);
+        }
+    }
 }

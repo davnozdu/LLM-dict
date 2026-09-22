@@ -2795,7 +2795,7 @@ dependencies = [
 
 [[package]]
 name = "llm-dict"
-version = "0.16.1"
+version = "0.16.2"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2820,7 +2820,9 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "tempfile",
  "tiny_http",
+ "tokio",
  "toml 1.1.4+spec-1.1.0",
  "tray-icon",
 ]

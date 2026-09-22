@@ -177,7 +177,7 @@ impl Corrector {
     }
 
     fn build_prompt(&self, system: &str, context: Option<&str>, text: &str) -> Result<String> {
-        let mut instruction = system.to_string();
+        let mut instruction = crate::typography::prompt(system);
         // Сведения идут в ту же системную часть, что и инструкция. Облако
         // кладёт их отдельным сообщением, но здесь это ничего не меняет:
         // шаблоны части моделей второе системное сообщение не принимают.
@@ -218,14 +218,16 @@ impl Corrector {
         guard: Guard,
     ) -> Result<String> {
         let g = self.generate(system, context, text)?;
-        sanitize(text, &g, guard).map_err(|r| anyhow!("{}", r.explain()))
+        sanitize(text, &g, guard)
+            .map(|text| crate::typography::normalize(&text))
+            .map_err(|r| anyhow!("{}", r.explain()))
     }
 
     fn generate(&self, system: &str, context: Option<&str>, text: &str) -> Result<Generated> {
         let prompt = self.build_prompt(system, context, text)?;
         // Потолок генерации: правка не бывает многократно длиннее входа.
         let budget = |n: usize| n * 2 + 256;
-        self.run_prompt(prompt, budget, |_| {})
+        self.run_prompt(prompt, budget, |_| true)
     }
 
     /// Беседа произвольной формы: то, что приходит снаружи через
@@ -239,7 +241,7 @@ impl Corrector {
         &self,
         turns: &[Turn],
         max_tokens: Option<usize>,
-        on_token: impl FnMut(&str),
+        on_token: impl FnMut(&str) -> bool,
     ) -> Result<Generated> {
         let prompt = self.render_chat(turns)?;
         let budget = move |n: usize| max_tokens.unwrap_or(n * 2 + 512);
@@ -251,7 +253,7 @@ impl Corrector {
         &self,
         prompt: String,
         budget_for: impl Fn(usize) -> usize,
-        mut on_token: impl FnMut(&str),
+        mut on_token: impl FnMut(&str) -> bool,
     ) -> Result<Generated> {
         // BOS не добавляем: если модель его требует, он уже есть в шаблоне.
         let tokens = self
@@ -262,21 +264,11 @@ impl Corrector {
             bail!("пустой запрос");
         }
         // Без потолка зациклившаяся модель молотит до конца контекста.
-        let budget = budget_for(tokens.len()).max(16);
-
-        // Контекст под конкретный запрос, а не всегда самый большой: KV-кеш
-        // занимает память пропорционально размеру, и держать 32k ради фразы
-        // в двадцать слов незачем.
-        let needed = (tokens.len() + budget + 64) as u32;
-        if needed > N_CTX_MAX {
-            bail!(
-                "запрос не влезает в контекст локальной модели: {} токенов при пределе {}",
-                tokens.len(),
-                N_CTX_MAX
-            );
+        let budget = budget_for(tokens.len());
+        let (n_ctx, budget) = generation_limits(tokens.len(), budget)?;
+        if !on_token("") {
+            bail!("генерация отменена");
         }
-        let n_ctx = needed.max(N_CTX_MIN).next_power_of_two().min(N_CTX_MAX);
-        let budget = budget.min((n_ctx as usize).saturating_sub(tokens.len() + 4));
 
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(n_ctx))
@@ -286,12 +278,19 @@ impl Corrector {
             .new_context(backend()?, ctx_params)
             .map_err(|e| anyhow!("не создать контекст: {e}"))?;
 
-        let mut batch = LlamaBatch::new(tokens.len().max(512), 1);
+        let mut batch = LlamaBatch::new(512, 1);
         let last = tokens.len() - 1;
-        for (i, t) in tokens.iter().enumerate() {
-            batch.add(*t, i as i32, &[0], i == last)?;
+        for (chunk_index, chunk) in tokens.chunks(512).enumerate() {
+            if !on_token("") {
+                bail!("генерация отменена");
+            }
+            batch.clear();
+            for (offset, token) in chunk.iter().enumerate() {
+                let i = chunk_index * 512 + offset;
+                batch.add(*token, i as i32, &[0], i == last)?;
+            }
+            ctx.decode(&mut batch)?;
         }
-        ctx.decode(&mut batch)?;
 
         // Жадный выбор: правка должна быть воспроизводимой.
         let mut sampler = LlamaSampler::chain_simple([LlamaSampler::greedy()]);
@@ -305,6 +304,9 @@ impl Corrector {
         let mut produced = 0usize;
 
         while produced < budget {
+            if !on_token("") {
+                bail!("генерация отменена");
+            }
             let token = sampler.sample(&ctx, -1);
             sampler.accept(token);
             if self.model.is_eog_token(token) {
@@ -316,7 +318,9 @@ impl Corrector {
             // Отдаём только то, что уже складывается в целые символы.
             if let Some(chunk) = complete_utf8(&out[sent..]) {
                 if !chunk.is_empty() {
-                    on_token(chunk);
+                    if !on_token(chunk) {
+                        bail!("генерация отменена");
+                    }
                     sent += chunk.len();
                 }
             }
@@ -333,10 +337,36 @@ impl Corrector {
     }
 }
 
+fn generation_limits(input: usize, budget: usize) -> Result<(u32, usize)> {
+    if budget == 0 {
+        bail!("max_tokens должен быть больше нуля");
+    }
+    let needed = input
+        .checked_add(budget)
+        .and_then(|n| n.checked_add(64))
+        .filter(|n| *n <= N_CTX_MAX as usize)
+        .ok_or_else(|| anyhow!("запрос и ответ не влезают в контекст из {N_CTX_MAX} токенов"))?;
+    let n_ctx = (needed as u32)
+        .max(N_CTX_MIN)
+        .next_power_of_two()
+        .min(N_CTX_MAX);
+    Ok((n_ctx, budget))
+}
+
 pub struct Generated {
     pub raw: String,
     /// Модель упёрлась в потолок, то есть не остановилась сама.
     pub hit_budget: bool,
+}
+
+impl Generated {
+    pub fn finish_reason(&self) -> &'static str {
+        if self.hit_budget {
+            "length"
+        } else {
+            "stop"
+        }
+    }
 }
 
 /// Почему ответ модели забракован.
@@ -373,6 +403,18 @@ pub fn sanitize(input: &str, g: &Generated, guard: Guard) -> Result<String, Reje
     }
     let mut s = s.trim().to_string();
 
+    // В произвольной задаче кавычки, блок кода и слово «Ответ:» могут быть
+    // частью требуемого формата. Чистка корректуры к ним неприменима.
+    if guard == Guard::FreeForm {
+        if s.is_empty() {
+            return Err(Reject::Empty);
+        }
+        if g.hit_budget {
+            return Err(Reject::Runaway);
+        }
+        return Ok(s);
+    }
+
     // Ответ, завёрнутый в блок кода или кавычки.
     for fence in ["```text", "```markdown", "```"] {
         if s.starts_with(fence) {
@@ -395,12 +437,7 @@ pub fn sanitize(input: &str, g: &Generated, guard: Guard) -> Result<String, Reje
     if g.hit_budget {
         return Err(Reject::Runaway);
     }
-    // Дальше — проверки, осмысленные только для правки: там выход обязан
-    // походить на вход. Для перевода или ответа по данным он по замыслу
-    // другой, и мерить его длиной входа значило бы браковать исправное.
-    if guard == Guard::FreeForm {
-        return Ok(s);
-    }
+    // Для корректуры выход должен походить на исходный текст.
     // Длина: правка пунктуации не меняет объём текста на треть.
     let (a, b) = (input.chars().count() as f32, s.chars().count() as f32);
     if b < a * 0.7 || b > a * 1.35 {
@@ -445,6 +482,64 @@ fn complete_utf8(bytes: &[u8]) -> Option<&str> {
 
 fn is_cyrillic(c: char) -> bool {
     ('\u{0400}'..='\u{04FF}').contains(&c)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_token_budget_is_exact_and_checked() {
+        assert_eq!(generation_limits(100, 1).unwrap(), (4096, 1));
+        assert_eq!(generation_limits(100, 15).unwrap(), (4096, 15));
+        assert!(generation_limits(100, 0).is_err());
+        assert!(generation_limits(100, usize::MAX).is_err());
+        assert!(generation_limits(32700, 100).is_err());
+    }
+
+    #[test]
+    fn free_form_preserves_quotes_code_and_meaningful_prefix() {
+        for text in ["\"hello\"", "Ответ: 42", "```json\n{\"ok\": true}\n```"] {
+            let generated = Generated {
+                raw: text.into(),
+                hit_budget: false,
+            };
+            let result = sanitize("Сохрани формат", &generated, Guard::FreeForm).unwrap();
+            assert_eq!(crate::typography::normalize(&result), text);
+        }
+    }
+
+    #[test]
+    fn free_form_still_rejects_empty_and_truncated_answers() {
+        let empty = Generated {
+            raw: "<think>thinking</think>  ".into(),
+            hit_budget: false,
+        };
+        assert_eq!(
+            sanitize("текст", &empty, Guard::FreeForm),
+            Err(Reject::Empty)
+        );
+        let truncated = Generated {
+            raw: "Незаконченный ответ".into(),
+            hit_budget: true,
+        };
+        assert_eq!(
+            sanitize("текст", &truncated, Guard::FreeForm),
+            Err(Reject::Runaway)
+        );
+    }
+
+    #[test]
+    fn correction_still_removes_model_wrappers() {
+        let generated = Generated {
+            raw: "Исправленный текст: Привет, мир!".into(),
+            hit_budget: false,
+        };
+        assert_eq!(
+            sanitize("Привет мир", &generated, Guard::Correction).unwrap(),
+            "Привет, мир!"
+        );
+    }
 }
 
 /// Загруженная языковая модель и отсчёт её простоя.
@@ -506,15 +601,14 @@ impl LocalLlm {
         model_id: &str,
         turns: &[Turn],
         max_tokens: Option<usize>,
-        on_token: impl FnMut(&str),
-    ) -> Result<String> {
+        on_token: impl FnMut(&str) -> bool,
+    ) -> Result<Generated> {
         self.ensure(model_id)?;
         let out = self
             .loaded
             .as_ref()
             .ok_or_else(|| anyhow!("локальная модель не загружена"))?
-            .chat(turns, max_tokens, on_token)
-            .map(|g| g.raw);
+            .chat(turns, max_tokens, on_token);
         self.last_used = Some(Instant::now());
         out
     }
