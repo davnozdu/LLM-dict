@@ -2795,7 +2795,7 @@ dependencies = [
 
 [[package]]
 name = "llm-dict"
-version = "0.16.2"
+version = "0.16.3"
 dependencies = [
  "anyhow",
  "arboard",
