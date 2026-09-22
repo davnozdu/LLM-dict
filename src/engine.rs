@@ -54,7 +54,7 @@ pub struct Shared {
     pub level: Arc<audio::Level>,
     pub last_error: Mutex<Option<String>>,
     pub last_text: Mutex<Option<String>>,
-    pub history: Mutex<Vec<history::Entry>>,
+    pub history: Mutex<Vec<Arc<history::Entry>>>,
     pub hotkey_state: Arc<HotKeyState>,
     pub tap_running: AtomicBool,
     /// Ключ из Keychain уже прочитан: до этого пустое поле означает
@@ -106,7 +106,7 @@ impl Shared {
             level: Arc::new(audio::Level::default()),
             last_error: Mutex::new(load_error),
             last_text: Mutex::new(None),
-            history: Mutex::new(history::load(limit)),
+            history: Mutex::new(history::load(limit).into_iter().map(Arc::new).collect()),
             hotkey_state,
             tap_running: AtomicBool::new(false),
             key_loaded: AtomicBool::new(false),
@@ -150,11 +150,16 @@ impl Shared {
 
     fn add_history(&self, entry: history::Entry, limit: usize) {
         let mut hist = self.history.lock().unwrap();
-        if let Err(e) = history::append(&entry).and_then(|()| history::trim(limit)) {
+        let appended = if hist.len() < limit {
+            Some(history::append(&entry))
+        } else {
+            None
+        };
+        hist.insert(0, Arc::new(entry));
+        hist.truncate(limit);
+        if let Err(e) = appended.unwrap_or_else(|| history::replace(&hist)) {
             log::warn!("не сохранить историю: {e}");
         }
-        hist.insert(0, entry);
-        hist.truncate(limit);
         self.dirty.store(true, Ordering::Relaxed);
     }
 
@@ -928,6 +933,7 @@ fn run_action(shared: &Arc<Shared>, id: &str) {
 
         let started = Instant::now();
         let mut replaced = false;
+        let mut insertion_error = None;
         let outcome = (|| -> anyhow::Result<(String, Option<String>, String, bool)> {
             if target.is_none() || crate::macos::frontmost_app_pid() != target {
                 anyhow::bail!("активное приложение сменилось — повторите действие");
@@ -949,25 +955,32 @@ fn run_action(shared: &Arc<Shared>, id: &str) {
             let done = apply_action(shared, &cfg, &action, &key, context.as_deref(), &selection)?;
             let result = done.text;
 
-            match action.output {
-                crate::actions::Output::Replace => {
-                    // Возвращаем в буфер то, что там было до нашего ⌘C,
-                    // а не скопированное выделение.
-                    if let Some(target) = &selection_target {
-                        replaced =
-                            insert::insert_into(&result, cfg.general.restore_clipboard, target)?;
-                    } else {
-                        // Нельзя подтвердить выделение через Accessibility.
+            let insertion = (|| -> anyhow::Result<()> {
+                match action.output {
+                    crate::actions::Output::Replace => {
+                        // Возвращаем в буфер то, что там было до нашего ⌘C,
+                        // а не скопированное выделение.
+                        if let Some(target) = &selection_target {
+                            replaced = insert::insert_into(
+                                &result,
+                                cfg.general.restore_clipboard,
+                                target,
+                            )?;
+                        } else {
+                            // Нельзя подтвердить выделение через Accessibility.
+                            insert::write_clipboard(&result)?;
+                        }
+                    }
+                    crate::actions::Output::Clipboard => {
                         insert::write_clipboard(&result)?;
                     }
                 }
-                crate::actions::Output::Clipboard => {
-                    insert::write_clipboard(&result)?;
-                }
-            }
-            // Прежнее содержимое буфера мы затёрли своим же ⌘C. Вернуть его
-            // нельзя — там теперь результат, — но в истории оно сохранится,
-            // и на вкладке «Буфер» его можно достать обратно.
+                Ok(())
+            })();
+            insertion_error = insertion
+                .err()
+                .map(|e| format!("Не вставить результат: {e}"));
+            // История сохраняет результат даже при ошибке вставки.
             Ok((result, previous, done.model, done.local))
         })();
 
@@ -988,7 +1001,12 @@ fn run_action(shared: &Arc<Shared>, id: &str) {
                         )
                     }
                 };
-                shared.notify(note);
+                if let Some(error) = &insertion_error {
+                    shared.set_error(Some(error.clone()));
+                    shared.notify(format!("{error}. Текст сохранён в истории."));
+                } else {
+                    shared.notify(note);
+                }
                 *shared.last_text.lock().unwrap() = Some(text.clone());
                 let entry = history::Entry {
                     at: chrono::Local::now(),
@@ -1001,7 +1019,7 @@ fn run_action(shared: &Arc<Shared>, id: &str) {
                     llm_model: Some(used_model),
                     latency_ms,
                     clipboard_before,
-                    error: None,
+                    error: insertion_error,
                     engine: Some(if went_local {
                         crate::provider::Provider::Local.label().to_string()
                     } else {

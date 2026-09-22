@@ -4,7 +4,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,16 +42,7 @@ pub fn load(limit: usize) -> Vec<Entry> {
     let Ok(file) = std::fs::File::open(history_path()) else {
         return Vec::new();
     };
-    let mut entries: Vec<Entry> = BufReader::new(file)
-        .lines()
-        .map_while(Result::ok)
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(&l).ok())
-        .collect();
-    // Новые сверху.
-    entries.reverse();
-    entries.truncate(limit);
-    entries
+    crate::persistence::recent_json(BufReader::new(file), limit)
 }
 
 pub fn append(entry: &Entry) -> Result<()> {
@@ -73,17 +64,11 @@ pub fn clear() -> Result<()> {
     Ok(())
 }
 
-/// Обрезает файл до последних `limit` записей.
-pub fn trim(limit: usize) -> Result<()> {
-    let mut entries = load(usize::MAX);
-    if entries.len() <= limit {
-        return Ok(());
-    }
-    entries.truncate(limit);
-    entries.reverse(); // обратно в хронологический порядок
+/// Writes the already bounded in-memory snapshot, newest first.
+pub fn replace(entries: &[std::sync::Arc<Entry>]) -> Result<()> {
     let mut out = String::new();
-    for e in &entries {
-        out.push_str(&serde_json::to_string(e)?);
+    for e in entries.iter().rev() {
+        out.push_str(&serde_json::to_string(e.as_ref())?);
         out.push('\n');
     }
     crate::persistence::atomic_write(&history_path(), out.as_bytes())?;

@@ -159,14 +159,13 @@ pub fn start(level: Arc<Level>) -> Result<Recording> {
             let prev = level_cb.get();
             level_cb.set(if peak > prev { peak } else { prev * 0.85 });
 
-            let mut out = Vec::new();
-            dm.push(data, &mut out);
             if let Ok(mut b) = buf_cb.lock() {
-                b.extend_from_slice(&out);
+                dm.push(data, &mut b);
             }
         };
 
         let err_fn = |e| log::error!("ошибка потока записи: {e}");
+        let mut converted = Vec::new();
         let stream = match sample_format {
             cpal::SampleFormat::F32 => device.build_input_stream(
                 config,
@@ -177,8 +176,9 @@ pub fn start(level: Arc<Level>) -> Result<Recording> {
             cpal::SampleFormat::I16 => device.build_input_stream(
                 config,
                 move |data: &[i16], _: &_| {
-                    let f: Vec<f32> = data.iter().map(|s| *s as f32 / i16::MAX as f32).collect();
-                    on_samples(&f)
+                    converted.clear();
+                    converted.extend(data.iter().map(|s| *s as f32 / i16::MAX as f32));
+                    on_samples(&converted)
                 },
                 err_fn,
                 None,
@@ -186,11 +186,9 @@ pub fn start(level: Arc<Level>) -> Result<Recording> {
             cpal::SampleFormat::U16 => device.build_input_stream(
                 config,
                 move |data: &[u16], _: &_| {
-                    let f: Vec<f32> = data
-                        .iter()
-                        .map(|s| (*s as f32 - 32768.0) / 32768.0)
-                        .collect();
-                    on_samples(&f)
+                    converted.clear();
+                    converted.extend(data.iter().map(|s| (*s as f32 - 32768.0) / 32768.0));
+                    on_samples(&converted)
                 },
                 err_fn,
                 None,
@@ -216,7 +214,10 @@ pub fn start(level: Arc<Level>) -> Result<Recording> {
         drop(stream);
         level.set(0.0);
 
-        let samples = buffer.lock().map(|b| b.clone()).unwrap_or_default();
+        let samples = buffer
+            .lock()
+            .map(|mut b| std::mem::take(&mut *b))
+            .unwrap_or_default();
         let _ = done_tx.send(samples);
     });
 

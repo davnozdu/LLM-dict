@@ -9,6 +9,7 @@ mod autostart;
 mod binding;
 mod clipboard;
 mod config;
+mod config_writer;
 mod conflicts;
 mod engine;
 mod focus;

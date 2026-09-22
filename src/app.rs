@@ -68,6 +68,10 @@ pub struct App {
     shared: Arc<Shared>,
     cfg: Config,
     saved_cfg: Config,
+    config_writer: crate::config_writer::Writer,
+    key_migration: Option<Receiver<Result<(Config, String), String>>>,
+    stored_keys: HashMap<Provider, String>,
+    key_reads: HashMap<Provider, Receiver<String>>,
     api_key_input: String,
     tab: Tab,
     models: Vec<String>,
@@ -177,6 +181,10 @@ impl App {
 
         Self {
             saved_cfg: cfg.clone(),
+            config_writer: crate::config_writer::Writer::new(),
+            key_migration: None,
+            stored_keys: HashMap::new(),
+            key_reads: HashMap::new(),
             cfg,
             api_key_input,
             shared,
@@ -256,10 +264,54 @@ impl App {
         if self.cfg.general.show_in_dock != self.saved_cfg.general.show_in_dock {
             macos::set_dock_visible(self.cfg.general.show_in_dock);
         }
-        if let Err(e) = self.cfg.save() {
-            self.toast(format!("Не сохранить настройки: {e}"));
-        }
+        self.config_writer.queue(self.cfg.clone());
         self.saved_cfg = self.cfg.clone();
+    }
+
+    fn flush_config(&mut self) -> bool {
+        self.apply_config();
+        match self.config_writer.flush() {
+            Ok(()) => true,
+            Err(e) => {
+                self.toast(format!("Не сохранить настройки: {e}"));
+                false
+            }
+        }
+    }
+
+    fn poll_config(&mut self) {
+        while let Ok(error) = self.config_writer.errors.try_recv() {
+            self.toast(format!(
+                "Не сохранить настройки: {error}. Повторяю попытку."
+            ));
+        }
+        let result = self
+            .key_migration
+            .as_ref()
+            .and_then(|rx| match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("Поток переноса ключей завершился".into()))
+                }
+                Err(_) => None,
+            });
+        if let Some(result) = result {
+            self.key_migration = None;
+            match result {
+                Ok((cfg, key)) => {
+                    self.cfg = cfg;
+                    self.api_key_input = key;
+                    self.shared.set_api_key(self.api_key_input.clone());
+                    self.key_synced = true;
+                    self.provider_keys.clear();
+                    self.stored_keys.clear();
+                    self.key_reads.clear();
+                    self.apply_config();
+                    self.toast("Хранилище изменено, сохранённые ключи перенесены");
+                }
+                Err(e) => self.toast(format!("Не перенести ключи: {e}")),
+            }
+        }
     }
 
     /// Иконка в панели: цвет кружка = стадия работы.
@@ -498,8 +550,7 @@ impl App {
         ctx.request_repaint_after(Duration::from_millis(interval));
     }
 
-    /// Ключ уходит туда, куда указано настройками, а из другого места
-    /// подчищается: иначе он остался бы лежать в двух местах сразу.
+    /// Сохраняет ключ в выбранном хранилище и обновляет рабочий кеш.
     fn save_api_key(&mut self) {
         let key = self.api_key_input.trim().to_string();
         match self.cfg.set_key_for("groq_api_key", &key) {
@@ -513,6 +564,11 @@ impl App {
             }
         }
         self.shared.set_api_key(key);
+        self.stored_keys
+            .insert(Provider::Groq, self.api_key_input.trim().to_string());
+        self.provider_keys
+            .insert(Provider::Groq, self.api_key_input.trim().to_string());
+        self.key_reads.remove(&Provider::Groq);
     }
 
     fn start_model_check(&mut self) {
@@ -532,6 +588,10 @@ impl eframe::App for App {
     /// Выполняется и когда окно скрыто — значит сюда идёт всё, что должно
     /// работать в фоне: значок в панели и плашка у курсора.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_config();
+        if self.key_migration.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
         self.ensure_tray();
         self.sync_tray();
         self.update_overlay(ctx);
@@ -545,7 +605,13 @@ impl eframe::App for App {
                     log::info!("открываю окно из меню в панели");
                     self.show_main_window(ctx);
                 }
-                MENU_QUIT => std::process::exit(0),
+                MENU_QUIT => {
+                    if self.key_migration.is_some() {
+                        self.toast("Дождитесь завершения переноса ключей");
+                    } else if self.flush_config() {
+                        std::process::exit(0);
+                    }
+                }
                 _ => {}
             }
         }
@@ -583,6 +649,12 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if self.key_migration.is_some() {
+            ui.spinner();
+            ui.label("Переношу ключи...");
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
+            return;
+        }
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
         self.poll_model_check();
@@ -931,10 +1003,30 @@ impl App {
                     self.start_model_check();
                 }
             });
-            ui.checkbox(
-                &mut self.cfg.general.key_in_config,
-                "Хранить ключ в файле настроек, а не в Keychain",
-            );
+            let mut in_config = self.cfg.general.key_in_config;
+            if ui
+                .checkbox(
+                    &mut in_config,
+                    "Хранить ключ в файле настроек, а не в Keychain",
+                )
+                .changed()
+                && self.flush_config()
+            {
+                let mut cfg = self.cfg.clone();
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let result = cfg
+                        .switch_key_storage(in_config)
+                        .map(|()| {
+                            let key = cfg.load_api_key();
+                            (cfg, key)
+                        })
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(result);
+                });
+                self.key_migration = Some(rx);
+                ui.disable();
+            }
             if let Some((msg, ok)) = &self.check_message {
                 let color = if *ok {
                     egui::Color32::from_rgb(60, 160, 90)
@@ -1616,13 +1708,11 @@ impl App {
     fn fetch_models(&mut self, endpoint: &Endpoint) {
         let provider = endpoint.provider;
         let base_url = endpoint.base_url();
-        let key = self
-            .provider_keys
-            .get(&provider)
-            .cloned()
-            .unwrap_or_else(|| endpoint.api_key(&self.cfg));
+        let key = self.provider_keys.get(&provider).cloned();
+        let cfg = self.cfg.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
+            let key = key.unwrap_or_else(|| cfg.key_for(provider.key_account()));
             let _ = tx.send(providers::list_models(&base_url, &key).map_err(|e| e.to_string()));
         });
         self.model_fetch = Some((provider, FetchKind::Models, rx));
@@ -1635,7 +1725,27 @@ impl App {
             ui.weak("Ollama работает локально, ключ не нужен.");
             return;
         }
-        let stored = self.cfg.key_for(provider.key_account());
+        if !self.stored_keys.contains_key(&provider) {
+            if let Some(rx) = self.key_reads.get(&provider) {
+                if let Ok(key) = rx.try_recv() {
+                    self.stored_keys.insert(provider, key);
+                    self.key_reads.remove(&provider);
+                }
+            } else {
+                let cfg = self.cfg.clone();
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(cfg.key_for(provider.key_account()));
+                });
+                self.key_reads.insert(provider, rx);
+            }
+            if !self.stored_keys.contains_key(&provider) {
+                ui.label("Читаю сохранённый ключ...");
+                ui.ctx().request_repaint_after(Duration::from_millis(100));
+                return;
+            }
+        }
+        let stored = self.stored_keys[&provider].clone();
         let entry = self.provider_keys.entry(provider).or_insert(stored);
         let mut value = entry.clone();
         let hint = if value.is_empty() {
@@ -1656,7 +1766,7 @@ impl App {
         self.provider_keys.insert(provider, value.clone());
 
         // Видно, лежит ли ключ на самом деле: набранное в поле ещё не сохранено.
-        let stored_now = self.cfg.key_for(provider.key_account());
+        let stored_now = &self.stored_keys[&provider];
         if stored_now.is_empty() {
             ui.colored_label(
                 egui::Color32::from_rgb(220, 130, 40),
@@ -1674,6 +1784,7 @@ impl App {
                 let account = provider.key_account();
                 match self.cfg.set_key_for(account, value.trim()) {
                     Ok(()) => {
+                        self.stored_keys.insert(provider, value.trim().to_string());
                         if provider == Provider::Groq {
                             self.api_key_input = value.trim().to_string();
                             self.shared.set_api_key(self.api_key_input.clone());
@@ -1706,9 +1817,10 @@ impl App {
             self.toast("Сначала выберите модель для этого поставщика");
             return;
         };
-        let key = self.cfg.key_for(provider.key_account());
+        let cfg = self.cfg.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
+            let key = cfg.key_for(provider.key_account());
             let _ = tx.send(
                 providers::verify_key(&action.endpoint, &key)
                     .map(|()| Vec::new())
@@ -1912,7 +2024,7 @@ impl App {
         // означало бы десятки мегабайт в секунду на ровном месте.
         let (found, total) = {
             let entries = self.shared.clipboard.entries.lock().unwrap();
-            let found: Vec<crate::clipboard::Entry> = if query.is_empty() {
+            let found: Vec<Arc<crate::clipboard::Entry>> = if query.is_empty() {
                 entries.iter().take(recent).cloned().collect()
             } else {
                 entries
@@ -2495,7 +2607,9 @@ impl App {
             self.start_update_install(r);
         }
         if let Some(path) = relaunch {
-            updater::relaunch(&path);
+            if self.key_migration.is_none() && self.flush_config() {
+                updater::relaunch(&path);
+            }
         }
     }
 
@@ -2518,6 +2632,7 @@ impl App {
         let entries = self.shared.history.lock().unwrap().clone();
         let filtered: Vec<&history::Entry> = entries
             .iter()
+            .map(AsRef::as_ref)
             .filter(|e| match self.filter {
                 HistoryFilter::All => true,
                 HistoryFilter::Transformed => e.was_transformed(),
@@ -2614,7 +2729,7 @@ impl App {
         ui.add_space(6.0);
 
         // Как и в списке выбора: копируем только показываемое.
-        let entries: Vec<crate::clipboard::Entry> = {
+        let entries: Vec<Arc<crate::clipboard::Entry>> = {
             let guard = self.shared.clipboard.entries.lock().unwrap();
             guard.iter().take(300).cloned().collect()
         };

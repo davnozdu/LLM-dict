@@ -375,6 +375,57 @@ pub fn config_path() -> PathBuf {
 }
 
 impl Config {
+    /// Copy all saved provider keys before committing the storage preference.
+    /// The source is left intact until the new configuration is durable.
+    pub fn switch_key_storage(&mut self, in_config: bool) -> Result<()> {
+        self.switch_key_storage_with(in_config, secrets::read, secrets::set, Config::save)
+    }
+
+    fn switch_key_storage_with(
+        &mut self,
+        in_config: bool,
+        mut read: impl FnMut(&str) -> Result<Option<String>>,
+        mut write: impl FnMut(&str, &str) -> Result<()>,
+        persist: impl FnOnce(&Config) -> Result<()>,
+    ) -> Result<()> {
+        if self.general.key_in_config == in_config {
+            return Ok(());
+        }
+        let mut accounts: std::collections::BTreeSet<String> = crate::provider::Provider::ALL
+            .iter()
+            .filter(|p| p.needs_key())
+            .map(|p| p.key_account().to_string())
+            .collect();
+        accounts.extend(self.provider_keys.keys().cloned());
+        let mut keys = Vec::new();
+        for account in accounts {
+            let key = if self.general.key_in_config {
+                self.key_for(&account)
+            } else {
+                read(&account)?.unwrap_or_default()
+            };
+            keys.push((account, key));
+        }
+        let mut next = self.clone();
+        next.general.key_in_config = in_config;
+        next.api_key.clear();
+        next.provider_keys.clear();
+        for (account, key) in keys {
+            if in_config {
+                if account == "groq_api_key" {
+                    next.api_key = key;
+                } else if !key.is_empty() {
+                    next.provider_keys.insert(account, key);
+                }
+            } else {
+                write(&account, &key)?;
+            }
+        }
+        persist(&next)?;
+        *self = next;
+        Ok(())
+    }
+
     pub fn load() -> Self {
         let path = config_path();
         match std::fs::read_to_string(&path) {
@@ -500,7 +551,6 @@ impl Config {
 
     pub fn set_key_for(&mut self, account: &str, value: &str) -> anyhow::Result<()> {
         if self.general.key_in_config {
-            let _ = secrets::set(account, "");
             if value.is_empty() || account == "groq_api_key" {
                 self.provider_keys.remove(account);
             } else {
@@ -532,16 +582,114 @@ pub mod secrets {
     }
 
     pub fn get(account: &str) -> Option<String> {
-        entry(account).ok()?.get_password().ok()
+        read(account).ok().flatten()
+    }
+
+    pub fn read(account: &str) -> Result<Option<String>> {
+        match entry(account)?.get_password() {
+            Ok(key) => Ok(Some(key)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub fn set(account: &str, value: &str) -> Result<()> {
         let e = entry(account)?;
         if value.is_empty() {
-            let _ = e.delete_credential();
+            match e.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => {}
+                Err(e) => return Err(e.into()),
+            }
         } else {
             e.set_password(value)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+
+    #[test]
+    fn storage_migration_preserves_all_provider_keys() {
+        let mut cfg = Config::default();
+        cfg.switch_key_storage_with(
+            true,
+            |account| Ok(Some(format!("key-{account}"))),
+            |_, _| panic!("source must not be changed"),
+            |next| {
+                assert!(next.general.key_in_config);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(cfg.api_key, "key-groq_api_key");
+        for provider in crate::provider::Provider::ALL
+            .into_iter()
+            .filter(|p| p.needs_key())
+        {
+            assert_eq!(
+                cfg.key_for(provider.key_account()),
+                format!("key-{}", provider.key_account())
+            );
+        }
+        let mut copied = std::collections::HashMap::new();
+        cfg.switch_key_storage_with(
+            false,
+            |_| panic!("file is the source"),
+            |account, key| {
+                copied.insert(account.to_string(), key.to_string());
+                Ok(())
+            },
+            |next| {
+                assert!(next.api_key.is_empty());
+                assert!(next.provider_keys.is_empty());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(copied["groq_api_key"], "key-groq_api_key");
+        assert!(!cfg.general.key_in_config);
+    }
+
+    #[test]
+    fn failed_keychain_read_does_not_switch_or_persist() {
+        let mut cfg = Config::default();
+        let original = cfg.clone();
+        assert!(cfg
+            .switch_key_storage_with(
+                true,
+                |_| anyhow::bail!("keychain locked"),
+                |_, _| panic!("must not write"),
+                |_| panic!("must not persist"),
+            )
+            .is_err());
+        assert_eq!(cfg, original);
+    }
+
+    #[test]
+    fn failed_write_or_save_keeps_source_configuration() {
+        for fail_write in [true, false] {
+            let mut cfg = Config {
+                api_key: "saved-key".into(),
+                ..Config::default()
+            };
+            cfg.general.key_in_config = true;
+            let original = cfg.clone();
+            assert!(cfg
+                .switch_key_storage_with(
+                    false,
+                    |_| panic!("file is the source"),
+                    |_, _| if fail_write {
+                        anyhow::bail!("keychain unavailable")
+                    } else {
+                        Ok(())
+                    },
+                    |_| anyhow::bail!("disk unavailable"),
+                )
+                .is_err());
+            assert_eq!(cfg, original);
+        }
     }
 }

@@ -9,12 +9,28 @@ use anyhow::{anyhow, bail, Result};
 use serde::Deserialize;
 use std::time::Duration;
 
+fn cached_client(
+    slot: &std::sync::Mutex<Option<reqwest::blocking::Client>>,
+    timeout: u64,
+    connect_timeout: u64,
+) -> Result<reqwest::blocking::Client> {
+    let mut slot = slot.lock().unwrap();
+    if let Some(client) = slot.as_ref() {
+        return Ok(client.clone());
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(timeout))
+        .connect_timeout(Duration::from_secs(connect_timeout))
+        .build()?;
+    *slot = Some(client.clone());
+    Ok(client)
+}
+
 /// Для загрузки записи: минута речи — это мегабайты, отправка небыстрая.
 fn client() -> Result<reqwest::blocking::Client> {
-    Ok(reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .connect_timeout(Duration::from_secs(8))
-        .build()?)
+    static CLIENT: std::sync::Mutex<Option<reqwest::blocking::Client>> =
+        std::sync::Mutex::new(None);
+    cached_client(&CLIENT, 120, 8)
 }
 
 /// Для запросов к модели по тексту.
@@ -23,10 +39,9 @@ fn client() -> Result<reqwest::blocking::Client> {
 /// вставкой, и если облако не отвечает, лучше быстро вставить текст как есть,
 /// чем держать пользователя две минуты.
 fn text_client() -> Result<reqwest::blocking::Client> {
-    Ok(reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(25))
-        .connect_timeout(Duration::from_secs(5))
-        .build()?)
+    static CLIENT: std::sync::Mutex<Option<reqwest::blocking::Client>> =
+        std::sync::Mutex::new(None);
+    cached_client(&CLIENT, 25, 5)
 }
 
 /// Отчего запрос к поставщику не удался.

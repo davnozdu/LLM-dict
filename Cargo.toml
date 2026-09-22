@@ -41,7 +41,7 @@ parakeet-rs = "0.3"
 # бинарнике окажутся две копии среды выполнения.
 ort = { version = "2.0.0-rc.13", default-features = false, features = ["std"] }
 
-# Локальная языковая модель. Собирается статически, как и whisper.cpp.
+# Локальная языковая модель. Собирается статически с поддержкой Metal.
 llama-cpp-2 = { version = "0.1.155", default-features = false, features = ["metal"] }
 tiny_http = "0.12"
 tempfile = "3"

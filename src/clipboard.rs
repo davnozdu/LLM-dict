@@ -57,25 +57,11 @@ pub fn history_path() -> PathBuf {
     crate::config::config_dir().join("clipboard.jsonl")
 }
 
-pub fn load() -> Vec<Entry> {
+pub fn load_recent() -> Vec<Entry> {
     let Ok(file) = std::fs::File::open(history_path()) else {
         return Vec::new();
     };
-    let mut entries: Vec<Entry> = BufReader::new(file)
-        .lines()
-        .map_while(Result::ok)
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(&l).ok())
-        .collect();
-    entries.reverse(); // новые сверху
-    entries
-}
-
-/// То же, но только последние записи — для показа в окне.
-pub fn load_recent() -> Vec<Entry> {
-    let mut entries = load();
-    entries.truncate(MAX_IN_MEMORY);
-    entries
+    crate::persistence::recent_json(BufReader::new(file), MAX_IN_MEMORY)
 }
 
 fn append(entry: &Entry) -> anyhow::Result<()> {
@@ -95,14 +81,21 @@ pub fn rotate(days: u32) -> anyhow::Result<()> {
         return Ok(());
     }
     let cutoff = Local::now() - chrono::Duration::days(days as i64);
-    let kept: Vec<Entry> = load().into_iter().filter(|e| e.at > cutoff).collect();
-    let mut out = String::new();
-    // На диск пишем в хронологическом порядке, как и читали.
-    for e in kept.iter().rev() {
-        out.push_str(&serde_json::to_string(e)?);
-        out.push('\n');
-    }
-    crate::persistence::atomic_write(&history_path(), out.as_bytes())?;
+    let file = match std::fs::File::open(history_path()) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    crate::persistence::atomic_write_with(&history_path(), |out| {
+        let mut out = std::io::BufWriter::new(out);
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if serde_json::from_str::<Entry>(&line).is_ok_and(|e| e.at > cutoff) {
+                writeln!(out, "{line}")?;
+            }
+        }
+        out.flush()
+    })?;
     Ok(())
 }
 
@@ -116,7 +109,7 @@ pub fn clear() -> anyhow::Result<()> {
 
 /// Общая история, которую видит окно.
 pub struct History {
-    pub entries: Mutex<Vec<Entry>>,
+    pub entries: Mutex<Vec<Arc<Entry>>>,
     enabled: AtomicBool,
     days: AtomicU32,
 }
@@ -124,7 +117,7 @@ pub struct History {
 impl History {
     pub fn new(enabled: bool, days: u32) -> Arc<Self> {
         let _ = rotate(days);
-        let mut entries = load_recent();
+        let mut entries = load_recent().into_iter().map(Arc::new).collect();
         prune(&mut entries, days);
         Arc::new(Self {
             entries: Mutex::new(entries),
@@ -149,7 +142,7 @@ impl History {
     }
 }
 
-fn prune(entries: &mut Vec<Entry>, days: u32) {
+fn prune(entries: &mut Vec<Arc<Entry>>, days: u32) {
     if days != 0 {
         let cutoff = Local::now() - chrono::Duration::days(i64::from(days));
         entries.retain(|e| e.at > cutoff);
@@ -213,7 +206,7 @@ pub fn spawn(history: Arc<History>) {
                 app_path: front.path,
             };
             let _ = append(&entry);
-            entries.insert(0, entry);
+            entries.insert(0, Arc::new(entry));
             entries.truncate(MAX_IN_MEMORY);
         }
     });
