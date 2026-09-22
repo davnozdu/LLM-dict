@@ -237,7 +237,24 @@ impl Matcher {
             .max_by_key(|(_, b)| b.keys.len());
         let action_len = best_action.map(|(_, b)| b.keys.len()).unwrap_or(0);
 
-        let active = dictation_len > 0;
+        // Набор клавиш может быть ещё не дособран: диктовка на правом ⌘,
+        // а действие — на правом ⌥ + правом ⌘ + букве. В промежутке между
+        // вторым модификатором и буквой сочетание диктовки формально
+        // подходит, и микрофон открывался на те доли секунды, что рука
+        // тянется к букве.
+        //
+        // Лишним считается только тот зажатый модификатор, которого в
+        // сочетании диктовки нет: сама клавиша диктовки, нажатая в
+        // одиночку, — это по-прежнему диктовка, даже если какое-то
+        // действие начинается с неё же. Там ждать нечего, и запись
+        // начинается сразу, как раньше.
+        let growing_into_action = actions.iter().any(|(_, b)| {
+            b.keys.len() > held.len()
+                && held.iter().all(|k| b.keys.contains(k))
+                && held.iter().any(|k| !dictation.keys.contains(k))
+        });
+
+        let active = dictation_len > 0 && !growing_into_action;
         let was_active = std::mem::replace(&mut self.dictation_active, active);
         if !active {
             self.suppressed = false;
@@ -281,7 +298,14 @@ impl Matcher {
         } else if active && !was_active && is_down {
             out.push(HotKeyEvent::StartRecording);
         } else if !active && was_active {
-            out.push(HotKeyEvent::StopRecording);
+            // Запись, начатую клавишей диктовки, обрываем, а не
+            // останавливаем: раз набирается действие, распознавать
+            // полсекунды случайного шума незачем.
+            out.push(if growing_into_action {
+                HotKeyEvent::CancelRecording
+            } else {
+                HotKeyEvent::StopRecording
+            });
         }
         out
     }
@@ -732,6 +756,78 @@ mod tests {
                 HotKeyEvent::CancelRecording,
                 HotKeyEvent::Action("перевод".into())
             ]
+        );
+    }
+
+    /// Диктовка на правом ⌘, действия на правом ⌥ + правом ⌘ + букве.
+    /// Пока набор клавиш ещё может дорасти до действия, диктовку включать
+    /// нельзя: микрофон открывался на те доли секунды, что рука тянется
+    /// к букве.
+    #[test]
+    fn сочетание_действия_не_включает_диктовку() {
+        let mut m = Matcher::default();
+        let dict = Binding::new(vec![R_CMD]);
+        let acts = actions(&[("чешский", &[R_OPT, R_CMD, KEY_C])]);
+
+        assert!(m
+            .decide(&[R_OPT], true, &dict, &acts, false, false)
+            .is_empty());
+        assert!(
+            m.decide(&[R_OPT, R_CMD], true, &dict, &acts, false, false)
+                .is_empty(),
+            "диктовка включилась на полпути к действию"
+        );
+        assert_eq!(
+            m.decide(&[R_OPT, R_CMD, KEY_C], true, &dict, &acts, false, false),
+            vec![
+                HotKeyEvent::CancelRecording,
+                HotKeyEvent::Action("чешский".into())
+            ]
+        );
+    }
+
+    /// Тот же случай, но модификаторы нажаты в другом порядке: сначала
+    /// клавиша диктовки. Запись успела начаться, и её надо оборвать сразу,
+    /// а не оставлять микрофон открытым до буквы.
+    #[test]
+    fn второй_модификатор_обрывает_начатую_диктовку() {
+        let mut m = Matcher::default();
+        let dict = Binding::new(vec![R_CMD]);
+        let acts = actions(&[("чешский", &[R_OPT, R_CMD, KEY_C])]);
+
+        assert_eq!(
+            m.decide(&[R_CMD], true, &dict, &acts, false, false),
+            vec![HotKeyEvent::StartRecording]
+        );
+        assert_eq!(
+            m.decide(&[R_CMD, R_OPT], true, &dict, &acts, true, false),
+            vec![HotKeyEvent::CancelRecording],
+            "запись должна обрываться, а не доживать до буквы"
+        );
+        assert_eq!(
+            m.decide(&[R_CMD, R_OPT, KEY_C], true, &dict, &acts, false, false),
+            vec![
+                HotKeyEvent::CancelRecording,
+                HotKeyEvent::Action("чешский".into())
+            ]
+        );
+    }
+
+    /// Одна клавиша диктовки — это всё ещё диктовка, даже если действия
+    /// начинаются с неё же. Иначе лечение оказалось бы хуже болезни.
+    #[test]
+    fn клавиша_диктовки_сама_по_себе_включает_запись() {
+        let mut m = Matcher::default();
+        let dict = Binding::new(vec![R_CMD]);
+        let acts = actions(&[("чешский", &[R_OPT, R_CMD, KEY_C])]);
+
+        assert_eq!(
+            m.decide(&[R_CMD], true, &dict, &acts, false, false),
+            vec![HotKeyEvent::StartRecording]
+        );
+        assert_eq!(
+            m.decide(&[], false, &dict, &acts, true, false),
+            vec![HotKeyEvent::StopRecording]
         );
     }
 
