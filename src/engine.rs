@@ -278,6 +278,7 @@ pub fn spawn(shared: Arc<Shared>) -> Sender<HotKeyEvent> {
 
 fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
     let mut recording: Option<audio::Recording> = None;
+    let mut dictation_delay = DictationDelay::default();
     // Модели живут здесь: загрузка занимает секунды, повторять её на каждую
     // фразу бессмысленно. Владеет ими только этот поток.
     let mut local = LocalEngines::default();
@@ -304,30 +305,37 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
     let mut deferred: Option<HotKeyEvent> = None;
 
     loop {
-        // Пока идёт запись, ждём событие с таймаутом: иначе некому проверить,
-        // не пора ли оборвать её по тишине или по пределу длины.
+        // Пока сочетание ещё может дорасти до макроса, ждём его продолжение.
+        // При записи заодно регулярно проверяем пределы и тишину.
+        let timeout = dictation_delay.timeout(Instant::now()).unwrap_or_else(|| {
+            if recording.is_some() {
+                Duration::from_millis(200)
+            } else {
+                Duration::from_secs(30)
+            }
+        });
         let event = if let Some(event) = deferred.take() {
             Some(event)
-        } else if recording.is_some() {
-            match rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(e) => Some(e),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-            }
         } else {
-            // Не блокируемся навсегда: иначе некому проверить, не пора ли
-            // выгрузить локальные модели. Полминуты — достаточно частая
-            // проверка для таймаута, который считается в минутах.
-            match rx.recv_timeout(Duration::from_secs(30)) {
+            match rx.recv_timeout(timeout) {
                 Ok(e) => Some(e),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    drop_stale_model(&shared, &mut local);
-                    unload_idle(&shared, &mut local);
+                    if recording.is_none() && dictation_delay.pending.is_none() {
+                        drop_stale_model(&shared, &mut local);
+                        unload_idle(&shared, &mut local);
+                    }
                     None
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         };
+        let delay = match event.as_ref() {
+            Some(event @ (HotKeyEvent::StartRecording | HotKeyEvent::StopRecording)) => {
+                dictation_transition_delay(&shared.config_snapshot(), event)
+            }
+            _ => Duration::ZERO,
+        };
+        let event = dictation_delay.handle(event, delay, Instant::now());
 
         // Проверка пределов до разбора события: остановиться надо и тогда,
         // когда пользователь ничего не нажимает.
@@ -344,15 +352,10 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
             }
         }
 
-        let event = if forced_stop {
-            // Нажатие, пришедшее в этот же заход, откладываем, а не выбрасываем:
-            // раньше действие по горячей клавише молча пропадало, если попало
-            // ровно в момент обрыва записи.
-            deferred = event;
-            Some(HotKeyEvent::StopRecording)
-        } else {
-            event
-        };
+        let event = recording_event(event, forced_stop, &mut deferred);
+        if forced_stop {
+            dictation_delay.pending = None;
+        }
 
         let Some(event) = event else { continue };
 
@@ -361,29 +364,14 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
                 if recording.is_some() {
                     continue;
                 }
-                let cfg = shared.config_snapshot();
-                shared.set_stage(Stage::Recording);
-                match audio::start(shared.level.clone()) {
-                    Ok(rec) => {
-                        recording = Some(rec);
-                        shared.set_stage(Stage::Recording);
-                        shared.set_error(None);
-                        if cfg.general.play_sounds {
-                            insert::play_sound("Tink");
-                        }
-                    }
-                    Err(e) => {
-                        shared.set_stage(Stage::Idle);
-                        shared.hotkey_state.set_recording(false);
-                        shared.set_error(Some(format!("Микрофон недоступен: {e}")));
-                    }
-                }
+                recording = begin_recording(&shared);
             }
 
             HotKeyEvent::CancelRecording => {
                 shared.hotkey_state.set_recording(false);
                 if let Some(rec) = recording.take() {
                     let _ = rec.finish();
+                    shared.notify("Диктовка отменена");
                 }
                 shared.set_stage(Stage::Idle);
             }
@@ -442,6 +430,103 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
                 shared.set_stage(Stage::Idle);
             }
         }
+    }
+}
+
+/// Короткая пауза только для сочетаний диктовки, вложенных в макросы.
+const MACRO_GRACE: Duration = Duration::from_millis(150);
+
+fn dictation_transition_delay(cfg: &Config, event: &HotKeyEvent) -> Duration {
+    // В Hold отпускание уже однозначно: сочетание макроса распалось.
+    if *event == HotKeyEvent::StopRecording && cfg.general.hotkey_mode == HotKeyMode::Hold {
+        return Duration::ZERO;
+    }
+    let dictation = &cfg.general.hotkey;
+    if !dictation.is_empty()
+        && collect_bindings(cfg).iter().any(|(_, binding)| {
+            binding.keys.len() > dictation.keys.len()
+                && dictation.keys.iter().all(|key| binding.keys.contains(key))
+        })
+    {
+        MACRO_GRACE
+    } else {
+        Duration::ZERO
+    }
+}
+
+#[derive(Default)]
+struct DictationDelay {
+    pending: Option<(HotKeyEvent, Instant)>,
+}
+
+impl DictationDelay {
+    fn timeout(&self, now: Instant) -> Option<Duration> {
+        self.pending
+            .as_ref()
+            .map(|(_, deadline)| deadline.saturating_duration_since(now))
+    }
+
+    fn handle(
+        &mut self,
+        event: Option<HotKeyEvent>,
+        delay: Duration,
+        now: Instant,
+    ) -> Option<HotKeyEvent> {
+        match event {
+            Some(event @ (HotKeyEvent::StartRecording | HotKeyEvent::StopRecording)) => {
+                self.pending = None;
+                if delay.is_zero() {
+                    Some(event)
+                } else {
+                    self.pending = Some((event, now + delay));
+                    None
+                }
+            }
+            Some(event @ (HotKeyEvent::CancelRecording | HotKeyEvent::Action(_))) => {
+                self.pending = None;
+                Some(event)
+            }
+            None if self.timeout(now).is_some_and(|left| left.is_zero()) => {
+                self.pending.take().map(|(event, _)| event)
+            }
+            event => event,
+        }
+    }
+}
+
+fn begin_recording(shared: &Shared) -> Option<audio::Recording> {
+    shared.set_stage(Stage::Recording);
+    match audio::start(shared.level.clone()) {
+        Ok(rec) => {
+            shared.set_error(None);
+            if shared.config_snapshot().general.play_sounds {
+                insert::play_sound("Tink");
+            }
+            Some(rec)
+        }
+        Err(e) => {
+            shared.set_stage(Stage::Idle);
+            shared.hotkey_state.set_recording(false);
+            shared.set_error(Some(format!("Микрофон недоступен: {e}")));
+            None
+        }
+    }
+}
+
+/// Отмена важнее предела записи: даже при совпадении с тишиной или таймером
+/// сэмплы надо выбросить. Остальные события сохраняем до следующего захода.
+fn recording_event(
+    event: Option<HotKeyEvent>,
+    forced_stop: bool,
+    deferred: &mut Option<HotKeyEvent>,
+) -> Option<HotKeyEvent> {
+    match (forced_stop, event) {
+        (_, Some(HotKeyEvent::CancelRecording)) => Some(HotKeyEvent::CancelRecording),
+        (true, event) => {
+            *deferred = event;
+            Some(HotKeyEvent::StopRecording)
+        }
+        (false, event) => event,
     }
 }
 
@@ -1071,7 +1156,265 @@ pub fn hotkey_mode_hint(mode: HotKeyMode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::next_cycle_pos;
+    use super::{
+        collect_bindings, dictation_transition_delay, next_cycle_pos, recording_event,
+        DictationDelay, MACRO_GRACE,
+    };
+    use crate::actions::TextAction;
+    use crate::binding::{Binding, K_RIGHT_COMMAND as CMD, K_RIGHT_OPTION as OPT};
+    use crate::config::{Config, GeneralConfig, HotKeyMode};
+    use crate::hotkey::{HotKeyEvent, Matcher};
+    use std::time::{Duration, Instant};
+
+    const KEY_C: u16 = 8;
+
+    fn macro_config(mode: HotKeyMode) -> Config {
+        Config {
+            general: GeneralConfig {
+                hotkey: Binding::new(vec![CMD]),
+                hotkey_mode: mode,
+                clipboard_hotkey: Binding::new(vec![]),
+                ..Default::default()
+            },
+            actions: vec![TextAction {
+                id: "macro".into(),
+                hotkey: Binding::new(vec![CMD, OPT, KEY_C]),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn command_first_macro_prevents_start_and_toggle_stop() {
+        for (mode, recording) in [
+            (HotKeyMode::Hold, false),
+            (HotKeyMode::Toggle, false),
+            (HotKeyMode::Toggle, true),
+        ] {
+            let cfg = macro_config(mode);
+            let actions = collect_bindings(&cfg);
+            let mut matcher = Matcher::default();
+            let mut delay = DictationDelay::default();
+            let now = Instant::now();
+            let events = matcher.decide(
+                &[CMD],
+                true,
+                &cfg.general.hotkey,
+                &actions,
+                recording,
+                mode == HotKeyMode::Toggle,
+            );
+            assert_eq!(events.len(), 1);
+            for event in events {
+                let grace = dictation_transition_delay(&cfg, &event);
+                assert!(delay.handle(Some(event), grace, now).is_none());
+            }
+            let events = matcher.decide(
+                &[CMD, OPT],
+                true,
+                &cfg.general.hotkey,
+                &actions,
+                !recording,
+                mode == HotKeyMode::Toggle,
+            );
+            assert_eq!(events, vec![HotKeyEvent::CancelRecording]);
+            assert_eq!(
+                delay.handle(
+                    Some(events[0].clone()),
+                    Duration::ZERO,
+                    now + Duration::from_millis(50)
+                ),
+                Some(HotKeyEvent::CancelRecording)
+            );
+            // Букву можно нажать и позже: после Option таймер уже отменён.
+            assert!(delay
+                .handle(None, Duration::ZERO, now + Duration::from_secs(1))
+                .is_none());
+            assert_eq!(
+                matcher.decide(
+                    &[CMD, OPT, KEY_C],
+                    true,
+                    &cfg.general.hotkey,
+                    &actions,
+                    false,
+                    mode == HotKeyMode::Toggle
+                ),
+                vec![
+                    HotKeyEvent::CancelRecording,
+                    HotKeyEvent::Action("macro".into())
+                ]
+            );
+            assert!(matcher
+                .decide(
+                    &[CMD, OPT],
+                    false,
+                    &cfg.general.hotkey,
+                    &actions,
+                    false,
+                    mode == HotKeyMode::Toggle
+                )
+                .is_empty());
+            assert!(matcher
+                .decide(
+                    &[CMD],
+                    false,
+                    &cfg.general.hotkey,
+                    &actions,
+                    false,
+                    mode == HotKeyMode::Toggle
+                )
+                .is_empty());
+            assert!(matcher
+                .decide(
+                    &[],
+                    false,
+                    &cfg.general.hotkey,
+                    &actions,
+                    false,
+                    mode == HotKeyMode::Toggle
+                )
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn standalone_command_commits_after_grace() {
+        for event in [HotKeyEvent::StartRecording, HotKeyEvent::StopRecording] {
+            let mut delay = DictationDelay::default();
+            let now = Instant::now();
+            assert!(delay
+                .handle(Some(event.clone()), MACRO_GRACE, now)
+                .is_none());
+            assert!(delay
+                .handle(None, Duration::ZERO, now + MACRO_GRACE / 2)
+                .is_none());
+            assert_eq!(
+                delay.handle(None, Duration::ZERO, now + MACRO_GRACE),
+                Some(event)
+            );
+            assert!(delay.pending.is_none());
+        }
+    }
+
+    #[test]
+    fn option_first_macro_never_requests_recording() {
+        for mode in [HotKeyMode::Hold, HotKeyMode::Toggle] {
+            let cfg = macro_config(mode);
+            let actions = collect_bindings(&cfg);
+            let mut matcher = Matcher::default();
+            for held in [&[OPT][..], &[CMD, OPT][..]] {
+                assert!(matcher
+                    .decide(
+                        held,
+                        true,
+                        &cfg.general.hotkey,
+                        &actions,
+                        false,
+                        mode == HotKeyMode::Toggle
+                    )
+                    .is_empty());
+            }
+            assert_eq!(
+                matcher.decide(
+                    &[CMD, OPT, KEY_C],
+                    true,
+                    &cfg.general.hotkey,
+                    &actions,
+                    false,
+                    mode == HotKeyMode::Toggle
+                ),
+                vec![
+                    HotKeyEvent::CancelRecording,
+                    HotKeyEvent::Action("macro".into())
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn short_hold_tap_is_discarded_and_ordinary_release_stops_immediately() {
+        let cfg = macro_config(HotKeyMode::Hold);
+        let mut delay = DictationDelay::default();
+        let now = Instant::now();
+        delay.handle(Some(HotKeyEvent::StartRecording), MACRO_GRACE, now);
+        let grace = dictation_transition_delay(&cfg, &HotKeyEvent::StopRecording);
+        assert_eq!(
+            delay.handle(
+                Some(HotKeyEvent::StopRecording),
+                grace,
+                now + Duration::from_millis(50)
+            ),
+            Some(HotKeyEvent::StopRecording)
+        );
+        assert!(delay
+            .handle(None, Duration::ZERO, now + MACRO_GRACE)
+            .is_none());
+    }
+
+    #[test]
+    fn cancellation_or_action_drops_pending_transition() {
+        for event in [
+            HotKeyEvent::CancelRecording,
+            HotKeyEvent::Action("macro".into()),
+        ] {
+            let mut delay = DictationDelay::default();
+            let now = Instant::now();
+            delay.handle(Some(HotKeyEvent::StartRecording), MACRO_GRACE, now);
+            assert_eq!(
+                delay.handle(Some(event.clone()), Duration::ZERO, now),
+                Some(event)
+            );
+            assert!(delay
+                .handle(None, Duration::ZERO, now + MACRO_GRACE)
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn grace_only_applies_to_conflicting_enabled_bindings() {
+        let mut cfg = macro_config(HotKeyMode::Toggle);
+        assert_eq!(
+            dictation_transition_delay(&cfg, &HotKeyEvent::StartRecording),
+            MACRO_GRACE
+        );
+        cfg.actions[0].enabled = false;
+        assert_eq!(
+            dictation_transition_delay(&cfg, &HotKeyEvent::StartRecording),
+            Duration::ZERO
+        );
+        cfg.general.clipboard_hotkey = Binding::new(vec![CMD, KEY_C]);
+        assert_eq!(
+            dictation_transition_delay(&cfg, &HotKeyEvent::StartRecording),
+            MACRO_GRACE
+        );
+        cfg.general.hotkey_mode = HotKeyMode::Hold;
+        assert_eq!(
+            dictation_transition_delay(&cfg, &HotKeyEvent::StopRecording),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn cancellation_wins_over_recording_limit() {
+        let mut deferred = None;
+        assert_eq!(
+            recording_event(Some(HotKeyEvent::CancelRecording), true, &mut deferred),
+            Some(HotKeyEvent::CancelRecording)
+        );
+        assert!(deferred.is_none());
+    }
+
+    #[test]
+    fn recording_limit_preserves_other_events() {
+        let mut deferred = None;
+        let action = HotKeyEvent::Action("translation".into());
+        assert_eq!(
+            recording_event(Some(action.clone()), true, &mut deferred),
+            Some(HotKeyEvent::StopRecording)
+        );
+        assert_eq!(deferred, Some(action));
+    }
 
     #[test]
     fn первое_нажатие_пропускает_то_что_уже_в_буфере() {

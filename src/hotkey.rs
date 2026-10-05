@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 pub enum HotKeyEvent {
     StartRecording,
     StopRecording,
-    /// Запись прервана более длинным сочетанием — выбросить, не распознавая.
+    /// Запись отменена через Esc или более длинное сочетание — не распознавать.
     CancelRecording,
     /// Сработало действие над текстом; внутри его идентификатор.
     Action(String),
@@ -209,9 +209,40 @@ pub struct Matcher {
     fired: Option<String>,
     dictation_active: bool,
     suppressed: bool,
+    /// Esc, отменивший запись: проглатываем и автоповтор, и отпускание.
+    escape_swallowed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscapeDecision {
+    Pass,
+    Swallow,
+    Cancel,
 }
 
 impl Matcher {
+    fn escape(&mut self, kind: RawKind, code: u16, recording: bool) -> EscapeDecision {
+        const ESC: u16 = 53;
+        if code != ESC {
+            return EscapeDecision::Pass;
+        }
+        match kind {
+            RawKind::KeyDown if self.escape_swallowed => EscapeDecision::Swallow,
+            RawKind::KeyDown if recording => {
+                self.escape_swallowed = true;
+                // В Hold клавиша диктовки ещё зажата. До её отпускания
+                // запись не должна возобновиться от других нажатий.
+                self.suppressed = self.dictation_active;
+                EscapeDecision::Cancel
+            }
+            RawKind::KeyUp if self.escape_swallowed => {
+                self.escape_swallowed = false;
+                EscapeDecision::Swallow
+            }
+            _ => EscapeDecision::Pass,
+        }
+    }
+
     pub fn decide(
         &mut self,
         held: &[u16],
@@ -246,8 +277,8 @@ impl Matcher {
         // Лишним считается только тот зажатый модификатор, которого в
         // сочетании диктовки нет: сама клавиша диктовки, нажатая в
         // одиночку, — это по-прежнему диктовка, даже если какое-то
-        // действие начинается с неё же. Там ждать нечего, и запись
-        // начинается сразу, как раньше.
+        // действие начинается с неё же. Рабочий поток даёт короткое время
+        // на набор длинного сочетания до включения или выключения записи.
         let growing_into_action = actions.iter().any(|(_, b)| {
             b.keys.len() > held.len()
                 && held.iter().all(|k| b.keys.contains(k))
@@ -256,7 +287,10 @@ impl Matcher {
 
         let active = dictation_len > 0 && !growing_into_action;
         let was_active = std::mem::replace(&mut self.dictation_active, active);
-        if !active {
+        let was_suppressed = self.suppressed;
+        // После макроса или Esc подавление живёт до отпускания самой
+        // клавиши диктовки, даже если остальные клавиши отпускают по одной.
+        if dictation_len == 0 {
             self.suppressed = false;
         }
 
@@ -283,10 +317,15 @@ impl Matcher {
         // Сочетание разобрано — следующее нажатие сработает снова.
         self.fired = None;
 
-        if self.suppressed {
+        if self.suppressed || (was_suppressed && !active) {
             return out;
         }
-        if toggle {
+        if growing_into_action && was_active {
+            // Отменяем и ожидающий запуск, и ожидающую остановку в Toggle.
+            // Иначе второй модификатор пришёл, а рабочий поток всё равно
+            // успеет распознать запись раньше третьей клавиши макроса.
+            out.push(HotKeyEvent::CancelRecording);
+        } else if toggle {
             // В Toggle реагируем только на момент сборки сочетания.
             if active && !was_active && is_down {
                 out.push(if recording {
@@ -298,14 +337,7 @@ impl Matcher {
         } else if active && !was_active && is_down {
             out.push(HotKeyEvent::StartRecording);
         } else if !active && was_active {
-            // Запись, начатую клавишей диктовки, обрываем, а не
-            // останавливаем: раз набирается действие, распознавать
-            // полсекунды случайного шума незачем.
-            out.push(if growing_into_action {
-                HotKeyEvent::CancelRecording
-            } else {
-                HotKeyEvent::StopRecording
-            });
+            out.push(HotKeyEvent::StopRecording);
         }
         out
     }
@@ -488,6 +520,25 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
                 }
                 capture.lock().unwrap().reset();
 
+                // Esc отменяет только текущую запись. Обрабатываем раньше
+                // пользовательских сочетаний и независимо от их перехвата,
+                // чтобы отмена не закрывала окно активной программы.
+                let escape = matcher.lock().unwrap().escape(
+                    kind,
+                    code,
+                    cb_state.recording.load(Ordering::Relaxed)
+                        && !cb_state.busy.load(Ordering::Relaxed),
+                );
+                match escape {
+                    EscapeDecision::Cancel => {
+                        cb_state.set_recording(false);
+                        let _ = cb_tx.send(HotKeyEvent::CancelRecording);
+                        return CallbackResult::Drop;
+                    }
+                    EscapeDecision::Swallow => return CallbackResult::Drop,
+                    EscapeDecision::Pass => {}
+                }
+
                 let binding = cb_state.binding.lock().unwrap().clone();
                 let actions = cb_state.actions.lock().unwrap().clone();
 
@@ -590,7 +641,10 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
 
 #[cfg(test)]
 mod tests {
-    use super::{classify, Binding, Capture, HeldKeys, HotKeyEvent, KeyUpdate, Matcher, RawKind};
+    use super::{
+        classify, Binding, Capture, EscapeDecision, HeldKeys, HotKeyEvent, KeyUpdate, Matcher,
+        RawKind,
+    };
     use crate::binding as b;
 
     /// Флаги события: device-dependent биты нужных модификаторов.
@@ -607,12 +661,101 @@ mod tests {
     const R_OPT: u16 = 61;
     const KEY_C: u16 = 8;
     const SPACE: u16 = 49;
+    const ESC: u16 = 53;
 
     fn actions(pairs: &[(&str, &[u16])]) -> Vec<(String, Binding)> {
         pairs
             .iter()
             .map(|(id, keys)| (id.to_string(), Binding::new(keys.to_vec())))
             .collect()
+    }
+
+    #[test]
+    fn escape_cancels_hold_until_dictation_key_is_released() {
+        let mut m = Matcher::default();
+        let dict = Binding::new(vec![R_CMD]);
+        assert_eq!(
+            m.decide(&[R_CMD], true, &dict, &[], false, false),
+            vec![HotKeyEvent::StartRecording]
+        );
+        assert_eq!(
+            m.escape(RawKind::KeyDown, ESC, true),
+            EscapeDecision::Cancel
+        );
+        assert!(m
+            .decide(&[R_CMD, ESC, KEY_C], true, &dict, &[], false, false)
+            .is_empty());
+        assert_eq!(
+            m.escape(RawKind::KeyUp, ESC, false),
+            EscapeDecision::Swallow
+        );
+        assert!(m
+            .decide(&[R_CMD], false, &dict, &[], false, false)
+            .is_empty());
+        assert!(m.decide(&[], false, &dict, &[], false, false).is_empty());
+        assert_eq!(
+            m.decide(&[R_CMD], true, &dict, &[], false, false),
+            vec![HotKeyEvent::StartRecording]
+        );
+    }
+
+    #[test]
+    fn escape_cancels_toggle_after_dictation_key_is_released() {
+        let mut m = Matcher::default();
+        let dict = Binding::new(vec![R_CMD]);
+        assert_eq!(
+            m.decide(&[R_CMD], true, &dict, &[], false, true),
+            vec![HotKeyEvent::StartRecording]
+        );
+        assert!(m.decide(&[], false, &dict, &[], true, true).is_empty());
+        assert_eq!(
+            m.escape(RawKind::KeyDown, ESC, true),
+            EscapeDecision::Cancel
+        );
+        assert_eq!(
+            m.escape(RawKind::KeyUp, ESC, false),
+            EscapeDecision::Swallow
+        );
+        assert_eq!(
+            m.decide(&[R_CMD], true, &dict, &[], false, true),
+            vec![HotKeyEvent::StartRecording]
+        );
+    }
+
+    #[test]
+    fn cancelling_escape_repeat_and_release_are_swallowed() {
+        let mut m = Matcher::default();
+        assert_eq!(
+            m.escape(RawKind::KeyDown, ESC, true),
+            EscapeDecision::Cancel
+        );
+        assert_eq!(
+            m.escape(RawKind::KeyDown, ESC, false),
+            EscapeDecision::Swallow
+        );
+        assert_eq!(
+            m.escape(RawKind::KeyUp, ESC, false),
+            EscapeDecision::Swallow
+        );
+        assert_eq!(m.escape(RawKind::KeyDown, ESC, false), EscapeDecision::Pass);
+        assert_eq!(m.escape(RawKind::KeyUp, ESC, false), EscapeDecision::Pass);
+    }
+
+    #[test]
+    fn idle_escape_and_other_keys_pass_through() {
+        let mut m = Matcher::default();
+        assert_eq!(m.escape(RawKind::KeyDown, ESC, false), EscapeDecision::Pass);
+        assert_eq!(m.escape(RawKind::KeyUp, ESC, false), EscapeDecision::Pass);
+        assert_eq!(
+            m.escape(RawKind::KeyDown, KEY_C, true),
+            EscapeDecision::Pass
+        );
+        // Esc по-прежнему можно назначить сочетанием, когда записи нет.
+        let dict = Binding::new(vec![ESC]);
+        assert_eq!(
+            m.decide(&[ESC], true, &dict, &[], false, false),
+            vec![HotKeyEvent::StartRecording]
+        );
     }
 
     /// Сочетание, сохранённое со сломанным Caps Lock, должно чиститься при
