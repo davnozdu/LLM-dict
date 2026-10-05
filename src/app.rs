@@ -481,7 +481,7 @@ impl App {
     fn start_update_install(&mut self, release: updater::Release) {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(updater::install(&release).map_err(|e| e.to_string()));
+            let _ = tx.send(updater::install(&release).map_err(|e| format!("{e:#}")));
         });
         self.update = UpdateState::Installing(rx);
     }

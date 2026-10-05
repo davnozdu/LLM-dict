@@ -241,8 +241,9 @@ fn signing_certificate(app: &Path, prefix: &Path) -> Result<Vec<u8>> {
         "/usr/bin/codesign",
         &[
             "-d",
-            "--extract-certificates",
-            &prefix.to_string_lossy(),
+            // У этой опции необязательный аргумент: отдельный путь codesign
+            // принимает за ещё одно приложение. Префикс нужен через '='.
+            &format!("--extract-certificates={}", prefix.display()),
             &app.to_string_lossy(),
         ],
     )
@@ -263,4 +264,29 @@ pub fn relaunch(app: &Path) -> ! {
         .spawn();
     std::thread::sleep(Duration::from_millis(300));
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::signing_certificate;
+    use std::path::Path;
+
+    #[test]
+    fn extracts_leaf_certificate_to_requested_path() {
+        let work = tempfile::Builder::new()
+            .prefix("llm-dict certificate test ")
+            .tempdir()
+            .unwrap();
+        let prefix = work.path().join("signing certificate");
+        let certificate = signing_certificate(
+            Path::new("/System/Library/CoreServices/Finder.app"),
+            &prefix,
+        )
+        .unwrap();
+        assert_eq!(certificate[0], 0x30, "сертификат должен быть DER SEQUENCE");
+        assert_eq!(
+            std::fs::read(work.path().join("signing certificate0")).unwrap(),
+            certificate
+        );
+    }
 }
