@@ -22,7 +22,7 @@ pub enum Engine {
     /// сбросив заодно всё остальное. Такие конфиги молча переезжают сюда.
     #[serde(alias = "Whisper")]
     Parakeet,
-    /// GigaAM v3 e2e CTC через ONNX Runtime: только русский и английский,
+    /// GigaAM v3 e2e CTC и RNN-T через ONNX Runtime: только русский и английский,
     /// зато на русском заметно точнее Parakeet и сам расставляет знаки
     /// препинания. Считается своим кодом — см. `gigaam.rs`.
     GigaAm,
@@ -116,6 +116,47 @@ pub static CATALOG: &[ModelSpec] = &[
                     "322c3b29492673eb7d0b434bfa9dfb8653e34d02/v3_e2e_ctc_vocab.txt"
                 ),
                 size: 2_007,
+            },
+        ],
+    },
+    ModelSpec {
+        id: "gigaam-v3-e2e-rnnt-int8",
+        engine: Engine::GigaAm,
+        title: "GigaAM v3 e2e RNN-T (int8)",
+        note: "Русская диктовка с пунктуацией и числами. В тестах разработчиков \
+               в среднем точнее CTC; последовательный декодер может работать медленнее.",
+        files: &[
+            ModelFile {
+                name: "v3_e2e_rnnt_encoder.int8.onnx",
+                url: concat!(
+                    "https://huggingface.co/istupakov/gigaam-v3-onnx/resolve/",
+                    "322c3b29492673eb7d0b434bfa9dfb8653e34d02/v3_e2e_rnnt_encoder.int8.onnx"
+                ),
+                size: 224_570_477,
+            },
+            ModelFile {
+                name: "v3_e2e_rnnt_decoder.int8.onnx",
+                url: concat!(
+                    "https://huggingface.co/istupakov/gigaam-v3-onnx/resolve/",
+                    "322c3b29492673eb7d0b434bfa9dfb8653e34d02/v3_e2e_rnnt_decoder.int8.onnx"
+                ),
+                size: 1_159_170,
+            },
+            ModelFile {
+                name: "v3_e2e_rnnt_joint.int8.onnx",
+                url: concat!(
+                    "https://huggingface.co/istupakov/gigaam-v3-onnx/resolve/",
+                    "322c3b29492673eb7d0b434bfa9dfb8653e34d02/v3_e2e_rnnt_joint.int8.onnx"
+                ),
+                size: 687_791,
+            },
+            ModelFile {
+                name: "v3_e2e_rnnt_vocab.txt",
+                url: concat!(
+                    "https://huggingface.co/istupakov/gigaam-v3-onnx/resolve/",
+                    "322c3b29492673eb7d0b434bfa9dfb8653e34d02/v3_e2e_rnnt_vocab.txt"
+                ),
+                size: 13_354,
             },
         ],
     },
@@ -400,6 +441,21 @@ mod tests {
             "нет файла модели"
         );
         assert!(names.contains(&crate::gigaam::VOCAB_FILE), "нет словаря");
+    }
+
+    #[test]
+    fn каталог_rnnt_содержит_все_файлы_движка() {
+        let spec = find("gigaam-v3-e2e-rnnt-int8").unwrap();
+        assert_eq!(spec.engine, Engine::GigaAm);
+        let names: Vec<_> = spec.files.iter().map(|f| f.name).collect();
+        for name in [
+            crate::gigaam::RNNT_ENCODER_FILE,
+            crate::gigaam::RNNT_DECODER_FILE,
+            crate::gigaam::RNNT_JOINT_FILE,
+            crate::gigaam::RNNT_VOCAB_FILE,
+        ] {
+            assert!(names.contains(&name), "в каталоге нет {name}");
+        }
     }
 
     #[test]

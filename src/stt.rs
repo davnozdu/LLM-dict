@@ -201,7 +201,7 @@ mod tests {
         assert!(needs_reload(
             Some((Engine::GigaAm, "gigaam-v3-e2e-ctc-int8")),
             Engine::GigaAm,
-            "gigaam-v4-когда-нибудь",
+            "gigaam-v3-e2e-rnnt-int8",
         ));
     }
 
@@ -362,7 +362,10 @@ mod tests {
             ..SttConfig::default()
         };
         assert!(is_wanted(&cfg, (Engine::GigaAm, "gigaam-v3-e2e-ctc-int8")));
-        assert!(!is_wanted(&cfg, (Engine::GigaAm, "gigaam-v4-когда-нибудь")));
+        assert!(!is_wanted(
+            &cfg,
+            (Engine::GigaAm, "gigaam-v3-e2e-rnnt-int8")
+        ));
     }
 
     #[test]
