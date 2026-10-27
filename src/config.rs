@@ -246,6 +246,9 @@ pub struct GeneralConfig {
     /// пользователя, а не первый запуск.
     pub actions_initialised: bool,
     pub actions_validation_migrated: bool,
+    /// Действия уже переведены на «вставлять сразу». Дальше галочка —
+    /// выбор пользователя, и снятую повторно не включаем.
+    pub actions_replace_migrated: bool,
     /// Через сколько минут простоя выгружать локальные модели из памяти.
     ///
     /// Правило общее для распознавания и языковой модели: обе живут в одном
@@ -285,6 +288,7 @@ impl Default for GeneralConfig {
             swallow_hotkey: true,
             actions_initialised: false,
             actions_validation_migrated: false,
+            actions_replace_migrated: false,
             idle_unload_min: 10,
             key_in_config: false,
         }
@@ -516,6 +520,12 @@ impl Config {
             }
             self.general.actions_validation_migrated = true;
         }
+        if !self.general.actions_replace_migrated {
+            for action in &mut self.actions {
+                action.output = crate::actions::Output::Replace;
+            }
+            self.general.actions_replace_migrated = true;
+        }
         self
     }
 
@@ -614,6 +624,22 @@ pub mod secrets {
 #[cfg(test)]
 mod storage_tests {
     use super::*;
+
+    #[test]
+    fn actions_switch_to_replace_once() {
+        let mut cfg = Config::default();
+        cfg.general.actions_initialised = true;
+        cfg.actions = vec![crate::actions::TextAction {
+            output: crate::actions::Output::Clipboard,
+            ..Default::default()
+        }];
+        let mut cfg = cfg.normalized();
+        assert_eq!(cfg.actions[0].output, crate::actions::Output::Replace);
+        // Снятая после переноса галочка остаётся снятой.
+        cfg.actions[0].output = crate::actions::Output::Clipboard;
+        let cfg = cfg.normalized();
+        assert_eq!(cfg.actions[0].output, crate::actions::Output::Clipboard);
+    }
 
     #[test]
     fn storage_migration_preserves_all_provider_keys() {

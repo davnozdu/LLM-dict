@@ -15,13 +15,6 @@ pub enum Output {
 }
 
 impl Output {
-    pub fn label(self) -> &'static str {
-        match self {
-            Output::Clipboard => "положить в буфер",
-            Output::Replace => "заменить выделенное сразу",
-        }
-    }
-
     pub fn hint(self) -> &'static str {
         match self {
             Output::Clipboard => {
@@ -75,7 +68,7 @@ impl Default for TextAction {
             prompt: "Перепиши текст пользователя. Выведи только результат.".into(),
             endpoint: Endpoint::default(),
             hotkey: Binding::new(Vec::new()),
-            output: Output::Clipboard,
+            output: Output::Replace,
             enabled: true,
             after_dictation: false,
             context_file: String::new(),
@@ -118,7 +111,7 @@ pub fn correction_action(endpoint: Endpoint) -> TextAction {
         prompt: crate::local_llm::CORRECT_PROMPT.into(),
         endpoint,
         hotkey: Binding::new(Vec::new()),
-        output: Output::Clipboard,
+        output: Output::Replace,
         enabled: true,
         after_dictation: true,
         // Ровно то действие, ради которого локальная модель и заводится:
@@ -147,7 +140,7 @@ pub fn answer_action(endpoint: Endpoint) -> TextAction {
             .into(),
         endpoint,
         hotkey: Binding::new(Vec::new()),
-        output: Output::Clipboard,
+        output: Output::Replace,
         enabled: true,
         after_dictation: false,
         context_file: String::new(),
@@ -173,7 +166,7 @@ pub fn defaults() -> Vec<TextAction> {
             prompt: translate_prompt("английский"),
             endpoint: endpoint.clone(),
             hotkey: Binding::new(Vec::new()),
-            output: Output::Clipboard,
+            output: Output::Replace,
             enabled: true,
             after_dictation: false,
             context_file: String::new(),
@@ -187,7 +180,7 @@ pub fn defaults() -> Vec<TextAction> {
             prompt: translate_prompt("чешский"),
             endpoint: endpoint.clone(),
             hotkey: Binding::new(Vec::new()),
-            output: Output::Clipboard,
+            output: Output::Replace,
             enabled: true,
             after_dictation: false,
             context_file: String::new(),
@@ -201,7 +194,7 @@ pub fn defaults() -> Vec<TextAction> {
             prompt: translate_prompt("русский"),
             endpoint: endpoint.clone(),
             hotkey: Binding::new(Vec::new()),
-            output: Output::Clipboard,
+            output: Output::Replace,
             enabled: true,
             after_dictation: false,
             context_file: String::new(),

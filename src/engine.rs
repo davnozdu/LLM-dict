@@ -1115,8 +1115,14 @@ fn run_action(shared: &Arc<Shared>, id: &str) {
                                 cfg.general.restore_clipboard,
                                 target,
                             )?;
+                        } else if crate::macos::frontmost_app_pid() == target {
+                            // Выделение через Accessibility не видно — браузеры
+                            // и Electron его не отдают. Но ⌘C только что
+                            // сработал в этой же программе, значит выделение
+                            // на месте: вставляем поверх него.
+                            insert::insert(&result, cfg.general.restore_clipboard)?;
+                            replaced = true;
                         } else {
-                            // Нельзя подтвердить выделение через Accessibility.
                             insert::write_clipboard(&result)?;
                         }
                     }

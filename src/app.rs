@@ -2460,12 +2460,20 @@ impl App {
         ui.weak("Выделенный текст приходит модели отдельным сообщением, вставлять его в промпт не нужно.");
 
         ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.add_sized([130.0, 20.0], egui::Label::new("Результат"));
-            for o in [Output::Clipboard, Output::Replace] {
-                ui.selectable_value(&mut self.cfg.actions[pos].output, o, o.label());
-            }
-        });
+        let mut replace = self.cfg.actions[pos].output == Output::Replace;
+        if ui
+            .checkbox(
+                &mut replace,
+                "Вставлять сразу — заменить выделенный текст результатом",
+            )
+            .changed()
+        {
+            self.cfg.actions[pos].output = if replace {
+                Output::Replace
+            } else {
+                Output::Clipboard
+            };
+        }
         ui.weak(self.cfg.actions[pos].output.hint());
 
         // --- файл со сведениями ---
