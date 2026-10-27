@@ -112,6 +112,7 @@ pub struct App {
     main_size: egui::Vec2,
     /// Набирается сочетание именно для окна буфера, а не для действия.
     capturing_clipboard: bool,
+    capturing_last: bool,
     duplicates: Vec<String>,
     duplicates_checked: Instant,
     key_synced: bool,
@@ -218,6 +219,7 @@ impl App {
             picker_closed: long_ago(10),
             main_size: egui::vec2(600.0, 680.0),
             capturing_clipboard: false,
+            capturing_last: false,
             duplicates: Vec::new(),
             duplicates_checked: long_ago(60),
             key_synced: false,
@@ -1053,7 +1055,7 @@ impl App {
             ui.label(egui::RichText::new("Горячая клавиша").strong());
             ui.add_space(4.0);
 
-            if self.capturing {
+            if self.capturing && !self.capturing_clipboard && !self.capturing_last {
                 let shown = if self.capture_preview.is_empty() {
                     "нажмите клавиши…".to_string()
                 } else {
@@ -1163,6 +1165,61 @@ impl App {
                      отвечает системным писком.",
                 );
             }
+
+            ui.add_space(8.0);
+            let capturing_last = self.capturing_last;
+            ui.horizontal(|ui| {
+                ui.add_sized([130.0, 20.0], egui::Label::new("Вставить последнее"));
+                if capturing_last {
+                    let shown = if self.capture_preview.is_empty() {
+                        "нажмите клавиши…".to_string()
+                    } else {
+                        Binding::new(self.capture_preview.clone()).label()
+                    };
+                    ui.colored_label(egui::Color32::from_rgb(90, 140, 240), shown);
+                    if ui
+                        .add_enabled(!self.capture_preview.is_empty(), egui::Button::new("ОК"))
+                        .clicked()
+                    {
+                        self.cfg.general.paste_last_hotkey =
+                            Binding::new(self.capture_preview.clone());
+                        self.set_capturing(false);
+                        self.capturing_last = false;
+                    }
+                    if ui.button("Отмена").clicked() {
+                        self.set_capturing(false);
+                        self.capturing_last = false;
+                    }
+                } else {
+                    ui.label(self.cfg.general.paste_last_hotkey.label());
+                    if ui.button("Задать").clicked() {
+                        self.set_capturing(true);
+                        self.capturing_last = true;
+                    }
+                    if !self.cfg.general.paste_last_hotkey.is_empty()
+                        && ui.button("Убрать").clicked()
+                    {
+                        self.cfg.general.paste_last_hotkey = Binding::new(Vec::new());
+                    }
+                }
+            });
+            let last = &self.cfg.general.paste_last_hotkey;
+            if !last.is_empty() && *last == self.cfg.general.hotkey {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 80, 80),
+                    "Занято — это сочетание уже стоит на диктовке",
+                );
+            } else if !last.is_empty() && *last == self.cfg.general.clipboard_hotkey {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 80, 80),
+                    "Занято — это сочетание уже открывает буфер обмена",
+                );
+            }
+            ui.weak(
+                "Вставляет последний результат туда, где сейчас курсор. Выручает, если \
+                 фокус ушёл во время диктовки: текст сохранён в истории, открывать окно \
+                 не нужно.",
+            );
 
             ui.add_space(12.0);
             ui.separator();

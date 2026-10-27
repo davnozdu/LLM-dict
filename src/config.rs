@@ -225,6 +225,9 @@ pub struct GeneralConfig {
     pub clipboard_days: u32,
     /// Сочетание, открывающее окно выбора из истории буфера.
     pub clipboard_hotkey: Binding,
+    /// Сочетание, вставляющее последний результат ещё раз. Выручает, когда
+    /// фокус ушёл во время диктовки и текст остался только в истории.
+    pub paste_last_hotkey: Binding,
     /// Что это сочетание делает: открывает список или листает записи.
     pub clipboard_mode: ClipboardMode,
     /// Сколько последних записей показывать в списке и листать по кругу.
@@ -275,6 +278,7 @@ impl Default for GeneralConfig {
             clipboard_history: true,
             clipboard_days: 30,
             clipboard_hotkey: Binding::new(Vec::new()),
+            paste_last_hotkey: Binding::new(Vec::new()),
             clipboard_mode: ClipboardMode::List,
             clipboard_recent: 10,
             check_updates: true,

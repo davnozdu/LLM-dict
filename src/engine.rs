@@ -245,6 +245,9 @@ impl Shared {
 /// только усложнила бы разбор вложенных сочетаний.
 pub const CLIPBOARD_ACTION_ID: &str = "__clipboard_picker__";
 
+/// Особое имя для сочетания «вставить последнее» — тем же путём.
+pub const PASTE_LAST_ACTION_ID: &str = "__paste_last__";
+
 pub const NOTICE_LIFETIME: std::time::Duration = std::time::Duration::from_millis(1000);
 
 /// Слишком короткое нажатие — это промах по клавише, а не диктовка.
@@ -386,6 +389,16 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
                     }
                     ClipboardMode::Cycle => cycle_clipboard(&shared, &cfg, &mut cycle),
                 }
+            }
+
+            HotKeyEvent::Action(id) if id == PASTE_LAST_ACTION_ID => {
+                if let Some(rec) = recording.take() {
+                    let _ = rec.finish();
+                    shared.hotkey_state.set_recording(false);
+                }
+                paste_last(&shared);
+                discard_busy_events(&shared, &rx);
+                shared.set_stage(Stage::Idle);
             }
 
             HotKeyEvent::Action(id) => {
@@ -565,6 +578,12 @@ fn collect_bindings(cfg: &Config) -> Vec<(String, crate::binding::Binding)> {
         out.push((
             CLIPBOARD_ACTION_ID.to_string(),
             cfg.general.clipboard_hotkey.clone(),
+        ));
+    }
+    if !cfg.general.paste_last_hotkey.is_empty() {
+        out.push((
+            PASTE_LAST_ACTION_ID.to_string(),
+            cfg.general.paste_last_hotkey.clone(),
         ));
     }
     out
@@ -975,6 +994,66 @@ fn record_result(
     shared.add_history(entry, cfg.general.history_limit);
 }
 
+/// Дождаться, пока клавиши сочетания отпустят.
+///
+/// Копирование и вставка изображаются нажатием ⌘C и ⌘V. Если послать его,
+/// пока пользователь ещё держит, скажем, ⌘⌥C, программа-получатель
+/// увидит ⌘⌥C, а не ⌘C, ничего не скопирует — и действие тихо упрётся
+/// в таймаут.
+fn wait_keys_released(shared: &Arc<Shared>) {
+    let wait_until = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < wait_until {
+        if shared.hotkey_state.diagnostics().0.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Небольшая пауза сверх этого: система обрабатывает отпускание
+    // модификаторов не мгновенно.
+    std::thread::sleep(Duration::from_millis(60));
+}
+
+/// Последний непустой результат: сначала из памяти, затем из истории на
+/// диске — она переживает перезапуск после сбоя.
+fn last_result(shared: &Shared) -> Option<String> {
+    if let Some(text) = shared.last_text.lock().unwrap().clone() {
+        return Some(text);
+    }
+    shared
+        .history
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|e| !e.final_text.trim().is_empty())
+        .map(|e| e.final_text.clone())
+}
+
+/// Вставляет последний результат ещё раз — туда, где сейчас курсор.
+/// В историю не пишет: текст там уже есть.
+fn paste_last(shared: &Arc<Shared>) {
+    let cfg = shared.config_snapshot();
+    let Some(text) = last_result(shared) else {
+        shared.notify("Вставлять нечего — история пуста");
+        return;
+    };
+    shared.set_stage(Stage::Inserting);
+    wait_keys_released(shared);
+    match insert::insert(&text, cfg.general.restore_clipboard) {
+        Ok(_) => {
+            shared.set_error(None);
+            shared.notify("Вставлено последнее");
+        }
+        Err(e) => {
+            let msg = format!("Не вставить последнее: {e}");
+            shared.set_error(Some(msg.clone()));
+            shared.notify(msg);
+            if cfg.general.play_sounds {
+                insert::play_sound("Basso");
+            }
+        }
+    }
+}
+
 /// Выполняет действие над выделенным текстом.
 ///
 /// Рабочий поток выполняет операции последовательно. Event tap живёт в
@@ -999,22 +1078,7 @@ fn run_action(shared: &Arc<Shared>, id: &str) {
             insert::play_sound("Tink");
         }
 
-        // Дождаться, пока клавиши сочетания отпустят.
-        //
-        // Копирование выделенного изображается нажатием ⌘C. Если послать его,
-        // пока пользователь ещё держит, скажем, ⌘⌥C, программа-получатель
-        // увидит ⌘⌥C, а не ⌘C, ничего не скопирует — и действие тихо упрётся
-        // в таймаут.
-        let wait_until = Instant::now() + Duration::from_millis(1500);
-        while Instant::now() < wait_until {
-            if shared.hotkey_state.diagnostics().0.is_empty() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        // Небольшая пауза сверх этого: система обрабатывает отпускание
-        // модификаторов не мгновенно.
-        std::thread::sleep(Duration::from_millis(60));
+        wait_keys_released(shared);
 
         let started = Instant::now();
         let mut replaced = false;
@@ -1158,7 +1222,7 @@ pub fn hotkey_mode_hint(mode: HotKeyMode) -> &'static str {
 mod tests {
     use super::{
         collect_bindings, dictation_transition_delay, next_cycle_pos, recording_event,
-        DictationDelay, MACRO_GRACE,
+        DictationDelay, MACRO_GRACE, PASTE_LAST_ACTION_ID,
     };
     use crate::actions::TextAction;
     use crate::binding::{Binding, K_RIGHT_COMMAND as CMD, K_RIGHT_OPTION as OPT};
@@ -1393,6 +1457,18 @@ mod tests {
             dictation_transition_delay(&cfg, &HotKeyEvent::StopRecording),
             Duration::ZERO
         );
+    }
+
+    #[test]
+    fn paste_last_binding_reaches_tap() {
+        let mut cfg = macro_config(HotKeyMode::Hold);
+        assert!(!collect_bindings(&cfg)
+            .iter()
+            .any(|(id, _)| id == PASTE_LAST_ACTION_ID));
+        cfg.general.paste_last_hotkey = Binding::new(vec![CMD, OPT, KEY_C + 1]);
+        assert!(collect_bindings(&cfg)
+            .iter()
+            .any(|(id, _)| id == PASTE_LAST_ACTION_ID));
     }
 
     #[test]
