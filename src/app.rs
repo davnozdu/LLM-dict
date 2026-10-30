@@ -31,6 +31,60 @@ fn long_ago(secs: u64) -> Instant {
         .unwrap_or_else(Instant::now)
 }
 
+/// Состояние системных разрешений, которое обновляет отдельный поток.
+///
+/// Три проверки вместе стоят около 14 мс: `microphone` — 9,2 мс,
+/// `input_monitoring` — 4,6 мс. На потоке интерфейса это заметный рывок, а
+/// спрашивать их чаще раза в пару секунд незачем — разрешение меняют руками
+/// в системных настройках. Поэтому опрос идёт фоном, а окно читает числа.
+struct Perms {
+    ax: std::sync::atomic::AtomicU8,
+    mic: std::sync::atomic::AtomicU8,
+    listen: std::sync::atomic::AtomicU8,
+}
+
+impl Perms {
+    fn new() -> Arc<Self> {
+        use std::sync::atomic::AtomicU8;
+        let not_asked = permissions::Status::NotAsked.code();
+        let perms = Arc::new(Self {
+            ax: AtomicU8::new(not_asked),
+            mic: AtomicU8::new(not_asked),
+            listen: AtomicU8::new(not_asked),
+        });
+        let worker = perms.clone();
+        std::thread::spawn(move || loop {
+            worker
+                .ax
+                .store(permissions::accessibility().code(), Ordering::Relaxed);
+            worker
+                .mic
+                .store(permissions::microphone().code(), Ordering::Relaxed);
+            worker
+                .listen
+                .store(permissions::input_monitoring().code(), Ordering::Relaxed);
+            std::thread::sleep(Duration::from_secs(2));
+        });
+        perms
+    }
+
+    /// Универсальный доступ, микрофон, мониторинг ввода.
+    fn get(
+        &self,
+    ) -> (
+        permissions::Status,
+        permissions::Status,
+        permissions::Status,
+    ) {
+        use std::sync::atomic::Ordering;
+        (
+            permissions::Status::from_code(self.ax.load(Ordering::Relaxed)),
+            permissions::Status::from_code(self.mic.load(Ordering::Relaxed)),
+            permissions::Status::from_code(self.listen.load(Ordering::Relaxed)),
+        )
+    }
+}
+
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Tab {
     Status,
@@ -82,8 +136,18 @@ pub struct App {
     autostart_on: bool,
     filter: HistoryFilter,
     toast: Option<(String, Instant)>,
-    perms: (permissions::Status, permissions::Status),
-    perms_checked: Instant,
+    perms: Arc<Perms>,
+    /// Имя микрофона: спрашивать его у CoreAudio каждый кадр стоит ~2 мс.
+    device_name: Option<String>,
+    device_checked: Instant,
+    /// Вердикты о занятости сочетаний: `conflicts::check` запускает plutil,
+    /// поэтому считается один раз на сочетание, а не на кадр.
+    verdicts: HashMap<Binding, conflicts::Verdict>,
+    /// Проверка файла сведений: путь → (размер, время правки, итог).
+    context_checks: HashMap<String, ContextCheck>,
+    /// Что из моделей уже скачано: stat по файлам на каждом кадре незачем.
+    installed: HashMap<String, bool>,
+    installed_checked: Instant,
     capturing: bool,
     capture_preview: Vec<u16>,
     verdict: conflicts::Verdict,
@@ -151,6 +215,15 @@ struct Download {
     result: Receiver<Result<(), String>>,
 }
 
+/// Итог проверки файла сведений, вместе с признаками, по которым видно, что
+/// его переписали.
+struct ContextCheck {
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+    /// Число символов или текст ошибки — ровно то, что показывается в окне.
+    result: Result<Option<usize>, String>,
+}
+
 enum UpdateState {
     Idle,
     Checking(Receiver<Result<Option<updater::Release>, String>>),
@@ -164,7 +237,15 @@ enum UpdateState {
 impl App {
     pub fn new(shared: Arc<Shared>) -> Self {
         let cfg = shared.config_snapshot();
-        let api_key_input = shared.api_key_snapshot();
+        // Ключ читается фоном (см. `Shared::new`), и на главном потоке связку
+        // ключей трогать нельзя: она умеет показать модальный запрос доступа.
+        // Пока фоновое чтение не закончилось, поле остаётся пустым, а досылает
+        // его `poll_api_key`.
+        let api_key_input = if shared.key_loaded() {
+            shared.key(cfg.stt.key_account())
+        } else {
+            String::new()
+        };
 
         // Ставится до создания значка в панели: внутри muda обработчик лежит
         // в OnceLock, и первое же нажатие при пустом гнезде закрывает его
@@ -198,11 +279,13 @@ impl App {
             autostart_on: autostart::is_enabled(),
             filter: HistoryFilter::All,
             toast: None,
-            perms: (permissions::Status::NotAsked, permissions::Status::NotAsked),
-            // checked_sub, а не вычитание: Instant отсчитывается от загрузки
-            // системы, и в первую минуту после неё вычитание паникует.
-            // Приложение стоит в автозапуске, то есть стартует именно тогда.
-            perms_checked: long_ago(10),
+            perms: Perms::new(),
+            device_name: None,
+            device_checked: long_ago(10),
+            verdicts: HashMap::new(),
+            context_checks: HashMap::new(),
+            installed: HashMap::new(),
+            installed_checked: long_ago(10),
             capturing: false,
             capture_preview: Vec::new(),
             verdict: conflicts::Verdict::Free,
@@ -302,8 +385,10 @@ impl App {
             match result {
                 Ok((cfg, key)) => {
                     self.cfg = cfg;
-                    self.api_key_input = key;
-                    self.shared.set_api_key(self.api_key_input.clone());
+                    self.api_key_input = key.clone();
+                    // Ключи переехали в другое хранилище — прежний кеш неверен.
+                    self.shared.forget_keys();
+                    self.shared.set_key(self.cfg.stt.key_account(), key);
                     self.key_synced = true;
                     self.provider_keys.clear();
                     self.stored_keys.clear();
@@ -412,6 +497,64 @@ impl App {
         }
     }
 
+    /// Вердикт для сочетания действия. Считается один раз на сочетание:
+    /// `conflicts::check` запускает `plutil`, а редактор рисуется каждый кадр.
+    fn verdict_cached(&mut self, binding: &Binding) -> conflicts::Verdict {
+        if let Some(verdict) = self.verdicts.get(binding) {
+            return verdict.clone();
+        }
+        let verdict = conflicts::check(binding);
+        self.verdicts.insert(binding.clone(), verdict.clone());
+        verdict
+    }
+
+    /// Читается ли файл сведений — с кешем по размеру и времени правки.
+    ///
+    /// Без кеша редактор действия перечитывал бы до 256 КБ на каждом кадре
+    /// только ради строки «Файл читается: N символов».
+    fn context_check(&mut self, pos: usize) -> Result<Option<usize>, String> {
+        let path = self.cfg.actions[pos].context_file.trim().to_string();
+        if path.is_empty() {
+            return Ok(None);
+        }
+        let meta = std::fs::metadata(&path).ok();
+        let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let modified = meta.as_ref().and_then(|m| m.modified().ok());
+        if let Some(cached) = self.context_checks.get(&path) {
+            if cached.size == size && cached.modified == modified {
+                return cached.result.clone();
+            }
+        }
+        let action = self.cfg.actions[pos].clone();
+        let result = action
+            .load_context()
+            .map(|text| text.map(|t| t.chars().count()))
+            .map_err(|e| e.to_string());
+        self.context_checks.insert(
+            path,
+            ContextCheck {
+                size,
+                modified,
+                result: result.clone(),
+            },
+        );
+        result
+    }
+
+    /// Скачана ли модель. `stat` по файлам на каждом кадре — лишняя работа.
+    fn installed(&mut self, spec: &'static models::ModelSpec) -> bool {
+        if self.installed_checked.elapsed() > Duration::from_secs(2) {
+            self.installed.clear();
+            self.installed_checked = Instant::now();
+        }
+        if let Some(known) = self.installed.get(spec.id) {
+            return *known;
+        }
+        let installed = spec.is_installed();
+        self.installed.insert(spec.id.to_string(), installed);
+        installed
+    }
+
     fn set_capturing(&mut self, on: bool) {
         self.capturing = on;
         self.capture_preview.clear();
@@ -428,7 +571,7 @@ impl App {
         }
         self.key_synced = true;
         if self.api_key_input.is_empty() {
-            self.api_key_input = self.shared.api_key_snapshot();
+            self.api_key_input = self.shared.key(self.cfg.stt.key_account());
         }
     }
 
@@ -439,6 +582,8 @@ impl App {
                 let id = dl.model_id.clone();
                 self.toast(format!("Модель {id} скачана"));
                 self.download = None;
+                // Список моделей изменился: кеш «скачано» больше не верен.
+                self.installed_checked = long_ago(10);
             }
             Ok(Err(e)) => {
                 self.toast(format!("Загрузка не удалась: {e}"));
@@ -554,8 +699,14 @@ impl App {
 
     /// Сохраняет ключ в выбранном хранилище и обновляет рабочий кеш.
     fn save_api_key(&mut self) {
+        let provider = self.cfg.stt.provider;
+        let account = self.cfg.stt.key_account();
+        if account.is_empty() {
+            self.toast(format!("{} работает без ключа", provider.label()));
+            return;
+        }
         let key = self.api_key_input.trim().to_string();
-        match self.cfg.set_key_for("groq_api_key", &key) {
+        match self.cfg.set_key_for(account, &key) {
             Ok(()) if self.cfg.general.key_in_config => {
                 self.toast("Ключ сохранён в файле настроек")
             }
@@ -565,12 +716,11 @@ impl App {
                 return;
             }
         }
-        self.shared.set_api_key(key);
-        self.stored_keys
-            .insert(Provider::Groq, self.api_key_input.trim().to_string());
-        self.provider_keys
-            .insert(Provider::Groq, self.api_key_input.trim().to_string());
-        self.key_reads.remove(&Provider::Groq);
+        self.shared.set_key(account, key.clone());
+        self.api_key_input = key.clone();
+        self.stored_keys.insert(provider, key.clone());
+        self.provider_keys.insert(provider, key);
+        self.key_reads.remove(&provider);
     }
 
     fn start_model_check(&mut self) {
@@ -697,10 +847,12 @@ impl eframe::App for App {
             self.start_update_check();
         }
 
-        // Разрешения опрашиваем раз в секунду: вызовы дешёвые, но не бесплатные.
-        if self.perms_checked.elapsed() > Duration::from_secs(1) {
-            self.perms = (permissions::accessibility(), permissions::microphone());
-            self.perms_checked = Instant::now();
+        // Разрешения опрашивает фоновый поток (`Perms`): три проверки вместе
+        // стоят ~14 мс, и на каждом кадре это заметный рывок. Здесь только
+        // редкое обновление имени микрофона — тоже системный вызов на 2 мс.
+        if self.device_checked.elapsed() > Duration::from_secs(5) {
+            self.device_name = crate::audio::input_device_name();
+            self.device_checked = Instant::now();
         }
 
         // Закрытие окна прячет его, а не завершает приложение.
@@ -717,7 +869,8 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.tab, Tab::Settings, "Настройки");
                 ui.selectable_value(&mut self.tab, Tab::History, "История");
                 ui.selectable_value(&mut self.tab, Tab::Clipboard, "Буфер");
-                let perms_ok = self.perms.0.is_ok() && self.perms.1.is_ok();
+                let (ax, mic, _) = self.perms.get();
+                let perms_ok = ax.is_ok() && mic.is_ok();
                 let label = if perms_ok {
                     "Права"
                 } else {
@@ -879,7 +1032,8 @@ impl App {
         // Без «Мониторинга ввода» работают только сочетания из модификаторов.
         // Диктовка на правом ⌘ при этом идёт как ни в чём не бывало, поэтому
         // без явного предупреждения причина неочевидна.
-        if !permissions::input_monitoring().is_ok() {
+        let (ax, mic, listen) = self.perms.get();
+        if !listen.is_ok() {
             ui.colored_label(
                 egui::Color32::from_rgb(220, 80, 80),
                 "Нет разрешения «Мониторинг ввода»",
@@ -920,7 +1074,7 @@ impl App {
             ui.add_space(8.0);
         }
 
-        let missing = engine::missing_permissions();
+        let missing = engine::missing_permissions(ax, mic, listen);
         if !missing.is_empty() {
             ui.colored_label(
                 egui::Color32::from_rgb(220, 130, 40),
@@ -978,7 +1132,7 @@ impl App {
         }
 
         ui.add_space(10.0);
-        if let Some(dev) = crate::audio::input_device_name() {
+        if let Some(dev) = &self.device_name {
             ui.weak(format!("Микрофон: {dev}"));
         }
     }
@@ -989,12 +1143,19 @@ impl App {
             ui.label(egui::RichText::new("Доступ к API").strong());
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label("Ключ:");
+                ui.label(format!("Ключ {}:", self.cfg.stt.provider.label()));
+                let hint = match self.cfg.stt.provider {
+                    Provider::Groq => "gsk_...",
+                    Provider::Gemini => "AIza...",
+                    Provider::DeepSeek => "sk-...",
+                    Provider::OllamaCloud => "ключ ollama.com",
+                    _ => "ключ API",
+                };
                 ui.add(
                     egui::TextEdit::singleline(&mut self.api_key_input)
                         .password(true)
                         .desired_width(300.0)
-                        .hint_text("gsk_..."),
+                        .hint_text(hint),
                 );
             });
             ui.horizontal(|ui| {
@@ -1382,6 +1543,38 @@ impl App {
             // --- облако ---
             ui.add_space(10.0);
             ui.label(egui::RichText::new("Облако").weak());
+            // Поставщик выбирается явно: от него зависит не только адрес, но и
+            // то, под каким именем лежит ключ. Одно поле на всех означало, что
+            // сохранение ключа нового сервиса затирало прежний.
+            labeled(ui, "Поставщик", |ui| {
+                let mut provider = self.cfg.stt.provider;
+                egui::ComboBox::from_id_salt("stt_provider")
+                    .width(220.0)
+                    .selected_text(provider.label())
+                    .show_ui(ui, |ui| {
+                        for p in Provider::ALL.into_iter().filter(|p| *p != Provider::Local) {
+                            ui.selectable_value(&mut provider, p, p.label());
+                        }
+                    });
+                if provider != self.cfg.stt.provider {
+                    let previous = self.cfg.stt.provider;
+                    // Набранный, но не сохранённый ключ пропадёт при смене
+                    // поставщика — об этом лучше сказать, чем молча стереть.
+                    let typed = self.api_key_input.trim().to_string();
+                    if !typed.is_empty() && typed != self.shared.key(previous.key_account()) {
+                        self.toast(format!("Ключ {} не был сохранён", previous.label()));
+                    }
+                    self.cfg.stt.provider = provider;
+                    self.cfg.stt.base_url = provider.default_base_url().to_string();
+                    if provider == Provider::Groq {
+                        self.cfg.stt.model = "whisper-large-v3-turbo".to_string();
+                    }
+                    // Ключ у каждого сервиса свой — показываем сохранённый.
+                    self.api_key_input = self.shared.key(provider.key_account());
+                    self.model_check = None;
+                    self.check_message = None;
+                }
+            });
             labeled(ui, "Адрес API", |ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.cfg.stt.base_url).desired_width(320.0));
             });
@@ -1651,7 +1844,7 @@ impl App {
         let mut cancel = false;
 
         for spec in catalog.iter() {
-            let installed = spec.is_installed();
+            let installed = self.installed(spec);
             let downloading = self
                 .download
                 .as_ref()
@@ -1730,7 +1923,10 @@ impl App {
         }
         if let Some(spec) = to_remove {
             match spec.remove() {
-                Ok(()) => self.toast(format!("Модель {} удалена", spec.title)),
+                Ok(()) => {
+                    self.toast(format!("Модель {} удалена", spec.title));
+                    self.installed_checked = long_ago(10);
+                }
                 Err(e) => self.toast(format!("Не удалить: {e}")),
             }
         }
@@ -1847,9 +2043,11 @@ impl App {
                 match self.cfg.set_key_for(account, value.trim()) {
                     Ok(()) => {
                         self.stored_keys.insert(provider, value.trim().to_string());
-                        if provider == Provider::Groq {
+                        self.shared.set_key(account, value.trim().to_string());
+                        // Тот же ключ мог быть и ключом распознавания: поле
+                        // наверху окна должно показывать то, что сохранено.
+                        if provider == self.cfg.stt.provider {
                             self.api_key_input = value.trim().to_string();
-                            self.shared.set_api_key(self.api_key_input.clone());
                         }
                         self.toast(format!("Ключ {} сохранён", provider.label()));
                     }
@@ -1868,6 +2066,9 @@ impl App {
     }
 
     /// Проверяет ключ настоящим запросом к модели, а не чтением списка.
+    ///
+    /// Берётся то, что набрано в поле, — иначе «Проверить» проверял бы
+    /// сохранённый ключ, а не тот, который пользователь только что вставил.
     fn verify_key_now(&mut self, provider: Provider) {
         let Some(action) = self
             .cfg
@@ -1880,9 +2081,14 @@ impl App {
             return;
         };
         let cfg = self.cfg.clone();
+        let typed = self
+            .provider_keys
+            .get(&provider)
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty());
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let key = cfg.key_for(provider.key_account());
+            let key = typed.unwrap_or_else(|| cfg.key_for(provider.key_account()));
             let _ = tx.send(
                 providers::verify_key(&action.endpoint, &key)
                     .map(|()| Vec::new())
@@ -2055,6 +2261,23 @@ impl App {
 
         let recent = self.cfg.general.clipboard_recent.clamp(1, 100);
 
+        // Клавиши списка забираем у поля поиска заранее: иначе ↑↓ двигали бы
+        // ещё и каретку в самом поле, а Enter уходил бы в него. `consume_key`
+        // убирает событие из очереди, поэтому поле его уже не увидит.
+        let (nav_down, nav_up, enter, shift_enter, escape) = if self.picker_focused {
+            ui.input_mut(|i| {
+                (
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+                    i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter),
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+                )
+            })
+        } else {
+            (false, false, false, false, false)
+        };
+
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Буфер обмена").strong());
             ui.label(
@@ -2103,23 +2326,23 @@ impl App {
         // в первом же проходе. Разбирать клавиши до прихода фокуса значило бы
         // закрыть список чужим Esc, нажатым когда-то раньше.
         let keys = self.picker_focused;
-        if keys && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if keys && escape {
             self.close_picker(&ctx);
             return;
         }
-        if keys && ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) && !found.is_empty() {
+        if keys && nav_down && !found.is_empty() {
             self.picker_index = (self.picker_index + 1).min(found.len() - 1);
         }
-        if keys && ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+        if keys && nav_up {
             self.picker_index = self.picker_index.saturating_sub(1);
         }
         if self.picker_index >= found.len() {
             self.picker_index = found.len().saturating_sub(1);
         }
-        if keys && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+        if keys && (enter || shift_enter) {
             if let Some(entry) = found.get(self.picker_index) {
                 let text = entry.text.clone();
-                if ctx.input(|i| i.modifiers.shift) {
+                if shift_enter {
                     self.copy_from_picker(&ctx, text);
                 } else {
                     self.paste_from_picker(&ctx, text);
@@ -2329,7 +2552,7 @@ impl App {
                     format!("Занято — это сочетание уже у действия «{}»", other.1.name),
                 );
             } else {
-                match conflicts::check(&own) {
+                match self.verdict_cached(&own) {
                     conflicts::Verdict::Free => {
                         ui.colored_label(
                             egui::Color32::from_rgb(60, 160, 90),
@@ -2389,8 +2612,9 @@ impl App {
         // обе — по три гигабайта каждая.
         if provider.is_local() {
             let chosen = crate::models::find(&self.cfg.local_llm.model);
+            let ready = chosen.is_some_and(|spec| self.installed(spec));
             labeled(ui, "Модель", |ui| match chosen {
-                Some(spec) if spec.is_installed() => {
+                Some(spec) if ready => {
                     ui.label(spec.title);
                 }
                 Some(spec) => {
@@ -2530,16 +2754,16 @@ impl App {
             }
         }
         if !self.cfg.actions[pos].context_file.is_empty() {
-            match self.cfg.actions[pos].load_context() {
-                Ok(Some(text)) => {
+            match self.context_check(pos) {
+                Ok(Some(chars)) => {
                     ui.colored_label(
                         egui::Color32::from_rgb(60, 160, 90),
-                        format!("Файл читается: {} символов", text.chars().count()),
+                        format!("Файл читается: {chars} символов"),
                     );
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    ui.colored_label(egui::Color32::from_rgb(220, 80, 80), e.to_string());
+                    ui.colored_label(egui::Color32::from_rgb(220, 80, 80), e);
                 }
             }
             ui.weak(
@@ -2593,7 +2817,7 @@ impl App {
                     "Локальная модель не выбрана — выберите её в настройках распознавания",
                 );
             } else if !crate::models::find(&self.cfg.local_llm.model)
-                .is_some_and(|m| m.is_installed())
+                .is_some_and(|m| self.installed(m))
             {
                 ui.colored_label(
                     egui::Color32::from_rgb(220, 130, 40),
@@ -2852,7 +3076,7 @@ impl App {
         ui.label(egui::RichText::new("Системные разрешения").strong());
         ui.add_space(8.0);
 
-        let (ax, mic) = self.perms;
+        let (ax, mic, listen) = self.perms.get();
 
         perm_row(
             ui,
@@ -2888,7 +3112,6 @@ impl App {
         }
 
         ui.add_space(12.0);
-        let listen = permissions::input_monitoring();
         perm_row(
             ui,
             "Мониторинг ввода",

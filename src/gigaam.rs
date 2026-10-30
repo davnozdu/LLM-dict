@@ -181,12 +181,19 @@ pub fn greedy_ctc(log_probs: &[f32], classes: usize, blank: usize) -> Vec<usize>
     let mut out = Vec::new();
     let mut prev = blank;
     for frame in log_probs.chunks_exact(classes) {
-        let best = frame
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.total_cmp(b))
-            .map(|(i, _)| i)
-            .unwrap_or(blank);
+        // При равных вероятностях берём первый класс — как numpy.argmax и как
+        // жадный декодер RNN-T ниже. `max_by` вернул бы последний, и выбор
+        // зависел бы от того, какой движок стоит в настройках.
+        let best = frame.iter().enumerate().fold(
+            0,
+            |best, (i, value)| {
+                if *value > frame[best] {
+                    i
+                } else {
+                    best
+                }
+            },
+        );
         if best != blank && best != prev {
             out.push(best);
         }
@@ -376,6 +383,15 @@ mod tests {
         ];
         let flat: Vec<f32> = frames.iter().flatten().copied().collect();
         assert_eq!(greedy_ctc(&flat, 3, 2), vec![0, 0, 1]);
+    }
+
+    #[test]
+    fn при_равных_вероятностях_берётся_первый_класс() {
+        // Так же поступает numpy.argmax и жадный декодер RNN-T. Иначе выход
+        // зависел бы от того, какой движок стоит в настройках.
+        let frames = [[0.5, 0.5, 0.0], [0.5, 0.5, 0.0]];
+        let flat: Vec<f32> = frames.iter().flatten().copied().collect();
+        assert_eq!(greedy_ctc(&flat, 3, 2), vec![0]);
     }
 
     #[test]

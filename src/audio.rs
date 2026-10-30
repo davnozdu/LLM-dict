@@ -286,6 +286,7 @@ pub fn read_wav(path: &str) -> Result<Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::Downmix;
+    use std::time::Duration;
 
     #[test]
     fn upsampling_preserves_duration() {
@@ -293,5 +294,68 @@ mod tests {
         let mut output = Vec::new();
         downmix.push(&[0.0; 8_000], &mut output);
         assert_eq!(output.len(), 16_000);
+    }
+
+    /// Сколько аудио теряется между нажатием клавиши и первым сэмплом.
+    ///
+    /// Поток записи открывается заново на каждую диктовку, и всё сказанное до
+    /// первого колбэка в запись не попадает. Число нужно, чтобы решать, стоит
+    /// ли держать поток открытым постоянно: это убирает потерю, но оставляет
+    /// значок микрофона в строке меню горящим всё время.
+    ///
+    /// Меряется без правок в рабочем коде: сравнивается реальное время от
+    /// вызова `start` до остановки с длиной полученной записи.
+    ///
+    /// Запуск: cargo test --offline --bin llm-dict открытие_микрофона -- --ignored --nocapture
+    /// macOS спросит доступ к микрофону у тестового бинарника — один раз.
+    #[test]
+    #[ignore = "нужен микрофон и разрешение на запись"]
+    fn открытие_микрофона_не_теряет_начало_фразы() {
+        const RUNS: usize = 5;
+        const HOLD: Duration = Duration::from_millis(600);
+        let mut opened = Vec::new();
+        let mut lost = Vec::new();
+
+        for run in 0..RUNS {
+            let level = std::sync::Arc::new(super::Level::default());
+            let started = std::time::Instant::now();
+            let rec = match super::start(level) {
+                Ok(rec) => rec,
+                Err(e) => panic!("микрофон не открылся: {e}"),
+            };
+            opened.push(started.elapsed());
+            std::thread::sleep(HOLD);
+
+            let before_finish = std::time::Instant::now();
+            let samples = rec.finish();
+            let captured = super::duration_secs(&samples);
+            // Запись покрывает промежуток от первого колбэка до остановки.
+            // Всё остальное — потери на открытие устройства.
+            let window = (before_finish - started).as_secs_f32();
+            lost.push((window - captured).max(0.0));
+            println!(
+                "прогон {}: открытие {:?}, записано {captured:.3} с из {window:.3} с",
+                run + 1,
+                opened[run]
+            );
+        }
+
+        let median = |v: &mut Vec<Duration>| {
+            v.sort();
+            v[v.len() / 2]
+        };
+        let median_lost = {
+            lost.sort_by(|a, b| a.total_cmp(b));
+            lost[lost.len() / 2]
+        };
+        println!(
+            "\nмедиана: открытие потока {:?}, потеряно в начале {:.0} мс",
+            median(&mut opened),
+            median_lost * 1000.0
+        );
+        assert!(
+            median_lost < HOLD.as_secs_f32(),
+            "замер не сошёлся: потеря больше самого удержания"
+        );
     }
 }

@@ -272,7 +272,10 @@ impl Corrector {
 
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(n_ctx))
-            .with_n_batch(n_ctx);
+            // Батч не равен всему окну: подсказка подаётся кусками по 512
+            // токенов, а лишний размер батча — это лишняя память под
+            // вычислительные буферы, вплоть до сотен мегабайт на 32k.
+            .with_n_batch(n_ctx.min(512));
         let mut ctx = self
             .model
             .new_context(backend()?, ctx_params)

@@ -299,6 +299,38 @@ fn completion_json(model_id: &str, out: &crate::local_llm::Generated) -> String 
     .to_string()
 }
 
+/// Сколько ждать места в очереди за медленным клиентом.
+///
+/// Заполненная очередь — это не отмена: клиент жив, просто читает медленнее,
+/// чем модель пишет. Раньше здесь стоял `try_send`, и такой клиент получал
+/// обрыв ответа посреди потока. Ждём, но не бесконечно: модель нужна диктовке.
+const SLOW_CLIENT_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Кладёт кусок в очередь отправки, дожидаясь места. `false` — отправлять
+/// больше некому или клиент перестал быть важнее диктовки.
+fn send_chunk(
+    tx: &std::sync::mpsc::SyncSender<String>,
+    mut chunk: String,
+    patience: std::time::Duration,
+    still_wanted: impl Fn() -> bool,
+) -> bool {
+    let deadline = std::time::Instant::now() + patience;
+    loop {
+        match tx.try_send(chunk) {
+            Ok(()) => return true,
+            Err(std::sync::mpsc::TrySendError::Full(back)) => {
+                // Ждём, но не в ущерб диктовке: она важнее внешнего клиента.
+                if std::time::Instant::now() >= deadline || !still_wanted() {
+                    return false;
+                }
+                chunk = back;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return false,
+        }
+    }
+}
+
 /// Потоковая выдача в формате Server-Sent Events, как у OpenAI.
 ///
 /// Пишем прямо в сокет: держать весь ответ в памяти и отдать разом означало бы
@@ -340,19 +372,25 @@ fn stream_response(
     );
     let _ = tx.try_send(opening);
     let result = llm.chat_raw(model_id, turns, max_tokens, |piece| {
-        if shared.stage() != Stage::Idle || sender.is_finished() {
+        let wanted = || shared.stage() == Stage::Idle && !sender.is_finished();
+        if !wanted() {
             return false;
         }
-        piece.is_empty()
-            || tx
-                .try_send(sse_chunk(
-                    &id,
-                    created,
-                    model_id,
-                    serde_json::json!({"content": piece}),
-                    None,
-                ))
-                .is_ok()
+        if piece.is_empty() {
+            return true;
+        }
+        send_chunk(
+            &tx,
+            sse_chunk(
+                &id,
+                created,
+                model_id,
+                serde_json::json!({"content": piece}),
+                None,
+            ),
+            SLOW_CLIENT_PATIENCE,
+            wanted,
+        )
     });
     drop(llm);
     let closing = match result {
@@ -369,7 +407,13 @@ fn stream_response(
         ),
     };
     // Очередь уже не держит модель. Закрытый/медленный клиент не мешает диктовке.
-    let _ = tx.try_send(format!("{closing}data: [DONE]\n\n"));
+    // Завершающий кусок тоже ждёт места: без него клиент не увидит [DONE].
+    let _ = send_chunk(
+        &tx,
+        format!("{closing}data: [DONE]\n\n"),
+        SLOW_CLIENT_PATIENCE,
+        || !sender.is_finished(),
+    );
     drop(tx);
     match sender.join() {
         Ok(result) => Ok(result?),
@@ -397,6 +441,53 @@ fn sse_chunk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slow_client_backpressure_waits_instead_of_aborting_the_answer() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1);
+        tx.try_send("первый".into()).unwrap();
+        let wanted = || true;
+        let started = std::time::Instant::now();
+        assert!(!send_chunk(
+            &tx,
+            "второй".into(),
+            std::time::Duration::from_millis(30),
+            wanted
+        ));
+        assert!(started.elapsed() >= std::time::Duration::from_millis(25));
+
+        // Место освободилось — кусок уходит, ответ не обрывается.
+        assert_eq!(rx.recv().unwrap(), "первый");
+        assert!(send_chunk(
+            &tx,
+            "второй".into(),
+            std::time::Duration::from_millis(30),
+            wanted
+        ));
+        assert_eq!(rx.recv().unwrap(), "второй");
+
+        // Получатель ушёл — ждать незачем.
+        drop(rx);
+        assert!(!send_chunk(
+            &tx,
+            "третий".into(),
+            std::time::Duration::from_millis(30),
+            wanted
+        ));
+
+        // Диктовка началась — внешний клиент уступает, не дожидаясь таймаута.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1);
+        tx.try_send("первый".into()).unwrap();
+        let started = std::time::Instant::now();
+        assert!(!send_chunk(
+            &tx,
+            "второй".into(),
+            std::time::Duration::from_secs(5),
+            || false
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        drop(rx);
+    }
 
     #[test]
     fn reports_truncation_in_json_and_stream() {

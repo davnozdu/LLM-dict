@@ -49,7 +49,12 @@ impl Stage {
 
 pub struct Shared {
     pub config: RwLock<Config>,
-    pub api_key: RwLock<String>,
+    /// Ключи поставщиков, уже прочитанные из хранилища.
+    ///
+    /// Связка ключей отвечает за единицы миллисекунд, а спрашивается она на
+    /// каждой диктовке — на потоке, который в этот момент держит вставку.
+    /// Кеш сбрасывается при сохранении ключа и при смене хранилища.
+    keys: Mutex<std::collections::HashMap<String, String>>,
     pub stage: Mutex<Stage>,
     pub level: Arc<audio::Level>,
     pub last_error: Mutex<Option<String>>,
@@ -73,8 +78,6 @@ pub struct Shared {
     pub clipboard_requested: AtomicBool,
     /// История буфера обмена.
     pub clipboard: Arc<crate::clipboard::History>,
-    /// Растёт при каждом изменении, чтобы трей перерисовал иконку.
-    pub dirty: AtomicBool,
     /// Локальная языковая модель.
     ///
     /// Лежит здесь, а не в потоке диктовки, потому что действия по горячей
@@ -101,7 +104,7 @@ impl Shared {
         let load_error = config.load_error.clone();
         let shared = Arc::new(Self {
             config: RwLock::new(config),
-            api_key: RwLock::new(String::new()),
+            keys: Mutex::new(std::collections::HashMap::new()),
             stage: Mutex::new(Stage::Idle),
             level: Arc::new(audio::Level::default()),
             last_error: Mutex::new(load_error),
@@ -115,7 +118,6 @@ impl Shared {
             wake: Mutex::new(None),
             clipboard_requested: AtomicBool::new(false),
             clipboard,
-            dirty: AtomicBool::new(true),
             llm: Mutex::new(crate::local_llm::LocalLlm::default()),
         });
 
@@ -125,13 +127,11 @@ impl Shared {
         {
             let shared = shared.clone();
             std::thread::spawn(move || {
-                let key = shared.config_snapshot().load_api_key();
-                let mut current = shared.api_key.write().unwrap();
-                if !shared.key_loaded.load(Ordering::Relaxed) {
-                    *current = key;
-                    shared.key_loaded.store(true, Ordering::Relaxed);
-                }
-                shared.dirty.store(true, Ordering::Relaxed);
+                let cfg = shared.config_snapshot();
+                let account = cfg.stt.key_account();
+                let key = cfg.key_for(account);
+                shared.set_key(account, key);
+                shared.key_loaded.store(true, Ordering::Relaxed);
             });
         }
 
@@ -142,10 +142,31 @@ impl Shared {
         self.key_loaded.load(Ordering::Relaxed)
     }
 
-    pub fn set_api_key(&self, key: String) {
-        let mut current = self.api_key.write().unwrap();
-        *current = key;
-        self.key_loaded.store(true, Ordering::Relaxed);
+    /// Ключ поставщика с кешем: связка ключей спрашивается один раз на запуск,
+    /// а не на каждую диктовку.
+    pub fn key(&self, account: &str) -> String {
+        if account.is_empty() {
+            return String::new();
+        }
+        if let Some(key) = self.keys.lock().unwrap().get(account) {
+            return key.clone();
+        }
+        let key = self.config_snapshot().key_for(account);
+        self.set_key(account, key.clone());
+        key
+    }
+
+    /// Запоминает ключ после сохранения: следующая диктовка не пойдёт в связку.
+    pub fn set_key(&self, account: &str, key: String) {
+        if account.is_empty() {
+            return;
+        }
+        self.keys.lock().unwrap().insert(account.to_string(), key);
+    }
+
+    /// Сбрасывает кеш: после смены хранилища ключей или правки адреса.
+    pub fn forget_keys(&self) {
+        self.keys.lock().unwrap().clear();
     }
 
     fn add_history(&self, entry: history::Entry, limit: usize) {
@@ -160,7 +181,6 @@ impl Shared {
         if let Err(e) = appended.unwrap_or_else(|| history::replace(&hist)) {
             log::warn!("не сохранить историю: {e}");
         }
-        self.dirty.store(true, Ordering::Relaxed);
     }
 
     pub fn clear_history(&self) -> anyhow::Result<()> {
@@ -182,7 +202,6 @@ impl Shared {
 
     pub fn notify(&self, text: impl Into<String>) {
         *self.notice.lock().unwrap() = Some((text.into(), std::time::Instant::now()));
-        self.dirty.store(true, Ordering::Relaxed);
         self.wake_ui();
     }
 
@@ -208,7 +227,6 @@ impl Shared {
         self.hotkey_state
             .set_busy(!matches!(s, Stage::Idle | Stage::Recording));
         *self.stage.lock().unwrap() = s;
-        self.dirty.store(true, Ordering::Relaxed);
         self.wake_ui();
     }
 
@@ -217,15 +235,10 @@ impl Shared {
             log::error!("{msg}");
         }
         *self.last_error.lock().unwrap() = e;
-        self.dirty.store(true, Ordering::Relaxed);
     }
 
     pub fn config_snapshot(&self) -> Config {
         self.config.read().unwrap().clone()
-    }
-
-    pub fn api_key_snapshot(&self) -> String {
-        self.api_key.read().unwrap().clone()
     }
 
     /// Применяет изменения горячей клавиши к живому тапу без перезапуска.
@@ -416,7 +429,6 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
 
             HotKeyEvent::Captured(keys) => {
                 *shared.captured.lock().unwrap() = Some(keys);
-                shared.dirty.store(true, Ordering::Relaxed);
             }
 
             HotKeyEvent::StopRecording => {
@@ -674,6 +686,16 @@ fn post_names(cfg: &Config) -> String {
     }
 }
 
+/// Какая модель распознала запись: у облака она из настроек, у локальных
+/// движков — своя, и в истории должно быть видно именно её.
+fn stt_model_name(cfg: &Config, engine: Engine) -> String {
+    if engine == Engine::Cloud {
+        cfg.stt.model.clone()
+    } else {
+        crate::stt::model_id_for(&cfg.stt, engine).to_string()
+    }
+}
+
 /// Ошибку тоже надо записать с реальной длительностью речи: иначе в истории
 /// у неудачных попыток стоит ноль, и не понять, писался ли звук вообще.
 fn error_entry(cfg: &Config, msg: String, duration_secs: f32, latency_ms: u64) -> history::Entry {
@@ -700,7 +722,7 @@ fn recognize(
     cfg: &Config,
     samples: &[f32],
 ) -> anyhow::Result<(String, Engine)> {
-    let key = shared.api_key_snapshot();
+    let key = shared.key(cfg.stt.key_account());
     let mut primary = cfg.stt.engine;
 
     // Без сети облако даже не пробуем: ждать таймаута там, где ответ известен
@@ -890,7 +912,7 @@ fn process(
     if !after.is_empty() {
         shared.set_stage(Stage::PostProcessing);
         for action in after {
-            let action_key = action.endpoint.api_key(cfg);
+            let action_key = shared.key(action.endpoint.key_account());
             if action.missing_context() {
                 log::warn!("«{}»: файл сведений не выбран", action.name);
                 shared.notify(format!("«{}»: файл сведений не выбран", action.name));
@@ -970,7 +992,7 @@ fn record_result(
                 raw_text: out.raw_text,
                 final_text: out.final_text,
                 mode: post_names(cfg),
-                stt_model: cfg.stt.model.clone(),
+                stt_model: stt_model_name(cfg, out.engine),
                 // Чем обработали текст. Пусто — обработки не было; при
                 // откате здесь стоит локальная модель, и по истории видно,
                 // что облако не сработало.
@@ -1088,7 +1110,7 @@ fn run_action(shared: &Arc<Shared>, id: &str) {
                 anyhow::bail!("активное приложение сменилось — повторите действие");
             }
             let (selection, previous) = insert::copy_selection()?;
-            let key = action.endpoint.api_key(&cfg);
+            let key = shared.key(action.endpoint.key_account());
             // Молчаливое «не знаю» вместо ответа — самый непонятный отказ:
             // модель отработала, а сведений ей не дали.
             if action.missing_context() {
@@ -1196,15 +1218,22 @@ fn run_action(shared: &Arc<Shared>, id: &str) {
 }
 
 /// Разрешения, которых не хватает для работы. Для баннера в UI.
-pub fn missing_permissions() -> Vec<&'static str> {
+///
+/// Значения приходят снаружи: опрашивает их фоновый поток, потому что три
+/// проверки вместе стоят около 14 мс.
+pub fn missing_permissions(
+    ax: permissions::Status,
+    mic: permissions::Status,
+    listen: permissions::Status,
+) -> Vec<&'static str> {
     let mut out = Vec::new();
-    if !permissions::accessibility().is_ok() {
+    if !ax.is_ok() {
         out.push("Универсальный доступ");
     }
-    if !permissions::microphone().is_ok() {
+    if !mic.is_ok() {
         out.push("Микрофон");
     }
-    if !permissions::input_monitoring().is_ok() {
+    if !listen.is_ok() {
         out.push("Мониторинг ввода");
     }
     out

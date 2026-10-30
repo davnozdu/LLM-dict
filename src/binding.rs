@@ -201,7 +201,7 @@ pub fn key_label(code: u16) -> String {
 }
 
 /// Сочетание клавиш, которые должны быть зажаты одновременно.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct Binding {
     pub keys: Vec<u16>,
 }

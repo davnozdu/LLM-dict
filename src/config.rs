@@ -3,6 +3,7 @@
 
 use crate::binding::Binding;
 use crate::models::Engine;
+use crate::provider::Provider;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -80,6 +81,11 @@ impl ClipboardMode {
 pub struct SttConfig {
     /// Чем распознавать по умолчанию.
     pub engine: Engine,
+    /// Чей адрес стоит в `base_url`. От этого зависит, под каким именем лежит
+    /// ключ распознавания: у Groq, Gemini и DeepSeek записи в связке ключей
+    /// разные. Пока место было одно, сохранение ключа нового сервиса молча
+    /// затирало прежний — вместе с ключом для действий.
+    pub provider: Provider,
     /// На что переключиться, если основной движок отказал.
     /// `None` — не переключаться, показать ошибку.
     pub fallback: Option<Engine>,
@@ -107,6 +113,7 @@ impl Default for SttConfig {
     fn default() -> Self {
         Self {
             engine: Engine::Cloud,
+            provider: Provider::Groq,
             fallback: None,
             base_url: "https://api.groq.com/openai/v1".into(),
             model: "whisper-large-v3-turbo".into(),
@@ -115,6 +122,20 @@ impl Default for SttConfig {
             parakeet_model: "parakeet-tdt-0.6b-v3-int8".into(),
             gigaam_model: "gigaam-v3-e2e-ctc-int8".into(),
             preload_local: true,
+        }
+    }
+}
+
+impl SttConfig {
+    /// Имя записи, под которым лежит ключ распознавания.
+    ///
+    /// Пусто — ключ не нужен: локальный Ollama и распознавание на своей машине
+    /// обходятся без него.
+    pub fn key_account(&self) -> &'static str {
+        if self.provider.needs_key() {
+            self.provider.key_account()
+        } else {
+            ""
         }
     }
 }
@@ -544,13 +565,16 @@ impl Config {
 impl Config {
     /// Читает ключ оттуда, куда его положили настройки.
     pub fn load_api_key(&self) -> String {
-        self.key_for("groq_api_key")
+        self.key_for(self.stt.key_account())
     }
 
     /// Ключ поставщика: из файла настроек или из связки ключей — смотря что
     /// выбрано. Раньше действия ходили только в связку и не видели ключ,
     /// положенный в файл.
     pub fn key_for(&self, account: &str) -> String {
+        if account.is_empty() {
+            return String::new();
+        }
         if self.general.key_in_config {
             if account == "groq_api_key" {
                 return self.api_key.clone();
@@ -564,6 +588,9 @@ impl Config {
     }
 
     pub fn set_key_for(&mut self, account: &str, value: &str) -> anyhow::Result<()> {
+        if account.is_empty() {
+            return Ok(());
+        }
         if self.general.key_in_config {
             if value.is_empty() || account == "groq_api_key" {
                 self.provider_keys.remove(account);
@@ -681,6 +708,50 @@ mod storage_tests {
         .unwrap();
         assert_eq!(copied["groq_api_key"], "key-groq_api_key");
         assert!(!cfg.general.key_in_config);
+    }
+
+    #[test]
+    fn ключ_распознавания_живёт_в_своей_записи() {
+        // Раньше место было одно, и сохранение ключа нового сервиса затирало
+        // прежний — вместе с ключом для действий.
+        let mut cfg = Config::default();
+        cfg.general.key_in_config = true;
+        cfg.stt.provider = Provider::Groq;
+        cfg.set_key_for(cfg.stt.key_account(), "gsk_groq").unwrap();
+        cfg.stt.provider = Provider::Gemini;
+        cfg.set_key_for(cfg.stt.key_account(), "AIza_gemini")
+            .unwrap();
+
+        assert_eq!(cfg.key_for("groq_api_key"), "gsk_groq");
+        assert_eq!(cfg.key_for("gemini_api_key"), "AIza_gemini");
+        cfg.stt.provider = Provider::Groq;
+        assert_eq!(cfg.load_api_key(), "gsk_groq");
+        cfg.stt.provider = Provider::Gemini;
+        assert_eq!(cfg.load_api_key(), "AIza_gemini");
+    }
+
+    /// Локальному Ollama ключ не нужен, и пустое имя записи не должно
+    /// превращаться в обращение к связке ключей.
+    #[test]
+    fn без_ключа_имя_записи_пустое() {
+        let mut cfg = Config::default();
+        cfg.stt.provider = Provider::Ollama;
+        assert_eq!(cfg.stt.key_account(), "");
+        assert_eq!(cfg.load_api_key(), "");
+        cfg.general.key_in_config = true;
+        assert_eq!(cfg.load_api_key(), "");
+    }
+
+    /// Настройки, сделанные до появления выбора поставщика, должны читаться:
+    /// иначе serde сбросил бы весь файл, а вместе с ним сочетания и действия.
+    #[test]
+    fn старая_настройка_распознавания_читается_как_groq() {
+        let cfg: Config = toml::from_str(
+            "[stt]\nengine = \"Cloud\"\nbase_url = \"https://api.groq.com/openai/v1\"\nmodel = \"whisper-large-v3-turbo\"\n",
+        )
+        .expect("старый файл должен читаться");
+        assert_eq!(cfg.stt.provider, Provider::Groq);
+        assert_eq!(cfg.stt.key_account(), "groq_api_key");
     }
 
     #[test]

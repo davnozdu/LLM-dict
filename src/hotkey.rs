@@ -252,6 +252,12 @@ impl Matcher {
         recording: bool,
         toggle: bool,
     ) -> Vec<HotKeyEvent> {
+        // Всё отпущено — застрявший отменяющий Esc больше не ждём. Событие
+        // отпускания могло не дойти, если система отключала перехватчик:
+        // тогда флаг оставался поднятым и Esc перестал бы работать вовсе.
+        if held.is_empty() {
+            self.escape_swallowed = false;
+        }
         let matches = |b: &Binding| !b.is_empty() && b.keys.iter().all(|k| held.contains(k));
 
         // Сочетания могут вкладываться друг в друга: правый ⌘ под диктовку и

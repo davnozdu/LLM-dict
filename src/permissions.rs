@@ -52,6 +52,24 @@ impl Status {
     pub fn is_ok(self) -> bool {
         matches!(self, Status::Granted)
     }
+
+    /// Число для атомарного поля: разрешения опрашивает фоновый поток,
+    /// а читает окно.
+    pub fn code(self) -> u8 {
+        match self {
+            Status::Granted => 0,
+            Status::Denied => 1,
+            Status::NotAsked => 2,
+        }
+    }
+
+    pub fn from_code(code: u8) -> Self {
+        match code {
+            0 => Status::Granted,
+            1 => Status::Denied,
+            _ => Status::NotAsked,
+        }
+    }
 }
 
 /// Есть ли доступ к «Универсальному доступу». Дёшево, можно звать каждый кадр.

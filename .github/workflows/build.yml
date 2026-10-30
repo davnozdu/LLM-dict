@@ -31,7 +31,7 @@ jobs:
       - name: Проверка
         run: |
           cargo fmt --check
-          cargo clippy --all-targets -- -D warnings
+          cargo clippy --locked --all-targets -- -D warnings
 
       - name: Тесты
         run: cargo test --locked
