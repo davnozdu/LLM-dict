@@ -16,8 +16,8 @@ env:
 
 jobs:
   build:
-    # macos-14 и новее — это Apple Silicon, сборка сразу под ARM.
-    runs-on: macos-14
+    # Apple Silicon (arm64): macos-14 снят с поддержки GitHub Actions.
+    runs-on: macos-latest
 
     steps:
       - uses: actions/checkout@v4
