@@ -221,6 +221,13 @@ enum EscapeDecision {
 }
 
 impl Matcher {
+    pub fn reset_transient(&mut self) {
+        self.fired = None;
+        self.dictation_active = false;
+        self.suppressed = false;
+        self.escape_swallowed = false;
+    }
+
     fn escape(&mut self, kind: RawKind, code: u16, recording: bool) -> EscapeDecision {
         const ESC: u16 = 53;
         if code != ESC {
@@ -258,19 +265,26 @@ impl Matcher {
         if held.is_empty() {
             self.escape_swallowed = false;
         }
-        let matches = |b: &Binding| !b.is_empty() && b.keys.iter().all(|k| held.contains(k));
+        let matches_dictation =
+            |b: &Binding| !b.is_empty() && b.keys.iter().all(|k| held.contains(k));
+        // Для действий требуем точное совпадение набора клавиш: иначе
+        // действие на ⌥+Пробел или ⌘+C ложно срабатывало бы при ⌘+⌥+Пробел
+        // или ⌘+⇧+C.
+        let matches_action = |b: &Binding| {
+            !b.is_empty() && b.keys.len() == held.len() && b.keys.iter().all(|k| held.contains(k))
+        };
 
         // Сочетания могут вкладываться друг в друга: правый ⌘ под диктовку и
         // правый ⌘ + T под перевод. Побеждает самое длинное подходящее —
         // иначе действие никогда бы не сработало.
-        let dictation_len = if matches(dictation) {
+        let dictation_len = if matches_dictation(dictation) {
             dictation.keys.len()
         } else {
             0
         };
         let best_action = actions
             .iter()
-            .filter(|(_, b)| matches(b))
+            .filter(|(_, b)| matches_action(b))
             .max_by_key(|(_, b)| b.keys.len());
         let action_len = best_action.map(|(_, b)| b.keys.len()).unwrap_or(0);
 
@@ -364,9 +378,47 @@ pub enum RawKind {
 pub enum KeyUpdate {
     /// Полное состояние модификаторов, вычисленное из флагов события.
     Modifiers(Vec<u16>),
-    Down(u16),
-    Up(u16),
+    /// Нажатие обычной клавиши вместе со снимком не-Fn модификаторов из флагов.
+    Down(u16, Vec<u16>),
+    /// Отпускание обычной клавиши вместе со снимком не-Fn модификаторов из флагов.
+    Up(u16, Vec<u16>),
     Ignore,
+}
+
+/// Читает зажатые модификаторы из флагов CGEvent.
+///
+/// Если клавиатура/виртуальный драйвер выставил только общий бит модификатора
+/// (без device-dependent бита стороны), подставляем левый модификатор, чтобы
+/// сочетание не терялось молча.
+fn modifiers_from_flags(flags: u64, include_fn: bool) -> Vec<u16> {
+    let mut mods: Vec<u16> = binding::HOLDABLE_MODIFIERS
+        .iter()
+        .copied()
+        .filter(|&m| {
+            (include_fn || m != binding::K_FN) && flags & binding::modifier_flag_mask(m) != 0
+        })
+        .collect();
+
+    const GENERIC_FALLBACKS: [(u64, u16, u16); 4] = [
+        (
+            0x0010_0000,
+            binding::K_LEFT_COMMAND,
+            binding::K_RIGHT_COMMAND,
+        ),
+        (0x0002_0000, binding::K_LEFT_SHIFT, binding::K_RIGHT_SHIFT),
+        (0x0008_0000, binding::K_LEFT_OPTION, binding::K_RIGHT_OPTION),
+        (
+            0x0004_0000,
+            binding::K_LEFT_CONTROL,
+            binding::K_RIGHT_CONTROL,
+        ),
+    ];
+    for (generic_mask, left, right) in GENERIC_FALLBACKS {
+        if flags & generic_mask != 0 && !mods.contains(&left) && !mods.contains(&right) {
+            mods.push(left);
+        }
+    }
+    mods
 }
 
 /// Состояние модификаторов берётся целиком из флагов события, а не копится
@@ -377,15 +429,16 @@ pub enum KeyUpdate {
 /// код клавиши навсегда застревал в наборе и приклеивался к любому сочетанию.
 pub fn classify(kind: RawKind, code: u16, flags: u64) -> KeyUpdate {
     match kind {
-        RawKind::FlagsChanged => KeyUpdate::Modifiers(
-            binding::HOLDABLE_MODIFIERS
-                .iter()
-                .copied()
-                .filter(|m| flags & binding::modifier_flag_mask(*m) != 0)
-                .collect(),
-        ),
-        RawKind::KeyDown if !binding::is_modifier(code) => KeyUpdate::Down(code),
-        RawKind::KeyUp if !binding::is_modifier(code) => KeyUpdate::Up(code),
+        RawKind::FlagsChanged => KeyUpdate::Modifiers(modifiers_from_flags(flags, true)),
+        // На KeyDown/KeyUp macOS автоматически ставит бит Fn для стрелок и
+        // функциональных клавиш, поэтому Fn читаем только из FlagsChanged, а
+        // остальные модификаторы синхронизируем на каждом событии.
+        RawKind::KeyDown if !binding::is_modifier(code) => {
+            KeyUpdate::Down(code, modifiers_from_flags(flags, false))
+        }
+        RawKind::KeyUp if !binding::is_modifier(code) => {
+            KeyUpdate::Up(code, modifiers_from_flags(flags, false))
+        }
         _ => KeyUpdate::Ignore,
     }
 }
@@ -398,6 +451,18 @@ pub struct HeldKeys {
 }
 
 impl HeldKeys {
+    pub fn clear(&mut self) {
+        self.modifiers.clear();
+        self.regular.clear();
+    }
+
+    fn sync_non_fn_modifiers(&mut self, mut mods: Vec<u16>) {
+        if self.modifiers.contains(&binding::K_FN) && !mods.contains(&binding::K_FN) {
+            mods.push(binding::K_FN);
+        }
+        self.modifiers = mods;
+    }
+
     /// Применяет событие. Возвращает набор зажатых клавиш и было ли это
     /// нажатием, либо `None`, если событие нас не касается.
     pub fn apply(&mut self, update: KeyUpdate) -> Option<(Vec<u16>, bool)> {
@@ -407,11 +472,13 @@ impl HeldKeys {
                 self.modifiers = mods;
                 pressed
             }
-            KeyUpdate::Down(code) => {
+            KeyUpdate::Down(code, mods) => {
+                self.sync_non_fn_modifiers(mods);
                 self.regular.insert(code);
                 true
             }
-            KeyUpdate::Up(code) => {
+            KeyUpdate::Up(code, mods) => {
+                self.sync_non_fn_modifiers(mods);
                 self.regular.remove(&code);
                 false
             }
@@ -425,15 +492,21 @@ impl HeldKeys {
     }
 }
 
-/// Запускает поток с event tap. Возвращает `false`, если тап создать не удалось
-/// (почти всегда — нет разрешения «Универсальный доступ»).
-pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::JoinHandle<bool> {
+/// Запускает поток с event tap. Отправляет `true` в `ready`, когда тап успешно
+/// поднят, или `false`, если создать его не удалось (обычно нет разрешения
+/// «Универсальный доступ»).
+pub fn spawn(
+    state: Arc<HotKeyState>,
+    tx: Sender<HotKeyEvent>,
+    ready: std::sync::mpsc::SyncSender<bool>,
+) -> std::thread::JoinHandle<bool> {
     std::thread::spawn(move || {
         // Тап отдаёт события по одному, а нам нужно знать, зажато ли
         // сочетание целиком.
         let pressed: Mutex<HeldKeys> = Mutex::new(HeldKeys::default());
         let capture: Mutex<Capture> = Mutex::new(Capture::default());
         let matcher: Mutex<Matcher> = Mutex::new(Matcher::default());
+        let swallowed_keys: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
 
         let cb_state = state.clone();
         let cb_tx = tx.clone();
@@ -473,7 +546,24 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
                     CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
                 ) {
                     log::error!("система отключила event tap: {event_type:?}");
+                    // Сбрасываем состояние зажатых клавиш и матчера: потерянный
+                    // KeyUp за время отключения иначе застрял бы навсегда.
+                    pressed.lock().unwrap().clear();
+                    cb_state.held_now.lock().unwrap().clear();
+                    swallowed_keys.lock().unwrap().clear();
+                    matcher.lock().unwrap().reset_transient();
+                    capture.lock().unwrap().reset();
                     cb_state.disabled_by_system.store(true, Ordering::Relaxed);
+                    // Будим цикл run_in_mode, чтобы включить тап обратно сразу,
+                    // не дожидаясь окончания секундного интервала.
+                    CFRunLoop::get_current().stop();
+                    return CallbackResult::Keep;
+                }
+
+                // Не реагируем на собственные синтетические ⌘C и ⌘V из insert.rs.
+                if event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA)
+                    == crate::insert::SYNTHETIC_EVENT_TAG
+                {
                     return CallbackResult::Keep;
                 }
 
@@ -495,13 +585,6 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
                 let capturing = cb_state.is_capturing();
                 let flags = event.get_flags().bits();
                 if capturing {
-                    // Пишем событие до разбора и до любых проверок. Раньше эта
-                    // запись стояла после отсева незначащих событий, и то, что
-                    // разбор выбрасывал, в журнал не попадало вовсе — по такому
-                    // журналу нельзя было отличить «клавиша не дошла» от
-                    // «дошла, но мы её отбросили».
-                    // debug, а не info: подробности нужны только при разборе
-                    // жалоб, а в обычной работе они забивают журнал.
                     log::debug!(
                         "событие при наборе: {kind:?} (тип {}) код={code} флаги=0x{flags:x}",
                         event_type as u32
@@ -521,6 +604,20 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
                     if let Some(keys) = capture.lock().unwrap().update(&held, is_down) {
                         log::debug!("набрано сочетание: {keys:?}");
                         let _ = cb_tx.send(HotKeyEvent::Captured(keys));
+                    }
+                    // Во время набора сочетания проглатываем обычные клавиши,
+                    // чтобы ⌘W/⌘Q/Пробел не закрывали окно и не нажимали кнопки.
+                    if !binding::is_modifier(code) {
+                        match kind {
+                            RawKind::KeyDown => {
+                                swallowed_keys.lock().unwrap().insert(code);
+                                return CallbackResult::Drop;
+                            }
+                            RawKind::KeyUp if swallowed_keys.lock().unwrap().remove(&code) => {
+                                return CallbackResult::Drop;
+                            }
+                            _ => {}
+                        }
                     }
                     return CallbackResult::Keep;
                 }
@@ -551,17 +648,33 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
                 // Клавиша из любого нашего сочетания — кандидат на
                 // проглатывание. Остальная клавиатура не затрагивается.
                 // Проглатываем только обычные клавиши и только когда сочетание
-                // с ними собрано целиком.
-                //
-                // Модификаторы трогать нельзя: диктовка висит на правом ⌘, и
-                // проглатывание сломало бы все обычные ⌘C и ⌘V. А вот букву
-                // отдавать дальше незачем — программа её не знает и отвечает
-                // системным писком.
-                let swallow = cb_state.swallow.load(Ordering::Relaxed)
-                    && !binding::is_modifier(code)
-                    && std::iter::once(&binding)
-                        .chain(actions.iter().map(|(_, b)| b))
-                        .any(|b| b.keys.contains(&code) && b.keys.iter().all(|k| held.contains(k)));
+                // с ними собрано целиком; парный KeyUp тоже проглатываем, чтобы
+                // он не утекал в активную программу без KeyDown.
+                let swallow = if !binding::is_modifier(code) {
+                    match kind {
+                        RawKind::KeyDown if cb_state.swallow.load(Ordering::Relaxed) => {
+                            let matched_dict = !binding.is_empty()
+                                && binding.keys.contains(&code)
+                                && binding.keys.iter().all(|k| held.contains(k));
+                            let matched_action = actions.iter().any(|(_, b)| {
+                                !b.is_empty()
+                                    && b.keys.len() == held.len()
+                                    && b.keys.contains(&code)
+                                    && b.keys.iter().all(|k| held.contains(k))
+                            });
+                            if matched_dict || matched_action {
+                                swallowed_keys.lock().unwrap().insert(code);
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        RawKind::KeyUp => swallowed_keys.lock().unwrap().remove(&code),
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
 
                 let recording = cb_state.recording.load(Ordering::Relaxed);
                 let toggle = cb_state.mode.load(Ordering::Relaxed) == 1;
@@ -601,6 +714,7 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
             Ok(t) => t,
             Err(_) => {
                 log::error!("не удалось создать CGEventTap — нет разрешения Accessibility?");
+                let _ = ready.send(false);
                 return false;
             }
         };
@@ -609,6 +723,7 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
             Ok(s) => s,
             Err(_) => {
                 log::error!("не удалось создать runloop source для тапа");
+                let _ = ready.send(false);
                 return false;
             }
         };
@@ -618,6 +733,7 @@ pub fn spawn(state: Arc<HotKeyState>, tx: Sender<HotKeyEvent>) -> std::thread::J
             run_loop.add_source(&loop_source, kCFRunLoopCommonModes);
         }
         tap.enable();
+        let _ = ready.send(true);
         log::info!("event tap запущен");
 
         // Не `run_current`: из неё уже не выйти, а тап приходится включать
@@ -1138,5 +1254,48 @@ mod tests {
         c.update(&[54, 60], true);
         c.reset();
         assert_eq!(c.update(&[], false), None);
+    }
+
+    #[test]
+    fn действие_не_срабатывает_с_лишним_модификатором() {
+        let mut m = Matcher::default();
+        let dict = Binding::new(vec![R_CMD]);
+        let acts = actions(&[("правка", &[L_OPT, SPACE])]);
+
+        assert!(m
+            .decide(&[L_CMD, L_OPT, SPACE], true, &dict, &acts, false, false)
+            .is_empty());
+    }
+
+    #[test]
+    fn keydown_синхронизирует_модификаторы_и_не_добавляет_fn_от_стрелок() {
+        let mut held = HeldKeys::default();
+        // Пропущен FlagsChanged, но KeyDown несёт флаги L_CMD + L_OPT + бит Fn (как у стрелок).
+        let (keys, is_down) = held
+            .apply(classify(
+                RawKind::KeyDown,
+                123, // ←
+                flags(&[L_CMD, L_OPT]) | b::modifier_flag_mask(b::K_FN),
+            ))
+            .unwrap();
+        assert!(is_down);
+        assert_eq!(keys, vec![L_CMD, L_OPT, 123]);
+        assert!(!keys.contains(&b::K_FN));
+    }
+
+    #[test]
+    fn общий_бит_модификатора_без_стороны_не_теряется() {
+        let mut held = HeldKeys::default();
+        // Виртуальная/внешняя клавиатура без device-dependent бита стороны: только kCGEventFlagMaskCommand.
+        let (keys, _) = held
+            .apply(classify(RawKind::FlagsChanged, L_CMD, 0x0010_0000))
+            .unwrap();
+        assert_eq!(keys, vec![L_CMD]);
+    }
+
+    #[test]
+    fn carbon_mask_объединяет_стороны_побитовым_или() {
+        let both_opt = Binding::new(vec![L_OPT, R_OPT, KEY_C]);
+        assert_eq!(both_opt.carbon_mask(), 0x0008_0000);
     }
 }

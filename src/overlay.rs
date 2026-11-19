@@ -14,7 +14,9 @@ use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
 /// Поверх обычных окон, но ниже системных панелей.
 const WINDOW_LEVEL: i64 = 25; // NSStatusWindowLevel
-const STYLE_BORDERLESS: usize = 0;
+/// NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel:
+/// панель гарантированно не перехватывает фокус и не активирует приложение.
+const STYLE_NONACTIVATING_PANEL: usize = 1 << 7;
 const BACKING_BUFFERED: usize = 2;
 /// canJoinAllSpaces | stationary | fullScreenAuxiliary — плашка должна быть
 /// видна на любом рабочем столе и поверх полноэкранных программ.
@@ -81,11 +83,11 @@ impl Overlay {
         }
         unsafe {
             let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(180.0, 34.0));
-            let alloc: *mut AnyObject = msg_send![class!(NSWindow), alloc];
+            let alloc: *mut AnyObject = msg_send![class!(NSPanel), alloc];
             let window: *mut AnyObject = msg_send![
                 alloc,
                 initWithContentRect: rect,
-                styleMask: STYLE_BORDERLESS,
+                styleMask: STYLE_NONACTIVATING_PANEL,
                 backing: BACKING_BUFFERED,
                 defer: false,
             ];
@@ -96,6 +98,7 @@ impl Overlay {
             let _: () = msg_send![window, setLevel: WINDOW_LEVEL];
             let _: () = msg_send![window, setOpaque: false];
             let _: () = msg_send![window, setHasShadow: false];
+            let _: () = msg_send![window, setHidesOnDeactivate: false];
             // Плашка не должна перехватывать мышь: под ней обычная работа,
             // и клики должны проходить насквозь.
             let _: () = msg_send![window, setIgnoresMouseEvents: true];
@@ -107,6 +110,10 @@ impl Overlay {
             // прямоугольника заводить незачем.
             let label_alloc: *mut AnyObject = msg_send![class!(NSTextField), alloc];
             let label: *mut AnyObject = msg_send![label_alloc, initWithFrame: rect];
+            if label.is_null() {
+                let _: () = msg_send![window, release];
+                return;
+            }
             let _: () = msg_send![label, setBezeled: false];
             let _: () = msg_send![label, setEditable: false];
             let _: () = msg_send![label, setSelectable: false];
@@ -134,6 +141,8 @@ impl Overlay {
             }
 
             let _: () = msg_send![window, setContentView: label];
+            // setContentView: удерживает label сам — снимаем наш исходный +1.
+            let _: () = msg_send![label, release];
 
             self.window = window;
             self.label = label;
@@ -151,9 +160,16 @@ impl Overlay {
 
         // Место выбирается один раз, при появлении.
         let anchor = *self.anchor.get_or_insert(cursor);
-        let flip = *self
-            .screen_height
-            .get_or_insert_with(Self::primary_screen_height_uncached);
+        let flip = match self.screen_height {
+            Some(h) if h > 0.0 => h,
+            _ => {
+                let h = Self::primary_screen_height_uncached();
+                if h > 0.0 {
+                    self.screen_height = Some(h);
+                }
+                h
+            }
+        };
 
         unsafe {
             let text_changed = text != self.last_text;
@@ -192,6 +208,7 @@ impl Overlay {
 
     pub fn hide(&mut self) {
         self.anchor = None;
+        self.screen_height = None;
         if self.window.is_null() || !self.visible {
             return;
         }
@@ -200,5 +217,19 @@ impl Overlay {
             let _: () = msg_send![self.window, orderOut: nil];
         }
         self.visible = false;
+    }
+}
+
+impl Drop for Overlay {
+    fn drop(&mut self) {
+        if !self.window.is_null() {
+            unsafe {
+                let nil: *mut AnyObject = std::ptr::null_mut();
+                let _: () = msg_send![self.window, orderOut: nil];
+                let _: () = msg_send![self.window, release];
+            }
+            self.window = std::ptr::null_mut();
+            self.label = std::ptr::null_mut();
+        }
     }
 }

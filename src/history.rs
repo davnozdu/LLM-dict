@@ -46,11 +46,13 @@ pub fn load(limit: usize) -> Vec<Entry> {
 }
 
 pub fn append(entry: &Entry) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
     let dir = crate::config::config_dir();
     std::fs::create_dir_all(&dir)?;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(history_path())?;
     writeln!(file, "{}", serde_json::to_string(entry)?)?;
     Ok(())

@@ -11,7 +11,7 @@ use crate::permissions;
 use crate::providers;
 use crate::stt::{self, LocalEngines};
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -55,6 +55,9 @@ pub struct Shared {
     /// каждой диктовке — на потоке, который в этот момент держит вставку.
     /// Кеш сбрасывается при сохранении ключа и при смене хранилища.
     keys: Mutex<std::collections::HashMap<String, String>>,
+    /// Поколение кеша ключей: не даёт фоновому чтению из связки перезаписать
+    /// ключ, который пользователь успел сохранить за время ожидания.
+    keys_gen: AtomicU64,
     pub stage: Mutex<Stage>,
     pub level: Arc<audio::Level>,
     pub last_error: Mutex<Option<String>>,
@@ -105,6 +108,7 @@ impl Shared {
         let shared = Arc::new(Self {
             config: RwLock::new(config),
             keys: Mutex::new(std::collections::HashMap::new()),
+            keys_gen: AtomicU64::new(0),
             stage: Mutex::new(Stage::Idle),
             level: Arc::new(audio::Level::default()),
             last_error: Mutex::new(load_error),
@@ -127,11 +131,12 @@ impl Shared {
         {
             let shared = shared.clone();
             std::thread::spawn(move || {
+                let gen = shared.keys_gen.load(Ordering::Acquire);
                 let cfg = shared.config_snapshot();
                 let account = cfg.stt.key_account();
                 let key = cfg.key_for(account);
-                shared.set_key(account, key);
-                shared.key_loaded.store(true, Ordering::Relaxed);
+                shared.set_key_if_unchanged(account, key, gen);
+                shared.key_loaded.store(true, Ordering::Release);
             });
         }
 
@@ -139,7 +144,7 @@ impl Shared {
     }
 
     pub fn key_loaded(&self) -> bool {
-        self.key_loaded.load(Ordering::Relaxed)
+        self.key_loaded.load(Ordering::Acquire)
     }
 
     /// Ключ поставщика с кешем: связка ключей спрашивается один раз на запуск,
@@ -151,9 +156,20 @@ impl Shared {
         if let Some(key) = self.keys.lock().unwrap().get(account) {
             return key.clone();
         }
+        let gen = self.keys_gen.load(Ordering::Acquire);
         let key = self.config_snapshot().key_for(account);
-        self.set_key(account, key.clone());
+        self.set_key_if_unchanged(account, key.clone(), gen);
         key
+    }
+
+    fn set_key_if_unchanged(&self, account: &str, key: String, expected_gen: u64) {
+        if account.is_empty() {
+            return;
+        }
+        let mut guard = self.keys.lock().unwrap();
+        if self.keys_gen.load(Ordering::Acquire) == expected_gen {
+            guard.insert(account.to_string(), key);
+        }
     }
 
     /// Запоминает ключ после сохранения: следующая диктовка не пойдёт в связку.
@@ -161,12 +177,16 @@ impl Shared {
         if account.is_empty() {
             return;
         }
-        self.keys.lock().unwrap().insert(account.to_string(), key);
+        let mut guard = self.keys.lock().unwrap();
+        self.keys_gen.fetch_add(1, Ordering::AcqRel);
+        guard.insert(account.to_string(), key);
     }
 
     /// Сбрасывает кеш: после смены хранилища ключей или правки адреса.
     pub fn forget_keys(&self) {
-        self.keys.lock().unwrap().clear();
+        let mut guard = self.keys.lock().unwrap();
+        self.keys_gen.fetch_add(1, Ordering::AcqRel);
+        guard.clear();
     }
 
     fn add_history(&self, entry: history::Entry, limit: usize) {
@@ -270,19 +290,19 @@ pub fn spawn(shared: Arc<Shared>) -> Sender<HotKeyEvent> {
     let (tx, rx) = mpsc::channel::<HotKeyEvent>();
 
     // Поток тапа: только читает события и шлёт их сюда.
-    let tap_handle = hotkey::spawn(shared.hotkey_state.clone(), tx.clone());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<bool>(1);
+    let _tap_handle = hotkey::spawn(shared.hotkey_state.clone(), tx.clone(), ready_tx);
     {
         let shared = shared.clone();
         std::thread::spawn(move || {
-            // Если тап не поднялся, поток завершится сразу и вернёт false.
-            std::thread::sleep(std::time::Duration::from_millis(400));
-            if tap_handle.is_finished() {
+            let started = ready_rx.recv().unwrap_or(false);
+            if started {
+                shared.tap_running.store(true, Ordering::Relaxed);
+            } else {
                 shared.tap_running.store(false, Ordering::Relaxed);
                 shared.set_error(Some(
                     "Горячая клавиша не работает: нет разрешения «Универсальный доступ»".into(),
                 ));
-            } else {
-                shared.tap_running.store(true, Ordering::Relaxed);
             }
         });
     }
@@ -429,6 +449,7 @@ fn worker(shared: Arc<Shared>, rx: Receiver<HotKeyEvent>) {
 
             HotKeyEvent::Captured(keys) => {
                 *shared.captured.lock().unwrap() = Some(keys);
+                shared.wake_ui();
             }
 
             HotKeyEvent::StopRecording => {
@@ -705,7 +726,7 @@ fn error_entry(cfg: &Config, msg: String, duration_secs: f32, latency_ms: u64) -
         raw_text: String::new(),
         final_text: String::new(),
         mode: post_names(cfg),
-        stt_model: cfg.stt.model.clone(),
+        stt_model: stt_model_name(cfg, cfg.stt.engine),
         llm_model: None,
         latency_ms,
         clipboard_before: None,
@@ -951,6 +972,7 @@ fn process(
     // Исходное распознавание остаётся в истории без изменений.
     let final_text = crate::typography::normalize(&final_text);
     shared.set_stage(Stage::Inserting);
+    wait_keys_released(shared);
     let (clipboard_before, insertion_error) =
         match insert::insert(&final_text, cfg.general.restore_clipboard) {
             Ok(previous) => (previous, None),
@@ -1023,6 +1045,9 @@ fn record_result(
 /// увидит ⌘⌥C, а не ⌘C, ничего не скопирует — и действие тихо упрётся
 /// в таймаут.
 fn wait_keys_released(shared: &Arc<Shared>) {
+    if shared.hotkey_state.diagnostics().0.is_empty() {
+        return;
+    }
     let wait_until = Instant::now() + Duration::from_millis(1500);
     while Instant::now() < wait_until {
         if shared.hotkey_state.diagnostics().0.is_empty() {

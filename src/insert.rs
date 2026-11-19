@@ -6,21 +6,41 @@
 
 use crate::pasteboard::Snapshot;
 use anyhow::Result;
-use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
+use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, EventField};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
-use std::sync::{
-    atomic::{AtomicI64, Ordering},
-    Mutex,
-};
+use std::collections::VecDeque;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 const KEYCODE_V: u16 = 9;
 const KEYCODE_C: u16 = 8;
+/// Метка наших синтетических ⌘C / ⌘V, чтобы собственный CGEventTap их не
+/// перехватывал и не путал с нажатиями пользователя.
+pub const SYNTHETIC_EVENT_TAG: i64 = 0x4C4C_4D44_4943_5401;
+
 static PASTEBOARD: Mutex<()> = Mutex::new(());
-static OUR_CHANGE: AtomicI64 = AtomicI64::new(-1);
+static OUR_CHANGES: LazyLock<Mutex<VecDeque<i64>>> = LazyLock::new(|| Mutex::new(VecDeque::new()));
+const MAX_TRACKED_CHANGES: usize = 16;
+
+fn record_our_change(change: i64) {
+    if change < 0 {
+        return;
+    }
+    let mut ring = OUR_CHANGES.lock().unwrap();
+    if ring.contains(&change) {
+        return;
+    }
+    if ring.len() >= MAX_TRACKED_CHANGES {
+        ring.pop_front();
+    }
+    ring.push_back(change);
+}
 
 pub fn is_our_change(change: i64) -> bool {
-    owns_change(OUR_CHANGE.load(Ordering::Relaxed), change)
+    if change < 0 {
+        return false;
+    }
+    OUR_CHANGES.lock().unwrap().contains(&change)
 }
 
 fn owns_change(owned: i64, current: i64) -> bool {
@@ -30,14 +50,14 @@ fn owns_change(owned: i64, current: i64) -> bool {
 fn write_unlocked(text: &str) -> Result<i64> {
     arboard::Clipboard::new()?.set_text(text.to_string())?;
     let change = pasteboard_change_count();
-    OUR_CHANGE.store(change, Ordering::Relaxed);
+    record_our_change(change);
     Ok(change)
 }
 
 fn restore_unlocked(previous: &Snapshot, expected: i64) -> Result<()> {
     if owns_change(expected, pasteboard_change_count()) {
         if let Some(change) = previous.restore(expected)? {
-            OUR_CHANGE.store(change, Ordering::Relaxed);
+            record_our_change(change);
         }
     }
     Ok(())
@@ -59,13 +79,13 @@ pub fn write_clipboard(text: &str) -> Result<()> {
 pub fn pasteboard_change_count() -> i64 {
     use objc2::runtime::AnyObject;
     use objc2::{class, msg_send};
-    unsafe {
+    objc2::rc::autoreleasepool(|_| unsafe {
         let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
         if pb.is_null() {
             return -1;
         }
         msg_send![pb, changeCount]
-    }
+    })
 }
 
 fn press_cmd(keycode: u16) -> Result<()> {
@@ -75,6 +95,7 @@ fn press_cmd(keycode: u16) -> Result<()> {
     let down = CGEvent::new_keyboard_event(source.clone(), keycode, true)
         .map_err(|_| anyhow::anyhow!("не создать событие нажатия"))?;
     down.set_flags(CGEventFlags::CGEventFlagCommand);
+    down.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, SYNTHETIC_EVENT_TAG);
     down.post(CGEventTapLocation::HID);
 
     std::thread::sleep(Duration::from_millis(12));
@@ -82,6 +103,7 @@ fn press_cmd(keycode: u16) -> Result<()> {
     let up = CGEvent::new_keyboard_event(source, keycode, false)
         .map_err(|_| anyhow::anyhow!("не создать событие отпускания"))?;
     up.set_flags(CGEventFlags::CGEventFlagCommand);
+    up.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, SYNTHETIC_EVENT_TAG);
     up.post(CGEventTapLocation::HID);
     Ok(())
 }
@@ -108,6 +130,7 @@ pub fn copy_selection() -> Result<(String, Option<String>)> {
             std::thread::sleep(Duration::from_millis(20));
             if pasteboard_change_count() != before {
                 let copied = pasteboard_change_count();
+                record_our_change(copied);
                 let text = read_clipboard().unwrap_or_default();
                 // Cmd+C — временная операция. Возвращаем буфер до запроса к
                 // модели, поэтому любой последующий отказ уже не теряет его.
@@ -192,9 +215,14 @@ fn paste_unlocked(
 
 pub fn play_sound(name: &str) {
     let path = format!("/System/Library/Sounds/{name}.aiff");
-    let _ = std::process::Command::new("/usr/bin/afplay")
+    if let Ok(mut child) = std::process::Command::new("/usr/bin/afplay")
         .arg(path)
-        .spawn();
+        .spawn()
+    {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
 }
 
 #[cfg(test)]

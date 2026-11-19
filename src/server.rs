@@ -173,7 +173,13 @@ fn handle(shared: &Arc<Shared>, request: Request) -> anyhow::Result<()> {
         .find(|h| h.field.equiv("Authorization"))
         .map(|h| h.value.as_str().trim().to_string())
         .unwrap_or_default();
-    let given = given.strip_prefix("Bearer ").unwrap_or(&given).trim();
+    let given = {
+        let mut parts = given.splitn(2, char::is_whitespace);
+        match (parts.next(), parts.next()) {
+            (Some(scheme), Some(token)) if scheme.eq_ignore_ascii_case("bearer") => token.trim(),
+            _ => given.trim(),
+        }
+    };
     if expected.is_empty() || given != expected {
         return Ok(request.respond(error_response(401, "неверный ключ"))?);
     }
@@ -223,14 +229,20 @@ fn chat(shared: &Arc<Shared>, mut request: Request, model_id: &str) -> anyhow::R
     if request.body_length().is_some_and(|n| n > MAX_BODY) {
         return Ok(request.respond(error_response(413, "слишком большой запрос"))?);
     }
-    let mut body = String::new();
+    let mut raw = Vec::new();
     request
         .as_reader()
         .take((MAX_BODY + 1) as u64)
-        .read_to_string(&mut body)?;
-    if body.len() > MAX_BODY {
+        .read_to_end(&mut raw)?;
+    if raw.len() > MAX_BODY {
         return Ok(request.respond(error_response(413, "слишком большой запрос"))?);
     }
+    let body = match String::from_utf8(raw) {
+        Ok(s) => s,
+        Err(_) => {
+            return Ok(request.respond(error_response(400, "тело запроса не в кодировке UTF-8"))?)
+        }
+    };
     let parsed: ChatRequest = match serde_json::from_str(&body) {
         Ok(p) => p,
         Err(e) => return Ok(request.respond(error_response(400, &format!("разбор запроса: {e}")))?),
@@ -353,12 +365,24 @@ fn stream_response(
     let (tx, rx) = std::sync::mpsc::sync_channel::<String>(64);
     let mut writer = request.into_writer();
     let sender = std::thread::spawn(move || -> std::io::Result<()> {
-        writer.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
+        // Chunked transfer encoding: tiny_http держит HTTP/1.1 keep-alive
+        // соединение открытым, и без chunked/Content-Length стандартные клиенты
+        // висели бы в ожидании TCP EOF после [DONE].
+        writer.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n\r\n",
+        )?;
         writer.flush()?;
         for chunk in rx {
+            if chunk.is_empty() {
+                continue;
+            }
+            write!(writer, "{:x}\r\n", chunk.len())?;
             writer.write_all(chunk.as_bytes())?;
+            writer.write_all(b"\r\n")?;
             writer.flush()?;
         }
+        writer.write_all(b"0\r\n\r\n")?;
+        writer.flush()?;
         Ok(())
     });
     let id = format!("chatcmpl-{}", now());
@@ -408,13 +432,18 @@ fn stream_response(
     };
     // Очередь уже не держит модель. Закрытый/медленный клиент не мешает диктовке.
     // Завершающий кусок тоже ждёт места: без него клиент не увидит [DONE].
-    let _ = send_chunk(
+    let delivered = send_chunk(
         &tx,
         format!("{closing}data: [DONE]\n\n"),
         SLOW_CLIENT_PATIENCE,
         || !sender.is_finished(),
     );
     drop(tx);
+    // Если клиент завис и перестал читать сокет, sender может вечно ждать в
+    // write_all — не занимаем этим рабочий поток из пула сервера.
+    if !delivered {
+        return Ok(());
+    }
     match sender.join() {
         Ok(result) => Ok(result?),
         Err(_) => anyhow::bail!("поток отправки ответа завершился аварийно"),

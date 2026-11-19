@@ -82,7 +82,7 @@ impl Downmix {
     fn new(src_rate: u32, channels: u16) -> Self {
         Self {
             channels: channels.max(1) as usize,
-            ratio: TARGET_RATE as f64 / src_rate as f64,
+            ratio: TARGET_RATE as f64 / src_rate.max(1) as f64,
             pos: 0.0,
             acc: 0.0,
             acc_n: 0,
@@ -261,16 +261,22 @@ pub fn duration_secs(samples: &[f32]) -> f32 {
 pub fn read_wav(path: &str) -> Result<Vec<f32>> {
     let mut reader = hound::WavReader::open(path)?;
     let spec = reader.spec();
+    anyhow::ensure!(
+        spec.sample_rate > 0,
+        "в WAV указана нулевая частота дискретизации"
+    );
+    anyhow::ensure!(spec.channels > 0, "в WAV указано ноль каналов");
 
     let raw: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => reader.samples::<f32>().map_while(Result::ok).collect(),
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .collect::<std::result::Result<Vec<_>, _>>()?,
         hound::SampleFormat::Int => {
-            let scale = 1.0 / (1i64 << (spec.bits_per_sample - 1)) as f32;
+            let scale = 1.0 / (1i64 << (spec.bits_per_sample.saturating_sub(1))) as f32;
             reader
                 .samples::<i32>()
-                .map_while(Result::ok)
-                .map(|s| s as f32 * scale)
-                .collect()
+                .map(|r| r.map(|s| s as f32 * scale))
+                .collect::<std::result::Result<Vec<_>, _>>()?
         }
     };
 

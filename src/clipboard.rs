@@ -65,11 +65,13 @@ pub fn load_recent() -> Vec<Entry> {
 }
 
 fn append(entry: &Entry) -> anyhow::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
     let dir = crate::config::config_dir();
     std::fs::create_dir_all(&dir)?;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(history_path())?;
     writeln!(file, "{}", serde_json::to_string(entry)?)?;
     Ok(())
@@ -88,10 +90,19 @@ pub fn rotate(days: u32) -> anyhow::Result<()> {
     };
     crate::persistence::atomic_write_with(&history_path(), |out| {
         let mut out = std::io::BufWriter::new(out);
-        for line in BufReader::new(file).lines() {
-            let line = line?;
-            if serde_json::from_str::<Entry>(&line).is_ok_and(|e| e.at > cutoff) {
-                writeln!(out, "{line}")?;
+        let mut reader = BufReader::new(file);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            let n = reader.read_until(b'\n', &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            if let Ok(line) = std::str::from_utf8(&buf) {
+                let line = line.trim_end_matches(['\r', '\n']);
+                if serde_json::from_str::<Entry>(line).is_ok_and(|e| e.at > cutoff) {
+                    writeln!(out, "{line}")?;
+                }
             }
         }
         out.flush()

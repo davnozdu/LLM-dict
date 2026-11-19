@@ -148,7 +148,7 @@ pub struct App {
     /// Что из моделей уже скачано: stat по файлам на каждом кадре незачем.
     installed: HashMap<String, bool>,
     installed_checked: Instant,
-    capturing: bool,
+    capture_target: Option<CaptureTarget>,
     capture_preview: Vec<u16>,
     verdict: conflicts::Verdict,
     verdict_for: Binding,
@@ -174,9 +174,6 @@ pub struct App {
     /// Размер обычного окна, чтобы вернуть его после списка: список
     /// перекраивает то же самое окно, а не заводит своё.
     main_size: egui::Vec2,
-    /// Набирается сочетание именно для окна буфера, а не для действия.
-    capturing_clipboard: bool,
-    capturing_last: bool,
     duplicates: Vec<String>,
     duplicates_checked: Instant,
     key_synced: bool,
@@ -189,14 +186,21 @@ pub struct App {
     show_server_key: bool,
     /// Какое действие сейчас раскрыто в редакторе.
     editing_action: Option<String>,
-    /// Для какого действия набирается сочетание.
-    capturing_action: Option<String>,
     /// Списки моделей, считанные с поставщиков.
     provider_models: HashMap<Provider, Vec<String>>,
     /// Идущее чтение списка моделей.
     model_fetch: Option<ModelFetch>,
     /// Ключи поставщиков в полях ввода.
     provider_keys: HashMap<Provider, String>,
+}
+
+/// Для какой настройки прямо сейчас набирается сочетание клавиш.
+#[derive(PartialEq, Eq, Clone)]
+enum CaptureTarget {
+    Dictation,
+    Clipboard,
+    PasteLast,
+    Action(String),
 }
 
 /// Что именно спрашиваем у поставщика: список моделей или годность ключа.
@@ -286,7 +290,7 @@ impl App {
             context_checks: HashMap::new(),
             installed: HashMap::new(),
             installed_checked: long_ago(10),
-            capturing: false,
+            capture_target: None,
             capture_preview: Vec::new(),
             verdict: conflicts::Verdict::Free,
             verdict_for: Binding::new(Vec::new()),
@@ -301,8 +305,6 @@ impl App {
             picker_focused: false,
             picker_closed: long_ago(10),
             main_size: egui::vec2(600.0, 680.0),
-            capturing_clipboard: false,
-            capturing_last: false,
             duplicates: Vec::new(),
             duplicates_checked: long_ago(60),
             key_synced: false,
@@ -311,7 +313,6 @@ impl App {
             download: None,
             show_server_key: false,
             editing_action: None,
-            capturing_action: None,
             provider_models: HashMap::new(),
             model_fetch: None,
             provider_keys: HashMap::new(),
@@ -555,8 +556,9 @@ impl App {
         installed
     }
 
-    fn set_capturing(&mut self, on: bool) {
-        self.capturing = on;
+    fn set_capturing(&mut self, target: Option<CaptureTarget>) {
+        let on = target.is_some();
+        self.capture_target = target;
         self.capture_preview.clear();
         let _ = self.shared.take_captured();
         self.shared.hotkey_state.set_capturing(on);
@@ -609,7 +611,7 @@ impl App {
     }
 
     fn poll_capture(&mut self) {
-        if !self.capturing {
+        if self.capture_target.is_none() {
             return;
         }
         if let Some(keys) = self.shared.take_captured() {
@@ -726,7 +728,7 @@ impl App {
     fn start_model_check(&mut self) {
         let (tx, rx) = std::sync::mpsc::channel();
         let base = self.cfg.stt.base_url.clone();
-        let key = self.api_key_input.clone();
+        let key = self.api_key_input.trim().to_string();
         std::thread::spawn(move || {
             let res = providers::list_models(&base, &key).map_err(|e| e.to_string());
             let _ = tx.send(res);
@@ -795,21 +797,37 @@ impl eframe::App for App {
             .clipboard_requested
             .swap(false, std::sync::atomic::Ordering::Relaxed)
             && !self.picker
+            && self.key_migration.is_none()
         {
             self.open_picker(ctx);
         }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
+
+        // Закрытие окна (в том числе ⌘W) прячет его, а не завершает процесс —
+        // обрабатываем раньше любых ранних возвратов (миграция ключей, пикер).
+        if ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if self.picker {
+                self.close_picker(ctx);
+            } else {
+                self.set_capturing(None);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
+            return;
+        }
+
         if self.key_migration.is_some() {
             ui.spinner();
             ui.label("Переношу ключи...");
-            ui.ctx().request_repaint_after(Duration::from_millis(100));
+            ctx.request_repaint_after(Duration::from_millis(100));
             return;
         }
-        let ctx = ui.ctx().clone();
-        let ctx = &ctx;
         self.poll_model_check();
+        self.poll_model_fetch();
 
         // Список из буфера занимает всё окно: ни вкладок, ни строки состояния
         // у него нет — только записи на полупрозрачной плашке.
@@ -855,12 +873,7 @@ impl eframe::App for App {
             self.device_checked = Instant::now();
         }
 
-        // Закрытие окна прячет его, а не завершает приложение.
-        if ctx.input(|i| i.viewport().close_requested()) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-        }
-
+        let prev_tab = self.tab;
         egui::Panel::top("tabs").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -880,6 +893,9 @@ impl eframe::App for App {
             });
             ui.add_space(4.0);
         });
+        if self.tab != prev_tab && self.capture_target.is_some() {
+            self.set_capturing(None);
+        }
 
         egui::Panel::bottom("status_bar").show(ui, |ui| {
             ui.add_space(3.0);
@@ -945,7 +961,7 @@ impl eframe::App for App {
         // Во время набора сочетания опрос должен успевать за пальцами: при
         // 500 мс между кадрами третья клавиша не попадала в превью, и казалось,
         // что приложение читает только две.
-        if self.capturing {
+        if self.capture_target.is_some() {
             ctx.request_repaint_after(Duration::from_millis(16));
         } else if self.shared.stage().is_busy() || self.model_check.is_some() {
             ctx.request_repaint_after(Duration::from_millis(60));
@@ -1098,7 +1114,11 @@ impl App {
             ui.add_space(6.0);
         }
 
-        if self.api_key_input.trim().is_empty() && self.shared.key_loaded() {
+        if self.cfg.stt.engine == Engine::Cloud
+            && self.cfg.stt.provider.needs_key()
+            && self.api_key_input.trim().is_empty()
+            && self.shared.key_loaded()
+        {
             ui.colored_label(
                 egui::Color32::from_rgb(220, 130, 40),
                 "Не задан API-ключ — распознавание работать не будет.",
@@ -1216,7 +1236,7 @@ impl App {
             ui.label(egui::RichText::new("Горячая клавиша").strong());
             ui.add_space(4.0);
 
-            if self.capturing && !self.capturing_clipboard && !self.capturing_last {
+            if self.capture_target == Some(CaptureTarget::Dictation) {
                 let shown = if self.capture_preview.is_empty() {
                     "нажмите клавиши…".to_string()
                 } else {
@@ -1241,17 +1261,17 @@ impl App {
                         .clicked()
                     {
                         self.cfg.general.hotkey = Binding::new(self.capture_preview.clone());
-                        self.set_capturing(false);
+                        self.set_capturing(None);
                     }
                     if ui.button("Отмена").clicked() {
-                        self.set_capturing(false);
+                        self.set_capturing(None);
                     }
                 });
                 ui.weak(
                     "Зажмите нужное сочетание целиком — до трёх клавиш. \
                      Записывается самый полный набор, который вы удерживали.",
                 );
-                if !permissions::input_monitoring().is_ok() {
+                if !self.perms.get().2.is_ok() {
                     ui.colored_label(
                         egui::Color32::from_rgb(220, 80, 80),
                         "Буквы и цифры сейчас не поймаются — нет «Мониторинга ввода»",
@@ -1266,7 +1286,7 @@ impl App {
                         ),
                     );
                     if ui.button("Задать сочетание").clicked() {
-                        self.set_capturing(true);
+                        self.set_capturing(Some(CaptureTarget::Dictation));
                     }
                 });
 
@@ -1328,7 +1348,7 @@ impl App {
             }
 
             ui.add_space(8.0);
-            let capturing_last = self.capturing_last;
+            let capturing_last = self.capture_target == Some(CaptureTarget::PasteLast);
             ui.horizontal(|ui| {
                 ui.add_sized([130.0, 20.0], egui::Label::new("Вставить последнее"));
                 if capturing_last {
@@ -1344,18 +1364,15 @@ impl App {
                     {
                         self.cfg.general.paste_last_hotkey =
                             Binding::new(self.capture_preview.clone());
-                        self.set_capturing(false);
-                        self.capturing_last = false;
+                        self.set_capturing(None);
                     }
                     if ui.button("Отмена").clicked() {
-                        self.set_capturing(false);
-                        self.capturing_last = false;
+                        self.set_capturing(None);
                     }
                 } else {
                     ui.label(self.cfg.general.paste_last_hotkey.label());
                     if ui.button("Задать").clicked() {
-                        self.set_capturing(true);
-                        self.capturing_last = true;
+                        self.set_capturing(Some(CaptureTarget::PasteLast));
                     }
                     if !self.cfg.general.paste_last_hotkey.is_empty()
                         && ui.button("Убрать").clicked()
@@ -1395,7 +1412,7 @@ impl App {
                 .clipboard
                 .set_enabled(self.cfg.general.clipboard_history);
 
-            let capturing_clip = self.capturing_clipboard;
+            let capturing_clip = self.capture_target == Some(CaptureTarget::Clipboard);
             ui.horizontal(|ui| {
                 ui.add_sized([130.0, 20.0], egui::Label::new("Сочетание"));
                 if capturing_clip {
@@ -1411,18 +1428,15 @@ impl App {
                     {
                         self.cfg.general.clipboard_hotkey =
                             Binding::new(self.capture_preview.clone());
-                        self.set_capturing(false);
-                        self.capturing_clipboard = false;
+                        self.set_capturing(None);
                     }
                     if ui.button("Отмена").clicked() {
-                        self.set_capturing(false);
-                        self.capturing_clipboard = false;
+                        self.set_capturing(None);
                     }
                 } else {
                     ui.label(self.cfg.general.clipboard_hotkey.label());
                     if ui.button("Задать").clicked() {
-                        self.set_capturing(true);
-                        self.capturing_clipboard = true;
+                        self.set_capturing(Some(CaptureTarget::Clipboard));
                     }
                     if !self.cfg.general.clipboard_hotkey.is_empty()
                         && ui.button("Убрать").clicked()
@@ -1474,6 +1488,9 @@ impl App {
             ui.label("Движок по умолчанию:");
             for e in Engine::ALL {
                 ui.radio_value(&mut self.cfg.stt.engine, e, e.label());
+            }
+            if self.cfg.stt.fallback == Some(self.cfg.stt.engine) {
+                self.cfg.stt.fallback = None;
             }
 
             ui.add_space(6.0);
@@ -1571,6 +1588,7 @@ impl App {
                     }
                     // Ключ у каждого сервиса свой — показываем сохранённый.
                     self.api_key_input = self.shared.key(provider.key_account());
+                    self.models.clear();
                     self.model_check = None;
                     self.check_message = None;
                 }
@@ -1654,11 +1672,13 @@ impl App {
                  Второй копии в памяти не появится.",
             );
             ui.add_space(6.0);
+            let was_enabled = self.cfg.server.enabled;
             ui.checkbox(&mut self.cfg.server.enabled, "Включить локальный эндпоинт");
+            if self.cfg.server.enabled && !was_enabled && self.cfg.server.api_key.trim().is_empty()
+            {
+                self.cfg.server.api_key = crate::server::new_key();
+            }
             if self.cfg.server.enabled {
-                if self.cfg.server.api_key.trim().is_empty() {
-                    self.cfg.server.api_key = crate::server::new_key();
-                }
                 labeled(ui, "Порт", |ui| {
                     ui.add(egui::DragValue::new(&mut self.cfg.server.port).range(1024..=65535));
                     ui.weak(format!("http://127.0.0.1:{}/v1", self.cfg.server.port));
@@ -1966,7 +1986,10 @@ impl App {
     fn fetch_models(&mut self, endpoint: &Endpoint) {
         let provider = endpoint.provider;
         let base_url = endpoint.base_url();
-        let key = self.provider_keys.get(&provider).cloned();
+        let key = self
+            .provider_keys
+            .get(&provider)
+            .map(|k| k.trim().to_string());
         let cfg = self.cfg.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -1978,16 +2001,24 @@ impl App {
     }
 
     /// Ключ поставщика: поле, кнопка сохранения и ссылка, где его взять.
-    fn ui_provider_key(&mut self, ui: &mut egui::Ui, provider: Provider) {
+    fn ui_provider_key(&mut self, ui: &mut egui::Ui, endpoint: &Endpoint) {
+        let provider = endpoint.provider;
         if !provider.needs_key() {
             ui.weak("Ollama работает локально, ключ не нужен.");
             return;
         }
         if !self.stored_keys.contains_key(&provider) {
             if let Some(rx) = self.key_reads.get(&provider) {
-                if let Ok(key) = rx.try_recv() {
-                    self.stored_keys.insert(provider, key);
-                    self.key_reads.remove(&provider);
+                match rx.try_recv() {
+                    Ok(key) => {
+                        self.stored_keys.insert(provider, key);
+                        self.key_reads.remove(&provider);
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.stored_keys.insert(provider, String::new());
+                        self.key_reads.remove(&provider);
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 }
             } else {
                 let cfg = self.cfg.clone();
@@ -2055,7 +2086,7 @@ impl App {
                 }
             }
             if ui.button("Проверить ключ").clicked() {
-                self.verify_key_now(provider);
+                self.verify_key_now(endpoint);
             }
             if let Some(url) = provider.key_url() {
                 if ui.button("Где взять").clicked() {
@@ -2069,17 +2100,9 @@ impl App {
     ///
     /// Берётся то, что набрано в поле, — иначе «Проверить» проверял бы
     /// сохранённый ключ, а не тот, который пользователь только что вставил.
-    fn verify_key_now(&mut self, provider: Provider) {
-        let Some(action) = self
-            .cfg
-            .actions
-            .iter()
-            .find(|a| a.endpoint.provider == provider)
-            .cloned()
-        else {
-            self.toast("Сначала выберите модель для этого поставщика");
-            return;
-        };
+    fn verify_key_now(&mut self, endpoint: &Endpoint) {
+        let provider = endpoint.provider;
+        let endpoint = endpoint.clone();
         let cfg = self.cfg.clone();
         let typed = self
             .provider_keys
@@ -2090,7 +2113,7 @@ impl App {
         std::thread::spawn(move || {
             let key = typed.unwrap_or_else(|| cfg.key_for(provider.key_account()));
             let _ = tx.send(
-                providers::verify_key(&action.endpoint, &key)
+                providers::verify_key(&endpoint, &key)
                     .map(|()| Vec::new())
                     .map_err(|e| e.to_string()),
             );
@@ -2108,8 +2131,10 @@ impl App {
     /// Запоминает, кто был впереди: после выбора фокус надо вернуть туда,
     /// иначе вставка уйдёт в наше же окно.
     fn open_picker(&mut self, ctx: &egui::Context) {
-        self.picker_return_pid = macos::frontmost_app_pid();
-        self.picker_target = crate::focus::Target::capture();
+        let own_pid = std::process::id() as i32;
+        let front_pid = macos::frontmost_app_pid().filter(|&p| p != own_pid);
+        self.picker_return_pid = front_pid;
+        self.picker_target = crate::focus::Target::capture().filter(|t| t.pid != own_pid);
         self.picker = true;
         self.picker_query.clear();
         self.picker_index = 0;
@@ -2178,6 +2203,7 @@ impl App {
     /// чтобы её можно было вставить ещё раз руками.
     fn paste_from_picker(&mut self, ctx: &egui::Context, text: String) {
         let target = self.picker_target.take();
+        let return_pid = self.picker_return_pid;
         self.close_picker(ctx);
         let shared = self.shared.clone();
         std::thread::spawn(move || {
@@ -2185,11 +2211,34 @@ impl App {
             // раньше этого уйдёт в никуда.
             let result = (|| -> anyhow::Result<bool> {
                 if let Some(target) = target {
-                    let deadline = Instant::now() + Duration::from_millis(700);
+                    let deadline = Instant::now() + Duration::from_millis(800);
+                    let mut reactivated = false;
                     while Instant::now() < deadline {
                         if target.is_current() {
+                            // Небольшая пауза, чтобы окно-получатель успело
+                            // восстановить first responder после возврата фокуса.
+                            std::thread::sleep(Duration::from_millis(40));
                             return insert::insert_into(&text, false, &target);
                         }
+                        if !reactivated {
+                            // ViewportCommand::Visible(false) выполняется в конце
+                            // кадра, поэтому повторяем активацию уже после скрытия.
+                            std::thread::sleep(Duration::from_millis(30));
+                            macos::activate_app(target.pid);
+                            reactivated = true;
+                        } else {
+                            std::thread::sleep(Duration::from_millis(25));
+                        }
+                    }
+                } else if let Some(pid) = return_pid {
+                    let deadline = Instant::now() + Duration::from_millis(800);
+                    while Instant::now() < deadline {
+                        if macos::frontmost_app_pid() == Some(pid) {
+                            std::thread::sleep(Duration::from_millis(40));
+                            insert::insert(&text, false)?;
+                            return Ok(true);
+                        }
+                        macos::activate_app(pid);
                         std::thread::sleep(Duration::from_millis(30));
                     }
                 }
@@ -2330,6 +2379,7 @@ impl App {
             self.close_picker(&ctx);
             return;
         }
+        let moved = keys && (nav_down || nav_up);
         if keys && nav_down && !found.is_empty() {
             self.picker_index = (self.picker_index + 1).min(found.len() - 1);
         }
@@ -2369,7 +2419,7 @@ impl App {
                 if response.clicked() {
                     chosen = Some(entry.text.clone());
                 }
-                if selected {
+                if selected && moved {
                     response.scroll_to_me(None);
                 }
             }
@@ -2381,8 +2431,6 @@ impl App {
     }
 
     fn ui_actions(&mut self, ui: &mut egui::Ui) {
-        self.poll_model_fetch();
-
         ui.add_space(6.0);
         ui.label(egui::RichText::new("Действия над выделенным текстом").strong());
         ui.weak(
@@ -2394,11 +2442,13 @@ impl App {
         ui.horizontal(|ui| {
             if ui.button("+  Новое действие").clicked() {
                 let action = TextAction::default();
+                self.set_capturing(None);
                 self.editing_action = Some(action.id.clone());
                 self.cfg.actions.push(action);
             }
             if ui.button("+  Ответ по моим данным").clicked() {
                 let action = crate::actions::answer_action(Endpoint::default());
+                self.set_capturing(None);
                 self.editing_action = Some(action.id.clone());
                 self.cfg.actions.push(action);
             }
@@ -2444,6 +2494,7 @@ impl App {
                             title.push_str("  ·  после диктовки");
                         }
                         if ui.selectable_label(expanded, title).clicked() {
+                            self.set_capturing(None);
                             self.editing_action = if expanded { None } else { Some(id.clone()) };
                         }
                         if index > 0 && ui.small_button("↑").clicked() {
@@ -2477,9 +2528,8 @@ impl App {
             if self.editing_action.as_deref() == Some(id.as_str()) {
                 self.editing_action = None;
             }
-            if self.capturing_action.as_deref() == Some(id.as_str()) {
-                self.set_capturing(false);
-                self.capturing_action = None;
+            if matches!(&self.capture_target, Some(CaptureTarget::Action(cid)) if cid == &id) {
+                self.set_capturing(None);
             }
         }
     }
@@ -2494,7 +2544,8 @@ impl App {
         });
 
         // --- сочетание клавиш ---
-        let capturing = self.capturing_action.as_deref() == Some(id.as_str());
+        let capturing =
+            matches!(&self.capture_target, Some(CaptureTarget::Action(cid)) if cid == &id);
         ui.horizontal(|ui| {
             ui.add_sized([130.0, 20.0], egui::Label::new("Сочетание"));
             if capturing {
@@ -2513,18 +2564,15 @@ impl App {
                     .clicked()
                 {
                     self.cfg.actions[pos].hotkey = Binding::new(self.capture_preview.clone());
-                    self.set_capturing(false);
-                    self.capturing_action = None;
+                    self.set_capturing(None);
                 }
                 if ui.button("Отмена").clicked() {
-                    self.set_capturing(false);
-                    self.capturing_action = None;
+                    self.set_capturing(None);
                 }
             } else {
                 ui.label(self.cfg.actions[pos].hotkey.label());
                 if ui.button("Задать").clicked() {
-                    self.set_capturing(true);
-                    self.capturing_action = Some(id.clone());
+                    self.set_capturing(Some(CaptureTarget::Action(id.clone())));
                 }
                 if !self.cfg.actions[pos].hotkey.is_empty() && ui.button("Убрать").clicked() {
                     self.cfg.actions[pos].hotkey = Binding::new(Vec::new());
@@ -2532,7 +2580,7 @@ impl App {
             }
         });
 
-        // Сочетание действия не должно совпадать с диктовкой и с другими действиями.
+        // Сочетание действия не должно совпадать с диктовкой, буфером и другими действиями.
         let own = self.cfg.actions[pos].hotkey.clone();
         if !own.is_empty() {
             if own == self.cfg.general.hotkey {
@@ -2540,12 +2588,20 @@ impl App {
                     egui::Color32::from_rgb(220, 80, 80),
                     "Занято — это сочетание уже стоит на диктовке",
                 );
-            } else if let Some(other) = self
-                .cfg
-                .actions
-                .iter()
-                .enumerate()
-                .find(|(i, a)| *i != pos && a.hotkey == own && !a.hotkey.is_empty())
+            } else if own == self.cfg.general.clipboard_hotkey {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 80, 80),
+                    "Занято — это сочетание уже открывает буфер обмена",
+                );
+            } else if own == self.cfg.general.paste_last_hotkey {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 80, 80),
+                    "Занято — это сочетание уже вставляет последнее",
+                );
+            } else if let Some(other) =
+                self.cfg.actions.iter().enumerate().find(|(i, a)| {
+                    *i != pos && a.enabled && a.hotkey == own && !a.hotkey.is_empty()
+                })
             {
                 ui.colored_label(
                     egui::Color32::from_rgb(220, 80, 80),
@@ -2670,7 +2726,8 @@ impl App {
             );
 
             ui.add_space(4.0);
-            self.ui_provider_key(ui, provider);
+            let endpoint = self.cfg.actions[pos].endpoint.clone();
+            self.ui_provider_key(ui, &endpoint);
         }
 
         // --- промпт и вывод ---
@@ -3072,6 +3129,12 @@ impl App {
     }
 
     fn ui_permissions(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            self.ui_permissions_inner(ui);
+        });
+    }
+
+    fn ui_permissions_inner(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.label(egui::RichText::new("Системные разрешения").strong());
         ui.add_space(8.0);
@@ -3415,7 +3478,11 @@ fn picker_row(
 }
 
 fn model_picker(ui: &mut egui::Ui, id: &str, value: &mut String, models: &[String], filter: &str) {
-    if models.is_empty() {
+    let filtered: Vec<&String> = models
+        .iter()
+        .filter(|m| filter.is_empty() || m.contains(filter))
+        .collect();
+    if filtered.is_empty() {
         ui.add(egui::TextEdit::singleline(value).desired_width(320.0));
         return;
     }
@@ -3423,10 +3490,7 @@ fn model_picker(ui: &mut egui::Ui, id: &str, value: &mut String, models: &[Strin
         .width(320.0)
         .selected_text(value.clone())
         .show_ui(ui, |ui| {
-            for m in models
-                .iter()
-                .filter(|m| filter.is_empty() || m.contains(filter))
-            {
+            for m in filtered {
                 ui.selectable_value(value, m.clone(), m);
             }
         });

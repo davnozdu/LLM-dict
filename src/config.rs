@@ -471,7 +471,20 @@ impl Config {
                     }
                 }
             },
-            Err(_) => Config::default(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
+            Err(e) => {
+                log::warn!(
+                    "не прочитать {}: {e}, беру значения по умолчанию",
+                    path.display()
+                );
+                Config {
+                    load_error: Some(format!(
+                        "Не прочитать {}: {e}. Исправьте файл и перезапустите приложение; исходник сохранён.",
+                        path.display()
+                    )),
+                    ..Config::default()
+                }
+            }
         }
     }
 
@@ -482,8 +495,8 @@ impl Config {
                 self.api_key = key;
             }
         } else {
-            // Ключом управляет Keychain; не оставляем старую копию в файле.
-            self.provider_keys.remove("groq_api_key");
+            // Ключами управляет Keychain; не оставляем старые копии в файле.
+            self.provider_keys.clear();
             self.api_key.clear();
         }
         self.stt.language = normalize_language(&self.stt.language).to_string();

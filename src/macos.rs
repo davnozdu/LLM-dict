@@ -92,17 +92,19 @@ pub fn watch_dock_reopen(wake: Box<dyn Fn() + Send + Sync>) -> bool {
         if class.is_null() {
             return false;
         }
-        // «B@:@B» — возвращает BOOL, принимает self, селектор, отправителя и
-        // BOOL «есть ли видимые окна». На arm64 BOOL — это bool, то есть «B».
         let imp: objc2::runtime::Imp = std::mem::transmute(
             should_handle_reopen
                 as extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject, Bool) -> Bool,
         );
+        #[cfg(target_arch = "aarch64")]
+        let types = c"B@:@B".as_ptr();
+        #[cfg(not(target_arch = "aarch64"))]
+        let types = c"c@:@c".as_ptr();
         let added = objc2::ffi::class_addMethod(
             class as *mut AnyClass,
             sel!(applicationShouldHandleReopen:hasVisibleWindows:),
             imp,
-            c"B@:@B".as_ptr(),
+            types,
         );
         if added.as_bool() {
             log::info!("щелчок по значку в Dock будет возвращать окно");
@@ -178,7 +180,7 @@ pub struct FrontmostApp {
 /// Одним обращением, а не тремя: спрашивается это на каждое попадание в
 /// буфер, а NSWorkspace на каждый вызов заглядывает в чужой процесс.
 pub fn frontmost_app() -> FrontmostApp {
-    unsafe {
+    objc2::rc::autoreleasepool(|_| unsafe {
         let mut out = FrontmostApp::default();
         let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
         if workspace.is_null() {
@@ -198,13 +200,13 @@ pub fn frontmost_app() -> FrontmostApp {
             out.path = read_nsstring(path);
         }
         out
-    }
+    })
 }
 
 /// Где лежит программа с таким идентификатором. Нужно для старых записей
 /// истории: там сохранено только имя и идентификатор, пути ещё нет.
 pub fn app_path_for_id(bundle_id: &str) -> Option<String> {
-    unsafe {
+    objc2::rc::autoreleasepool(|_| unsafe {
         let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
         if workspace.is_null() {
             return None;
@@ -216,7 +218,7 @@ pub fn app_path_for_id(bundle_id: &str) -> Option<String> {
         }
         let path: *mut AnyObject = msg_send![url, path];
         read_nsstring(path)
-    }
+    })
 }
 
 /// Значок программы в виде RGBA с домноженной альфой — ровно в том виде, в
@@ -295,7 +297,7 @@ pub fn app_icon_rgba(app_path: &str, size: usize) -> Option<Vec<u8>> {
 
 /// Идентификатор процесса программы, которая сейчас впереди.
 pub fn frontmost_app_pid() -> Option<i32> {
-    unsafe {
+    objc2::rc::autoreleasepool(|_| unsafe {
         let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
         if workspace.is_null() {
             return None;
@@ -306,7 +308,7 @@ pub fn frontmost_app_pid() -> Option<i32> {
         }
         let pid: i32 = msg_send![app, processIdentifier];
         Some(pid)
-    }
+    })
 }
 
 /// Возвращает фокус программе по её идентификатору процесса.
@@ -314,13 +316,14 @@ pub fn frontmost_app_pid() -> Option<i32> {
 /// Нужно после окна выбора: вставлять надо туда, откуда пользователь пришёл,
 /// а не в наше окно.
 pub fn activate_app(pid: i32) -> bool {
-    unsafe {
+    objc2::rc::autoreleasepool(|_| unsafe {
         let cls = class!(NSRunningApplication);
         let app: *mut AnyObject = msg_send![cls, runningApplicationWithProcessIdentifier: pid];
         if app.is_null() {
             return false;
         }
-        // 0 — активировать обычным порядком, не поднимая все окна программы.
-        msg_send![app, activateWithOptions: 0usize]
-    }
+        // NSApplicationActivateIgnoringOtherApps (1 << 1): надёжно возвращает
+        // фокус исходной программе, даже пока наше окно ещё скрывается.
+        msg_send![app, activateWithOptions: 2usize]
+    })
 }

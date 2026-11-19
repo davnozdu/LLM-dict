@@ -45,19 +45,28 @@ pub fn atomic_write_with(
 
 /// JSONL stays chronological on disk; retain only the requested tail in memory.
 pub fn recent_json<T: serde::de::DeserializeOwned>(
-    reader: impl std::io::BufRead,
+    mut reader: impl std::io::BufRead,
     limit: usize,
 ) -> Vec<T> {
     let mut entries = std::collections::VecDeque::new();
     if limit == 0 {
         return Vec::new();
     }
-    for line in reader.lines().map_while(Result::ok) {
-        if let Ok(entry) = serde_json::from_str::<T>(&line) {
-            if entries.len() == limit {
-                entries.pop_front();
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                if let Ok(line) = std::str::from_utf8(&buf) {
+                    if let Ok(entry) = serde_json::from_str::<T>(line.trim_end()) {
+                        if entries.len() == limit {
+                            entries.pop_front();
+                        }
+                        entries.push_back(entry);
+                    }
+                }
             }
-            entries.push_back(entry);
         }
     }
     entries.into_iter().rev().collect()
@@ -67,7 +76,7 @@ pub fn recent_json<T: serde::de::DeserializeOwned>(
 mod tests {
     #[test]
     fn recent_json_keeps_valid_tail_newest_first() {
-        let input = b"1\n2\ninvalid\n3\n4\n";
+        let input = b"1\n2\ninvalid\n\xff\xfe\n3\n4\n";
         assert_eq!(super::recent_json::<u32>(&input[..], 2), [4, 3]);
         assert!(super::recent_json::<u32>(&input[..], 0).is_empty());
     }

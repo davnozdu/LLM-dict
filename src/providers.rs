@@ -186,6 +186,7 @@ pub fn transcribe(cfg: &SttConfig, api_key: &str, wav: Vec<u8>) -> Result<String
         form = form.text("prompt", cfg.prompt.trim().to_string());
     }
 
+    let api_key = api_key.trim();
     let mut req = client()?.post(&url).multipart(form);
     if !api_key.is_empty() {
         req = req.bearer_auth(api_key);
@@ -263,6 +264,7 @@ pub fn run_prompt(
         "messages": messages,
     });
 
+    let api_key = api_key.trim();
     let client = text_client().map_err(PromptError::unavailable)?;
     let mut req = client.post(&url).json(&payload);
     if !api_key.is_empty() {
@@ -324,6 +326,7 @@ pub fn verify_key(endpoint: &crate::provider::Endpoint, api_key: &str) -> Result
         "messages": [{ "role": "user", "content": "ok" }]
     });
 
+    let api_key = api_key.trim();
     let client = text_client().map_err(PromptError::unavailable)?;
     let mut req = client.post(&url).json(&payload);
     if !api_key.is_empty() {
@@ -350,6 +353,7 @@ struct ModelEntry {
 
 /// Проверка ключа и заодно список доступных моделей для выпадающих списков.
 pub fn list_models(base_url: &str, api_key: &str) -> Result<Vec<String>> {
+    let api_key = api_key.trim();
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let mut req = client()?.get(&url);
     if !api_key.is_empty() {

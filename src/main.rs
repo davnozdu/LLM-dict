@@ -438,8 +438,15 @@ fn main() -> eframe::Result<()> {
     if args.len() >= 4 && args[1] == "--test-action" {
         // --local прогоняет действие через локальную модель, минуя облако:
         // так проверяется именно откат, а не поставщик.
-        let local = args.iter().any(|a| a == "--local");
-        return run_action_test(&args[2], &args[3], local);
+        let local = args[2..].iter().any(|a| a == "--local");
+        let pos: Vec<&str> = args[2..]
+            .iter()
+            .filter(|a| a.as_str() != "--local")
+            .map(String::as_str)
+            .collect();
+        if pos.len() >= 2 {
+            return run_action_test(pos[0], pos[1], local);
+        }
     }
 
     let cfg = config::Config::load().normalized();

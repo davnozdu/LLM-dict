@@ -15,7 +15,7 @@ extern "C" {
         allocator: *const c_void,
         nodename: *const c_char,
     ) -> *mut c_void;
-    fn SCNetworkReachabilityGetFlags(target: *mut c_void, flags: *mut u32) -> bool;
+    fn SCNetworkReachabilityGetFlags(target: *mut c_void, flags: *mut u32) -> u8;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -52,7 +52,7 @@ fn probe() -> bool {
             return true;
         }
         let mut flags: u32 = 0;
-        let ok = SCNetworkReachabilityGetFlags(target, &mut flags);
+        let ok = SCNetworkReachabilityGetFlags(target, &mut flags) != 0;
         CFRelease(target);
         if !ok {
             return true;

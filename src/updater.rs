@@ -153,7 +153,10 @@ pub fn install(release: &Release) -> Result<PathBuf> {
 
     let result = install_from_mount(&mount, &target);
 
-    let _ = run("/usr/bin/hdiutil", &["detach", &mount.to_string_lossy()]);
+    let mount_str = mount.to_string_lossy();
+    if run("/usr/bin/hdiutil", &["detach", &mount_str]).is_err() {
+        let _ = run("/usr/bin/hdiutil", &["detach", "-force", &mount_str]);
+    }
     let _ = std::fs::remove_file(&dmg_path);
 
     result.map(|()| target)

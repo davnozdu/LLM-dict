@@ -42,7 +42,13 @@ impl Snapshot {
                     ensure!(!name.is_null(), "не прочитать имя формата буфера");
                     let name = std::ffi::CStr::from_ptr(name).to_str()?.to_owned();
                     let data: *mut AnyObject = msg_send![item, dataForType: kind];
-                    ensure!(!data.is_null(), "не сохранить формат буфера {name}");
+                    if data.is_null() {
+                        // Маркерные и promise-типы (например у 1Password, Finder,
+                        // Office) законно отдают nil — пропускаем их, а не рвём
+                        // весь снимок буфера.
+                        log::debug!("пропущен формат буфера без данных: {name}");
+                        continue;
+                    }
                     let len: usize = msg_send![data, length];
                     total = total
                         .checked_add(len)

@@ -16,6 +16,7 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::TokenToStringError;
 use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -225,8 +226,9 @@ impl Corrector {
 
     fn generate(&self, system: &str, context: Option<&str>, text: &str) -> Result<Generated> {
         let prompt = self.build_prompt(system, context, text)?;
-        // Потолок генерации: правка не бывает многократно длиннее входа.
-        let budget = |n: usize| n * 2 + 256;
+        // Потолок генерации: правка не бывает многократно длиннее входа, но
+        // при большом файле сведений не должна вылетать за окно контекста.
+        let budget = |n: usize| default_budget(n, 256);
         self.run_prompt(prompt, budget, |_| true)
     }
 
@@ -244,7 +246,7 @@ impl Corrector {
         on_token: impl FnMut(&str) -> bool,
     ) -> Result<Generated> {
         let prompt = self.render_chat(turns)?;
-        let budget = move |n: usize| max_tokens.unwrap_or(n * 2 + 512);
+        let budget = move |n: usize| max_tokens.unwrap_or_else(|| default_budget(n, 512));
         self.run_prompt(prompt, budget, on_token)
     }
 
@@ -315,17 +317,22 @@ impl Corrector {
             if self.model.is_eog_token(token) {
                 break;
             }
-            out.extend_from_slice(&self.model.token_to_piece_bytes(token, 64, false, None)?);
+            let piece = match self.model.token_to_piece_bytes(token, 64, false, None) {
+                Ok(bytes) => bytes,
+                Err(TokenToStringError::InsufficientBufferSpace(needed)) => self
+                    .model
+                    .token_to_piece_bytes(token, (-needed) as usize, false, None)?,
+                Err(TokenToStringError::UnknownTokenType) => Vec::new(),
+                Err(e) => return Err(e.into()),
+            };
+            out.extend_from_slice(&piece);
             produced += 1;
 
             // Отдаём только то, что уже складывается в целые символы.
-            if let Some(chunk) = complete_utf8(&out[sent..]) {
-                if !chunk.is_empty() {
-                    if !on_token(chunk) {
-                        bail!("генерация отменена");
-                    }
-                    sent += chunk.len();
-                }
+            // Явно битые байты (error_len == Some) заменяем на U+FFFD и
+            // сдвигаем sent, иначе поток застрял бы на первом же битом байте.
+            if !flush_utf8(&out, &mut sent, &mut on_token) {
+                bail!("генерация отменена");
             }
 
             batch.clear();
@@ -333,11 +340,19 @@ impl Corrector {
             n_cur += 1;
             ctx.decode(&mut batch)?;
         }
+        if sent < out.len() && !on_token("\u{FFFD}") {
+            bail!("генерация отменена");
+        }
         Ok(Generated {
             raw: String::from_utf8_lossy(&out).into_owned(),
             hit_budget: produced >= budget,
         })
     }
+}
+
+fn default_budget(input: usize, extra: usize) -> usize {
+    let remaining = (N_CTX_MAX as usize).saturating_sub(input.saturating_add(64));
+    input.saturating_mul(2).saturating_add(extra).min(remaining)
 }
 
 fn generation_limits(input: usize, budget: usize) -> Result<(u32, usize)> {
@@ -472,15 +487,42 @@ fn strip_preamble(s: &str) -> String {
     s.to_string()
 }
 
-/// Самый длинный кусок байтов, который целиком складывается в UTF-8.
-///
-/// Токен может кончиться на середине многобайтового символа: отдать такой
-/// хвост наружу — получить «ромбик с вопросом» в чужом клиенте.
-fn complete_utf8(bytes: &[u8]) -> Option<&str> {
-    match std::str::from_utf8(bytes) {
-        Ok(s) => Some(s),
-        Err(e) => std::str::from_utf8(&bytes[..e.valid_up_to()]).ok(),
+/// Отдаёт наружу все завершённые UTF-8 символы из `out[*sent..]`, заменяя
+/// битые байты на U+FFFD и оставляя в буфере только незаконченный хвост
+/// многобайтового символа.
+fn flush_utf8(out: &[u8], sent: &mut usize, on_token: &mut impl FnMut(&str) -> bool) -> bool {
+    while *sent < out.len() {
+        let tail = &out[*sent..];
+        match std::str::from_utf8(tail) {
+            Ok(s) => {
+                if !s.is_empty() && !on_token(s) {
+                    return false;
+                }
+                *sent += s.len();
+                break;
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                if valid > 0 {
+                    let s = std::str::from_utf8(&tail[..valid]).unwrap();
+                    if !on_token(s) {
+                        return false;
+                    }
+                    *sent += valid;
+                }
+                match e.error_len() {
+                    Some(bad) => {
+                        if !on_token("\u{FFFD}") {
+                            return false;
+                        }
+                        *sent += bad;
+                    }
+                    None => break,
+                }
+            }
+        }
     }
+    true
 }
 
 fn is_cyrillic(c: char) -> bool {
@@ -498,6 +540,38 @@ mod tests {
         assert!(generation_limits(100, 0).is_err());
         assert!(generation_limits(100, usize::MAX).is_err());
         assert!(generation_limits(32700, 100).is_err());
+    }
+
+    #[test]
+    fn default_budget_fits_large_context_prompts() {
+        let b = default_budget(15_000, 256);
+        assert!(b > 0);
+        let (n_ctx, budget) = generation_limits(15_000, b).unwrap();
+        assert_eq!(n_ctx, N_CTX_MAX);
+        assert_eq!(budget, b);
+    }
+
+    #[test]
+    fn flush_utf8_recovers_after_invalid_byte() {
+        let mut out = Vec::new();
+        let mut sent = 0usize;
+        let mut chunks = Vec::new();
+
+        out.extend_from_slice(&[b'a', 0xFF, 0xD0]); // 'a', битый байт, начало 'П'
+        assert!(flush_utf8(&out, &mut sent, &mut |s| {
+            chunks.push(s.to_string());
+            true
+        }));
+        assert_eq!(chunks, vec!["a", "\u{FFFD}"]);
+        assert_eq!(sent, 2);
+
+        out.push(0x9F); // второй байт 'П'
+        assert!(flush_utf8(&out, &mut sent, &mut |s| {
+            chunks.push(s.to_string());
+            true
+        }));
+        assert_eq!(chunks, vec!["a", "\u{FFFD}", "П"]);
+        assert_eq!(sent, 4);
     }
 
     #[test]

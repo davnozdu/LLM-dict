@@ -181,13 +181,12 @@ pub fn check(b: &Binding) -> Verdict {
             FnUsage::Unknown => Verdict::Risky(
                 "по умолчанию Fn (🌐) переключает источник ввода. Чтобы освободить её, \
                  выберите «Ничего не делать» в Системных настройках → Клавиатура → \
-                 «При нажатии 🌐». Либо включите перехват клавиши ниже."
+                 «При нажатии 🌐»."
                     .into(),
             ),
             FnUsage::Assigned(what) => Verdict::Risky(format!(
                 "Fn (🌐) сейчас назначена на «{what}». Освободить: Системные настройки → \
-                 Клавиатура → «При нажатии 🌐» → «Ничего не делать». Либо включите \
-                 перехват клавиши ниже."
+                 Клавиатура → «При нажатии 🌐» → «Ничего не делать»."
             )),
         };
     }
@@ -202,8 +201,16 @@ pub fn check(b: &Binding) -> Verdict {
     let mask = b.carbon_mask();
 
     if let Some(main) = b.main_key() {
+        // macOS добавляет биты NumericPad (0x200000) и Function (0x800000)
+        // к стрелкам и F-клавишам в symbolichotkeys.plist. Сравниваем только
+        // значимые модификаторы (⇧⌃⌥⌘ + Fn, если Fn задан явно).
+        let compare_mask = if b.keys.contains(&binding::K_FN) {
+            0x009E_0000
+        } else {
+            0x001E_0000
+        };
         for (id, (code, sys_mask)) in system_hotkeys() {
-            if code == main && sys_mask == mask {
+            if code == main && (sys_mask & compare_mask) == (mask & compare_mask) {
                 let what = symbolic_name(id)
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| format!("системное сочетание #{id}"));

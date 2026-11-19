@@ -288,6 +288,8 @@ impl Binding {
 
     /// Суммарная маска модификаторов в формате macOS.
     pub fn carbon_mask(&self) -> u64 {
-        self.keys.iter().map(|k| carbon_modifier_mask(*k)).sum()
+        self.keys
+            .iter()
+            .fold(0, |acc, k| acc | carbon_modifier_mask(*k))
     }
 }

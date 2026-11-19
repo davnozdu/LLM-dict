@@ -42,13 +42,23 @@ impl Writer {
                         }
                         let _ = reply.send(result);
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => match save(pending.as_ref().unwrap()) {
-                        Ok(()) => pending = None,
-                        Err(error) => {
-                            let _ = errors_tx.send(error);
-                            delay = Duration::from_secs(2);
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        let cfg = pending.as_ref().unwrap();
+                        match save(cfg) {
+                            Ok(()) => pending = None,
+                            Err(error) => {
+                                let permanent = cfg.load_error.is_some();
+                                let _ = errors_tx.send(error);
+                                if permanent {
+                                    // При повреждённом config.toml сохранение всегда
+                                    // запрещено — не крутим бесконечный цикл повторов.
+                                    pending = None;
+                                } else {
+                                    delay = Duration::from_secs(2);
+                                }
+                            }
                         }
-                    },
+                    }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
