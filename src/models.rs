@@ -93,6 +93,31 @@ impl ModelSpec {
     }
 }
 
+pub static GIGAAM_FORMATTER: ModelSpec = ModelSpec {
+    id: "rupunct-small-int8",
+    engine: Engine::GigaAm,
+    title: "Пунктуация и регистр GigaAM",
+    note: "RUPunct Small восстанавливает знаки препинания и заглавные буквы в русском тексте.",
+    files: &[
+        ModelFile {
+            name: crate::gigaam_format::MODEL,
+            url: concat!(
+                "https://huggingface.co/ekhodzitsky/rupunct-small-onnx/resolve/",
+                "c4a35be7e4a413cdfb08427db75b621b571569c9/rupunct_small_int8.onnx"
+            ),
+            size: 29_259_673,
+        },
+        ModelFile {
+            name: "tokenizer.json",
+            url: concat!(
+                "https://huggingface.co/ekhodzitsky/rupunct-small-onnx/resolve/",
+                "c4a35be7e4a413cdfb08427db75b621b571569c9/tokenizer.json"
+            ),
+            size: 2_413_439,
+        },
+    ],
+};
+
 pub static CATALOG: &[ModelSpec] = &[
     ModelSpec {
         id: "gigaam-v3-e2e-ctc-int8",

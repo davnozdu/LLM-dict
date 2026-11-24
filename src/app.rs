@@ -1850,7 +1850,10 @@ impl App {
 
     /// Список локальных моделей: что скачано, что качается, что можно удалить.
     fn ui_local_models(&mut self, ui: &mut egui::Ui) {
-        self.ui_model_list(ui, models::CATALOG);
+        self.ui_model_list(
+            ui,
+            models::CATALOG.iter().chain([&models::GIGAAM_FORMATTER]),
+        );
     }
 
     /// Языковые модели для локальной обработки текста.
@@ -1858,12 +1861,16 @@ impl App {
         self.ui_model_list(ui, models::LLM_CATALOG);
     }
 
-    fn ui_model_list(&mut self, ui: &mut egui::Ui, catalog: &'static [models::ModelSpec]) {
+    fn ui_model_list(
+        &mut self,
+        ui: &mut egui::Ui,
+        catalog: impl IntoIterator<Item = &'static models::ModelSpec>,
+    ) {
         let mut to_download: Option<&'static models::ModelSpec> = None;
         let mut to_remove: Option<&'static models::ModelSpec> = None;
         let mut cancel = false;
 
-        for spec in catalog.iter() {
+        for spec in catalog {
             let installed = self.installed(spec);
             let downloading = self
                 .download
@@ -1880,7 +1887,9 @@ impl App {
 
             ui.push_id(spec.id, |ui| {
                 ui.horizontal(|ui| {
-                    if ui.radio(selected, spec.title).clicked() {
+                    if spec.id == models::GIGAAM_FORMATTER.id {
+                        ui.checkbox(&mut self.cfg.stt.gigaam_formatting, spec.title);
+                    } else if ui.radio(selected, spec.title).clicked() {
                         match spec.engine {
                             Engine::Parakeet => self.cfg.stt.parakeet_model = spec.id.to_string(),
                             Engine::GigaAm => self.cfg.stt.gigaam_model = spec.id.to_string(),
@@ -1892,7 +1901,9 @@ impl App {
                     // В списке распознавания теперь два движка, и по одному
                     // названию модели не видно, к какому она относится, —
                     // а выбор в каждом движке свой.
-                    if matches!(spec.engine, Engine::GigaAm | Engine::Parakeet) {
+                    if spec.id != models::GIGAAM_FORMATTER.id
+                        && matches!(spec.engine, Engine::GigaAm | Engine::Parakeet)
+                    {
                         ui.weak(spec.engine.label());
                     }
                     if installed {

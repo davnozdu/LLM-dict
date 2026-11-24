@@ -105,6 +105,8 @@ pub struct SttConfig {
     pub parakeet_model: String,
     /// Выбранная модель движка GigaAM.
     pub gigaam_model: String,
+    /// Исправлять регистр и пунктуацию в русской диктовке GigaAM.
+    pub gigaam_formatting: bool,
     /// Загружать локальную модель при запуске, не дожидаясь первой диктовки.
     pub preload_local: bool,
 }
@@ -121,6 +123,7 @@ impl Default for SttConfig {
             prompt: String::new(),
             parakeet_model: "parakeet-tdt-0.6b-v3-int8".into(),
             gigaam_model: "gigaam-v3-e2e-ctc-int8".into(),
+            gigaam_formatting: true,
             preload_local: true,
         }
     }

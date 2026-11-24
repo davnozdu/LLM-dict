@@ -15,6 +15,7 @@ mod engine;
 mod focus;
 mod fonts;
 mod gigaam;
+mod gigaam_format;
 mod history;
 mod hotkey;
 mod insert;
@@ -95,6 +96,10 @@ fn run_bench(path: &str, language: Option<&str>) -> eframe::Result<()> {
                 let rt = audio::duration_secs(&samples) / secs.max(0.001);
                 println!("{label}: {secs:.2} с ({rt:.1}x реального времени)");
                 println!("  → {text}\n");
+                if engine == models::Engine::GigaAm && cfg.stt.gigaam_formatting {
+                    let formatted = local.format_dictation(&cfg.stt, engine, &text);
+                    println!("  Оформление: {formatted}\n");
+                }
             }
             Err(e) => println!("{label}: ошибка — {e}\n"),
         }

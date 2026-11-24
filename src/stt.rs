@@ -88,6 +88,16 @@ impl LocalEngines {
         }
     }
 
+    pub fn format_dictation(&mut self, cfg: &SttConfig, engine: Engine, text: &str) -> String {
+        if let Some((Engine::GigaAm, _, Loaded::GigaAm(model))) = self.loaded.as_mut() {
+            if engine == Engine::GigaAm && cfg.gigaam_formatting {
+                return model.format(text);
+            }
+            model.drop_formatter();
+        }
+        text.to_owned()
+    }
+
     /// Убирает из памяти модель, которую настройки больше не выбирают.
     ///
     /// Иначе прежняя модель жила бы до таймаута простоя или до следующей

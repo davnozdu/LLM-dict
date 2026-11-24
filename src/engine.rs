@@ -923,7 +923,7 @@ fn process(
     // Действия, помеченные «после диктовки», прогоняются по порядку.
     // Отказ одного из них не должен ронять всю диктовку: лучше вставить
     // распознанное как есть, чем потерять сказанное.
-    let mut final_text = raw_text.clone();
+    let mut final_text = local.format_dictation(&cfg.stt, used_engine, &raw_text);
     let mut used_llm: Option<String> = None;
     let after: Vec<_> = cfg
         .actions

@@ -29,6 +29,7 @@ pub struct GigaAm {
     preprocessor: Session,
     model: AcousticModel,
     vocab: Vocab,
+    formatter: Option<crate::gigaam_format::Formatter>,
 }
 
 enum AcousticModel {
@@ -262,7 +263,35 @@ impl GigaAm {
             preprocessor,
             model,
             vocab,
+            formatter: None,
         })
+    }
+
+    pub fn drop_formatter(&mut self) {
+        self.formatter = None;
+    }
+
+    pub fn format(&mut self, text: &str) -> String {
+        use crate::gigaam_format::{self, Formatter};
+        if !text.chars().any(gigaam_format::is_russian_letter) {
+            return text.to_owned();
+        }
+        let spec = &crate::models::GIGAAM_FORMATTER;
+        if spec.is_installed() {
+            let result = (|| {
+                if self.formatter.is_none() {
+                    self.formatter = Some(Formatter::load(&spec.dir())?);
+                }
+                self.formatter.as_mut().unwrap().format(text)
+            })();
+            match result {
+                Ok(formatted) => return formatted,
+                Err(e) => log::warn!("оформление GigaAM: {e:#}"),
+            }
+        } else {
+            self.drop_formatter();
+        }
+        gigaam_format::capitalize_sentences(text)
     }
 
     /// Распознаёт запись 16 кГц, моно.
