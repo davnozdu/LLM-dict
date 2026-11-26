@@ -105,7 +105,8 @@ impl Formatter {
             let next = last
                 .iter()
                 .enumerate()
-                .fold(0, |best, (i, v)| if *v > last[best] { i } else { best }) as u32;
+                .fold(0, |best, (i, v)| if *v > last[best] { i } else { best })
+                as u32;
             if next == EOS {
                 break;
             }
@@ -289,7 +290,8 @@ mod tests {
         // CORRECTOR_EXPECTED — autotrain/results/<модель>.history.json: исходник и
         // результат Python-версии с той же защитой.
         let dir = std::env::var_os("CORRECTOR_DIR").unwrap();
-        let expected = std::fs::read_to_string(std::env::var_os("CORRECTOR_EXPECTED").unwrap()).unwrap();
+        let expected =
+            std::fs::read_to_string(std::env::var_os("CORRECTOR_EXPECTED").unwrap()).unwrap();
         let rows: Vec<serde_json::Value> = serde_json::from_str(&expected).unwrap();
         let mut formatter = Formatter::load(Path::new(&dir)).unwrap();
         let mut mismatches = 0;

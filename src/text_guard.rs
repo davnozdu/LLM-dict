@@ -30,7 +30,11 @@ fn lev(a: &[char], b: &[char]) -> usize {
     for (i, ca) in a.iter().enumerate() {
         let mut cur = vec![i + 1];
         for (j, cb) in b.iter().enumerate() {
-            cur.push((prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + usize::from(ca != cb)));
+            cur.push(
+                (prev[j + 1] + 1)
+                    .min(cur[j] + 1)
+                    .min(prev[j] + usize::from(ca != cb)),
+            );
         }
         prev = cur;
     }
@@ -38,7 +42,10 @@ fn lev(a: &[char], b: &[char]) -> usize {
 }
 
 fn lev_str(a: &str, b: &str) -> usize {
-    lev(&a.chars().collect::<Vec<_>>(), &b.chars().collect::<Vec<_>>())
+    lev(
+        &a.chars().collect::<Vec<_>>(),
+        &b.chars().collect::<Vec<_>>(),
+    )
 }
 
 /// Одно и то же слово с исправленной опечаткой или окончанием.
@@ -57,11 +64,39 @@ fn similar(a: &str, b: &str) -> bool {
 
 fn translit(c: char) -> Option<&'static str> {
     const TABLE: [(char, &str); 33] = [
-        ('а', "a"), ('б', "b"), ('в', "v"), ('г', "g"), ('д', "d"), ('е', "e"), ('ё', "e"),
-        ('ж', "zh"), ('з', "z"), ('и', "i"), ('й', "y"), ('к', "k"), ('л', "l"), ('м', "m"),
-        ('н', "n"), ('о', "o"), ('п', "p"), ('р', "r"), ('с', "s"), ('т', "t"), ('у', "u"),
-        ('ф', "f"), ('х', "h"), ('ц', "ts"), ('ч', "ch"), ('ш', "sh"), ('щ', "sch"), ('ъ', ""),
-        ('ы', "y"), ('ь', ""), ('э', "e"), ('ю', "yu"), ('я', "ya"),
+        ('а', "a"),
+        ('б', "b"),
+        ('в', "v"),
+        ('г', "g"),
+        ('д', "d"),
+        ('е', "e"),
+        ('ё', "e"),
+        ('ж', "zh"),
+        ('з', "z"),
+        ('и', "i"),
+        ('й', "y"),
+        ('к', "k"),
+        ('л', "l"),
+        ('м', "m"),
+        ('н', "n"),
+        ('о', "o"),
+        ('п', "p"),
+        ('р', "r"),
+        ('с', "s"),
+        ('т', "t"),
+        ('у', "u"),
+        ('ф', "f"),
+        ('х', "h"),
+        ('ц', "ts"),
+        ('ч', "ch"),
+        ('ш', "sh"),
+        ('щ', "sch"),
+        ('ъ', ""),
+        ('ы', "y"),
+        ('ь', ""),
+        ('э', "e"),
+        ('ю', "yu"),
+        ('я', "ya"),
     ];
     TABLE.iter().find(|(k, _)| *k == c).map(|(_, v)| *v)
 }
@@ -69,8 +104,16 @@ fn translit(c: char) -> Option<&'static str> {
 fn norm_lat(s: &str) -> String {
     let mut s = s.to_owned();
     for (a, b) in [
-        ("ee", "i"), ("ea", "i"), ("oo", "u"), ("ph", "f"), ("x", "ks"),
-        ("c", "k"), ("q", "k"), ("w", "v"), ("y", "i"), ("j", "dzh"),
+        ("ee", "i"),
+        ("ea", "i"),
+        ("oo", "u"),
+        ("ph", "f"),
+        ("x", "ks"),
+        ("c", "k"),
+        ("q", "k"),
+        ("w", "v"),
+        ("y", "i"),
+        ("j", "dzh"),
     ] {
         s = s.replace(a, b);
     }
@@ -78,25 +121,57 @@ fn norm_lat(s: &str) -> String {
 }
 
 const NUMBER_WORDS: [&str; 14] = [
-    "ноль", "один", "одна", "два", "две", "три", "четыре", "пять", "шесть",
-    "семь", "восемь", "девять", "десять", "точка",
+    "ноль",
+    "один",
+    "одна",
+    "два",
+    "две",
+    "три",
+    "четыре",
+    "пять",
+    "шесть",
+    "семь",
+    "восемь",
+    "девять",
+    "десять",
+    "точка",
 ];
 
 /// Кириллическая запись названия заменена им же латиницей.
 fn translit_ok(raw: &[&str], out: &[&str]) -> bool {
     let cx: Vec<String> = raw.iter().map(|w| core(w)).collect();
     let cy: Vec<String> = out.iter().map(|w| core(w)).collect();
-    let cyr = |w: &String| !w.is_empty() && w.chars().all(|c| c.is_ascii_digit() || translit(c).is_some());
-    let lat = |w: &String| !w.is_empty() && w.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+    let cyr = |w: &String| {
+        !w.is_empty()
+            && w.chars()
+                .all(|c| c.is_ascii_digit() || translit(c).is_some())
+    };
+    let lat = |w: &String| {
+        !w.is_empty()
+            && w.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    };
     if !cx.iter().all(cyr) || !cy.iter().all(lat) {
         return false;
     }
-    let a: String = cx.iter().filter(|w| !NUMBER_WORDS.contains(&w.as_str())).cloned().collect();
-    let b: String = cy.concat().chars().filter(|c| !c.is_ascii_digit()).collect();
+    let a: String = cx
+        .iter()
+        .filter(|w| !NUMBER_WORDS.contains(&w.as_str()))
+        .cloned()
+        .collect();
+    let b: String = cy
+        .concat()
+        .chars()
+        .filter(|c| !c.is_ascii_digit())
+        .collect();
     if a.is_empty() || b.is_empty() {
         return false;
     }
-    let t = norm_lat(&a.chars().map(|c| translit(c).unwrap_or("")).collect::<String>());
+    let t = norm_lat(
+        &a.chars()
+            .map(|c| translit(c).unwrap_or(""))
+            .collect::<String>(),
+    );
     let b = norm_lat(&b);
     lev_str(&t, &b) <= 2.max(b.chars().count().div_ceil(2))
 }
@@ -134,7 +209,11 @@ fn opcodes(a: &[String], b: &[String]) -> Vec<Op> {
     let mut dp = vec![vec![0u32; m + 1]; n + 1];
     for i in (0..n).rev() {
         for j in (0..m).rev() {
-            dp[i][j] = if a[i] == b[j] { dp[i + 1][j + 1] + 1 } else { dp[i + 1][j].max(dp[i][j + 1]) };
+            dp[i][j] = if a[i] == b[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
         }
     }
     let mut pairs = Vec::new();
@@ -186,7 +265,10 @@ pub fn merge(raw: &str, out: &str) -> String {
         return raw.to_owned();
     }
     let (raw_len, out_len) = (raw.chars().count(), out.chars().count());
-    if out.trim().is_empty() || out_len as f32 > 1.3 * raw_len as f32 + 10.0 || (has_loop(out) && !has_loop(raw)) {
+    if out.trim().is_empty()
+        || out_len as f32 > 1.3 * raw_len as f32 + 10.0
+        || (has_loop(out) && !has_loop(raw))
+    {
         return raw.to_owned();
     }
     let a: Vec<&str> = raw.split_whitespace().collect();
@@ -199,14 +281,15 @@ pub fn merge(raw: &str, out: &str) -> String {
     // следующего слова берём из исходника: модель могла поднять или опустить его
     // из-за слова, которого в итоге нет.
     let mut reverted = false;
-    let take = |word: &str, raw_word: Option<&str>, reverted: &mut bool, words: &mut Vec<String>| {
-        let w = match raw_word {
-            Some(r) if *reverted => with_case_of(r, word),
-            _ => word.to_owned(),
+    let take =
+        |word: &str, raw_word: Option<&str>, reverted: &mut bool, words: &mut Vec<String>| {
+            let w = match raw_word {
+                Some(r) if *reverted => with_case_of(r, word),
+                _ => word.to_owned(),
+            };
+            *reverted = false;
+            words.push(w);
         };
-        *reverted = false;
-        words.push(w);
-    };
     for op in opcodes(&ca, &cb) {
         match op {
             Op::Equal(a1, a2, b1, b2) => {
@@ -214,7 +297,9 @@ pub fn merge(raw: &str, out: &str) -> String {
                     take(y, Some(x), &mut reverted, &mut words);
                 }
             }
-            Op::Replace(a1, a2, b1, b2) if a2 - a1 <= 4 && b2 - b1 <= 4 && translit_ok(&a[a1..a2], &b[b1..b2]) => {
+            Op::Replace(a1, a2, b1, b2)
+                if a2 - a1 <= 4 && b2 - b1 <= 4 && translit_ok(&a[a1..a2], &b[b1..b2]) =>
+            {
                 for y in &b[b1..b2] {
                     take(y, None, &mut reverted, &mut words);
                 }
@@ -279,7 +364,10 @@ pub fn merge(raw: &str, out: &str) -> String {
 
 /// Слово модели, но с регистром первой буквы как в исходном слове.
 fn with_case_of(raw: &str, word: &str) -> String {
-    let raw_upper = raw.chars().find(|c| c.is_alphabetic()).map(char::is_uppercase);
+    let raw_upper = raw
+        .chars()
+        .find(|c| c.is_alphabetic())
+        .map(char::is_uppercase);
     let mut done = false;
     word.chars()
         .map(|c| {
@@ -302,23 +390,47 @@ mod tests {
 
     #[test]
     fn keeps_punctuation_and_case_fixes() {
-        assert_eq!(merge("Да обучай сколько нужно.", "Да, обучай, сколько нужно."), "Да, обучай, сколько нужно.");
-        assert_eq!(merge("главное— это скорость.", "Главное — это скорость."), "Главное — это скорость.");
+        assert_eq!(
+            merge("Да обучай сколько нужно.", "Да, обучай, сколько нужно."),
+            "Да, обучай, сколько нужно."
+        );
+        assert_eq!(
+            merge("главное— это скорость.", "Главное — это скорость."),
+            "Главное — это скорость."
+        );
     }
 
     #[test]
     fn keeps_word_fixes_but_not_word_swaps() {
-        assert_eq!(merge("Это еще работает.", "Это ещё работает."), "Это ещё работает.");
-        assert_eq!(merge("Подключин в режиме отладки.", "Подключен в режиме отладки."), "Подключен в режиме отладки.");
-        assert_eq!(merge("Книги размечены.", "Книги замечены."), "Книги размечены.");
+        assert_eq!(
+            merge("Это еще работает.", "Это ещё работает."),
+            "Это ещё работает."
+        );
+        assert_eq!(
+            merge("Подключин в режиме отладки.", "Подключен в режиме отладки."),
+            "Подключен в режиме отладки."
+        );
+        assert_eq!(
+            merge("Книги размечены.", "Книги замечены."),
+            "Книги размечены."
+        );
         // Известное ограничение: «Переноси» → «Перенёс» без словаря неотличимо от
         // исправления окончания и проходит (та же первая буква, две правки).
     }
 
     #[test]
     fn restores_dropped_words_but_drops_stutter() {
-        assert_eq!(merge("будет локально быстро работать.", "будет локально работать."), "будет локально быстро работать.");
-        assert_eq!(merge("я я хотел сказать.", "Я хотел сказать."), "Я хотел сказать.");
+        assert_eq!(
+            merge(
+                "будет локально быстро работать.",
+                "будет локально работать."
+            ),
+            "будет локально быстро работать."
+        );
+        assert_eq!(
+            merge("я я хотел сказать.", "Я хотел сказать."),
+            "Я хотел сказать."
+        );
         assert_eq!(merge("Это работает.", "А это работает."), "Это работает.");
         assert_eq!(merge("Тупо работает.", "Работает."), "Тупо работает.");
     }
@@ -327,26 +439,47 @@ mod tests {
     fn accepts_brand_transliteration() {
         assert_eq!(merge("Открой гитхаб.", "Открой GitHub."), "Открой GitHub.");
         assert_eq!(
-            merge("Помогает дипсик четыре один флэш.", "Помогает DeepSeek 4.1 Flash."),
+            merge(
+                "Помогает дипсик четыре один флэш.",
+                "Помогает DeepSeek 4.1 Flash."
+            ),
             "Помогает DeepSeek 4.1 Flash."
         );
-        assert_eq!(merge("Спроси у клод.", "Спроси у Claude."), "Спроси у Claude.");
+        assert_eq!(
+            merge("Спроси у клод.", "Спроси у Claude."),
+            "Спроси у Claude."
+        );
     }
 
     #[test]
     fn keeps_sentence_end_and_quotes() {
-        assert_eq!(merge("модель хорошо работает?", "Модель хорошо работает."), "Модель хорошо работает?");
+        assert_eq!(
+            merge("модель хорошо работает?", "Модель хорошо работает."),
+            "Модель хорошо работает?"
+        );
         assert_eq!(merge("меняли их на", "меняли их на."), "меняли их на");
-        assert_eq!(merge("начал её обучать на", "начал её обучать на ."), "начал её обучать на");
+        assert_eq!(
+            merge("начал её обучать на", "начал её обучать на ."),
+            "начал её обучать на"
+        );
         assert_eq!(merge("Вот так.", "Вот так ."), "Вот так.");
-        assert_eq!(merge("Это работает также", "Это работает также?"), "Это работает также?");
-        assert_eq!(merge("Буквы е-ё как контроль.", "Буквы е-ё как «контроль»."), "Буквы е-ё как контроль.");
+        assert_eq!(
+            merge("Это работает также", "Это работает также?"),
+            "Это работает также?"
+        );
+        assert_eq!(
+            merge("Буквы е-ё как контроль.", "Буквы е-ё как «контроль»."),
+            "Буквы е-ё как контроль."
+        );
     }
 
     #[test]
     fn rolls_back_loops_and_empty_output() {
         assert_eq!(merge("Телы.", "Телы.……Тела.……Тела.……"), "Телы.");
-        assert_eq!(merge("Вот ключ.", "Вот ключ вот ключ вот ключ вот ключ."), "Вот ключ.");
+        assert_eq!(
+            merge("Вот ключ.", "Вот ключ вот ключ вот ключ вот ключ."),
+            "Вот ключ."
+        );
         assert_eq!(merge("", "Для ситема три."), "");
         assert_eq!(merge("Привет.", ""), "Привет.");
     }
