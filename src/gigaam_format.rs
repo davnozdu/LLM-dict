@@ -1,23 +1,32 @@
-//! Восстановление регистра и пунктуации в русском тексте GigaAM.
+//! Исправление ошибок в русском тексте GigaAM.
+//!
+//! Модель — дообученная `sage-fredt5-distilled-95m` (T5, 95M параметров),
+//! экспортированная в ONNX INT8: `davnozdubv/sage-ru-dictation-onnx`. Она
+//! переписывает фразу целиком, поэтому её ответ проходит через
+//! [`crate::text_guard::merge`]: принимаются только знаки, регистр, окончания,
+//! опечатки и названия латиницей. Без скачанной модели остаются заглавные буквы
+//! в начале предложений.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use ort::{session::Session, value::Tensor};
 use std::path::Path;
 use tokenizers::Tokenizer;
 
-pub const MODEL: &str = "rupunct_small_int8.onnx";
+pub const ENCODER: &str = "encoder_model.int8.onnx";
+pub const DECODER: &str = "decoder_model.int8.onnx";
 
-// Порядок классов в config.json закреплённой версии модели. Каждому
-// знаку соответствуют три класса регистра: начальный верхний, нижний, верхний.
-const MARKS: [&str; 11] = [".", ",", "?", " -", "!", ":", ";", "-", "?!", "...", ""];
-const CASE_CONFIDENCE: f32 = 0.97;
-const MARK_CONFIDENCE: f32 = 0.95;
-const WINDOW: usize = 96;
-const CONTEXT: usize = 16;
+const DECODER_START: i64 = 0;
+const EOS: u32 = 2;
+/// Модель училась на кусках до 160 токенов: длинная диктовка режется по
+/// предложениям, примерно по 30–60 слов.
+const CHUNK_MIN_WORDS: usize = 30;
+const CHUNK_MAX_WORDS: usize = 60;
+const MAX_INPUT_TOKENS: usize = 400;
 
 pub struct Formatter {
     tokenizer: Tokenizer,
-    session: Session,
+    encoder: Session,
+    decoder: Session,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -29,108 +38,106 @@ struct Prediction {
 impl Formatter {
     pub fn load(dir: &Path) -> Result<Self> {
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
-            .map_err(|e| anyhow::anyhow!("токенизатор RUPunct: {e}"))?;
-        let session = Session::builder()?
-            .with_intra_threads(2)
-            .map_err(|e| anyhow::anyhow!("настройка потоков RUPunct: {e}"))?
-            .commit_from_file(dir.join(MODEL))?;
-        Ok(Self { tokenizer, session })
+            .map_err(|e| anyhow::anyhow!("токенизатор модели правки: {e}"))?;
+        let session = |name: &str| -> Result<Session> {
+            Ok(Session::builder()?
+                .with_intra_threads(4)
+                .map_err(|e| anyhow::anyhow!("настройка потоков модели правки: {e}"))?
+                .commit_from_file(dir.join(name))?)
+        };
+        Ok(Self {
+            tokenizer,
+            encoder: session(ENCODER)?,
+            decoder: session(DECODER)?,
+        })
     }
 
     pub fn format(&mut self, text: &str) -> Result<String> {
-        let words: Vec<String> = text
-            .split_whitespace()
-            .map(|word| {
-                let (core, _) = split_mark(word);
-                if core.is_empty() { word } else { core }.to_lowercase()
-            })
-            .collect();
-        let mut predictions = vec![Prediction::default(); words.len()];
-        for start in (0..words.len()).step_by(WINDOW) {
-            let end = (start + WINDOW).min(words.len());
-            let left = start.saturating_sub(CONTEXT);
-            let right = (end + CONTEXT).min(words.len());
-            self.predict(
-                &words[left..right],
-                start - left,
-                &mut predictions[start..end],
-            )?;
+        if text.trim().is_empty() {
+            return Ok(text.to_owned());
         }
-        Ok(render(text, &predictions))
+        let mut out = Vec::new();
+        for chunk in chunks(text) {
+            let fixed = self.correct(&chunk)?;
+            out.push(crate::text_guard::merge(&chunk, &fixed));
+        }
+        Ok(out.join(" "))
     }
 
-    fn predict(
-        &mut self,
-        words: &[String],
-        context: usize,
-        result: &mut [Prediction],
-    ) -> Result<()> {
+    /// Жадное декодирование T5. Экспорт без кэша ключей, поэтому декодер на
+    /// каждом шаге получает всю выданную последовательность — на фразах
+    /// диктовки это 50–200 мс.
+    fn correct(&mut self, text: &str) -> Result<String> {
         let encoding = self
             .tokenizer
-            .encode(words, true)
-            .map_err(|e| anyhow::anyhow!("токенизация RUPunct: {e}"))?;
-        let len = encoding.len();
-        if len > 2048 {
-            return Ok(());
+            .encode(text, true)
+            .map_err(|e| anyhow::anyhow!("токенизация модели правки: {e}"))?;
+        let ids: Vec<i64> = encoding.get_ids().iter().map(|&id| i64::from(id)).collect();
+        let len = ids.len();
+        if len == 0 || len > MAX_INPUT_TOKENS {
+            return Ok(text.to_owned());
         }
-        let tensor = |values: &[u32]| {
-            Tensor::from_array((
-                [1, len],
-                values.iter().map(|&id| i64::from(id)).collect::<Vec<_>>(),
-            ))
+        let mask = vec![1_i64; len];
+        let (hidden, width) = {
+            let outputs = self.encoder.run(ort::inputs![
+                "input_ids" => Tensor::from_array(([1, len], ids))?,
+                "attention_mask" => Tensor::from_array(([1, len], mask.clone()))?
+            ])?;
+            let (shape, hidden) = outputs["last_hidden_state"].try_extract_tensor::<f32>()?;
+            let width = *shape.get(2).context("энкодер вернул неожиданную форму")? as usize;
+            (hidden.to_vec(), width)
         };
-        let outputs = self.session.run(ort::inputs![
-            "input_ids" => tensor(encoding.get_ids())?,
-            "attention_mask" => tensor(encoding.get_attention_mask())?,
-            "token_type_ids" => tensor(encoding.get_type_ids())?
-        ])?;
-        let (_, logits) = outputs
-            .get("logits")
-            .context("RUPunct не вернул logits")?
-            .try_extract_tensor::<f32>()?;
-        let classes = MARKS.len() * 3;
-        if logits.len() != len * classes {
-            bail!("неожиданный размер выхода RUPunct");
-        }
 
-        let mut previous = None;
-        for (word, scores) in encoding
-            .get_word_ids()
-            .iter()
-            .copied()
-            .zip(logits.chunks_exact(classes))
-        {
-            // Для каждого слова модель размечает первый WordPiece.
-            if word == previous {
-                continue;
+        let mut decoded = vec![DECODER_START];
+        for _ in 0..(2 * len + 16).min(256) {
+            let steps = decoded.len();
+            let outputs = self.decoder.run(ort::inputs![
+                "decoder_input_ids" => Tensor::from_array(([1, steps], decoded.clone()))?,
+                "encoder_hidden_states" => Tensor::from_array(([1, len, width], hidden.clone()))?,
+                "encoder_attention_mask" => Tensor::from_array(([1, len], mask.clone()))?
+            ])?;
+            let (shape, logits) = outputs["logits"].try_extract_tensor::<f32>()?;
+            let vocab = *shape.get(2).context("декодер вернул неожиданную форму")? as usize;
+            let last = logits
+                .get((steps - 1) * vocab..steps * vocab)
+                .context("декодер вернул неожиданный размер")?;
+            // При равенстве берём первый, как numpy.argmax в замерах.
+            let next = last
+                .iter()
+                .enumerate()
+                .fold(0, |best, (i, v)| if *v > last[best] { i } else { best }) as u32;
+            if next == EOS {
+                break;
             }
-            previous = word;
-            let index = word.and_then(|id| (id as usize).checked_sub(context));
-            if let Some(slot) = index.and_then(|index| result.get_mut(index)) {
-                *slot = decode(scores);
-            }
+            decoded.push(i64::from(next));
         }
-        Ok(())
+        let ids: Vec<u32> = decoded[1..].iter().map(|&id| id as u32).collect();
+        let text = self
+            .tokenizer
+            .decode(&ids, true)
+            .map_err(|e| anyhow::anyhow!("сборка текста модели правки: {e}"))?;
+        Ok(text.trim().to_owned())
     }
 }
 
-fn decode(scores: &[f32]) -> Prediction {
-    let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut cases = [0.0; 3];
-    let mut marks = [0.0; MARKS.len()];
-    for (index, score) in scores.iter().enumerate() {
-        let weight = (score - max).exp();
-        cases[index % cases.len()] += weight;
-        marks[index / cases.len()] += weight;
+/// Режет текст на куски по концам предложений, не короче 30 и не длиннее 60 слов.
+fn chunks(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+    for word in text.split_whitespace() {
+        current.push(word);
+        let sentence_end = word
+            .trim_end_matches(['"', '»', ')'])
+            .ends_with(['.', '?', '!', '…']);
+        if (sentence_end && current.len() >= CHUNK_MIN_WORDS) || current.len() >= CHUNK_MAX_WORDS {
+            out.push(current.join(" "));
+            current.clear();
+        }
     }
-    let total = cases.iter().sum::<f32>();
-    let best = |weights: &[f32], threshold: f32| {
-        weights.iter().position(|&value| value / total >= threshold)
-    };
-    Prediction {
-        case: best(&cases, CASE_CONFIDENCE),
-        mark: best(&marks, MARK_CONFIDENCE).map(|index| MARKS[index]),
+    if !current.is_empty() {
+        out.push(current.join(" "));
     }
+    out
 }
 
 pub fn is_russian_letter(c: char) -> bool {
@@ -277,21 +284,26 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "нужны скачанные файлы RUPunct, каталог задаёт RUPUNCT_DIR"]
-    fn formats_real_russian_text() {
-        let dir = std::env::var_os("RUPUNCT_DIR").unwrap();
+    #[ignore = "нужна скачанная модель правки (CORRECTOR_DIR) и эталон из speechcorrector (CORRECTOR_EXPECTED)"]
+    fn matches_python_reference() {
+        // CORRECTOR_EXPECTED — autotrain/results/<модель>.history.json: исходник и
+        // результат Python-версии с той же защитой.
+        let dir = std::env::var_os("CORRECTOR_DIR").unwrap();
+        let expected = std::fs::read_to_string(std::env::var_os("CORRECTOR_EXPECTED").unwrap()).unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&expected).unwrap();
         let mut formatter = Formatter::load(Path::new(&dir)).unwrap();
-        assert_eq!(
-            formatter
-                .format("я знаю что делать. потом проверю конфигурацию")
-                .unwrap(),
-            "Я знаю, что делать. Потом проверю конфигурацию."
-        );
-        assert_eq!(
-            formatter
-                .format("завтра Мы проверим обновление. потом отправим ответ")
-                .unwrap(),
-            "Завтра мы проверим обновление. Потом отправим ответ."
-        );
+        let mut mismatches = 0;
+        for row in &rows {
+            let raw = row["raw"].as_str().unwrap();
+            if raw.split_whitespace().count() > CHUNK_MIN_WORDS {
+                continue; // Python-замер не режет текст на куски
+            }
+            let got = formatter.format(raw).unwrap();
+            if got != row["guarded"].as_str().unwrap() {
+                mismatches += 1;
+                eprintln!("IN : {raw}\nRS : {got}\nPY : {}\n", row["guarded"]);
+            }
+        }
+        assert_eq!(mismatches, 0);
     }
 }

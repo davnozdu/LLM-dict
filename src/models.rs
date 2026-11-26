@@ -93,27 +93,40 @@ impl ModelSpec {
     }
 }
 
+/// Модель правки русской диктовки GigaAM. Ревизия закреплена: новая версия
+/// модели на Hugging Face попадает в приложение только сменой ревизии здесь.
+/// Вместе с ревизией меняется и `id`: установленной модель считается по
+/// размерам файлов, а у переобученной версии они те же, и без новой папки
+/// у пользователей молча осталась бы старая модель.
 pub static GIGAAM_FORMATTER: ModelSpec = ModelSpec {
-    id: "rupunct-small-int8",
+    id: "sage-ru-dictation-s5-int8",
     engine: Engine::GigaAm,
-    title: "Пунктуация и регистр GigaAM",
-    note: "RUPunct Small восстанавливает знаки препинания и заглавные буквы в русском тексте.",
+    title: "Исправление ошибок GigaAM",
+    note: "Дообученная модель sage-fredt5: запятые, регистр, окончания, опечатки и названия латиницей в русской диктовке. Слова не выбрасывает и не подменяет — такие правки отбрасываются.",
     files: &[
         ModelFile {
-            name: crate::gigaam_format::MODEL,
+            name: crate::gigaam_format::ENCODER,
             url: concat!(
-                "https://huggingface.co/ekhodzitsky/rupunct-small-onnx/resolve/",
-                "c4a35be7e4a413cdfb08427db75b621b571569c9/rupunct_small_int8.onnx"
+                "https://huggingface.co/davnozdubv/sage-ru-dictation-onnx/resolve/",
+                "2c8f269c624dc123980fa1780e96c5a1f878a368/encoder_model.int8.onnx"
             ),
-            size: 29_259_673,
+            size: 45_036_678,
+        },
+        ModelFile {
+            name: crate::gigaam_format::DECODER,
+            url: concat!(
+                "https://huggingface.co/davnozdubv/sage-ru-dictation-onnx/resolve/",
+                "2c8f269c624dc123980fa1780e96c5a1f878a368/decoder_model.int8.onnx"
+            ),
+            size: 154_770_142,
         },
         ModelFile {
             name: "tokenizer.json",
             url: concat!(
-                "https://huggingface.co/ekhodzitsky/rupunct-small-onnx/resolve/",
-                "c4a35be7e4a413cdfb08427db75b621b571569c9/tokenizer.json"
+                "https://huggingface.co/davnozdubv/sage-ru-dictation-onnx/resolve/",
+                "2c8f269c624dc123980fa1780e96c5a1f878a368/tokenizer.json"
             ),
-            size: 2_413_439,
+            size: 5_207_982,
         },
     ],
 };

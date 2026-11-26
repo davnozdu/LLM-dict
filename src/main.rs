@@ -32,6 +32,7 @@ mod provider;
 mod providers;
 mod server;
 mod stt;
+mod text_guard;
 mod theme;
 mod typography;
 mod updater;
