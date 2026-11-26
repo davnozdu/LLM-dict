@@ -1,6 +1,6 @@
 [package]
 name = "llm-dict"
-version = "0.16.12"
+version = "0.16.13"
 edition = "2021"
 rust-version = "1.82"
 description = "Диктовка через LLM: горячая клавиша, распознавание речи в облаке, вставка под курсором"
@@ -40,6 +40,7 @@ parakeet-rs = "0.3"
 # внутри parakeet-rs. Версия обязана совпадать с его зависимостью, иначе в
 # бинарнике окажутся две копии среды выполнения.
 ort = { version = "2.0.0-rc.13", default-features = false, features = ["std"] }
+fst = "0.4.7"
 tokenizers = { version = "0.23.1", default-features = false, features = ["onig"] }
 
 # Локальная языковая модель. Собирается статически с поддержкой Metal.

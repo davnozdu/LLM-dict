@@ -7,6 +7,8 @@
 //!
 //! - знаки препинания и регистр — да;
 //! - опечатка или окончание: та же первая буква, не больше двух правок — да;
+//!   но словарное слово можно заменить только формой того же слова (лемма из
+//!   словаря OpenCorpora): «уменьшение» → «уменьшению» — да, «арбитр» → «арбитраж» — нет;
 //! - «е» → «ё» — да;
 //! - кириллица → название латиницей с похожей транслитерацией («гитхаб» → «GitHub») — да;
 //! - выбросить слово — только повтор соседнего (заикание);
@@ -16,6 +18,44 @@
 //!
 //! Правила те же, что в `autotrain/guard.py` репозитория speechcorrector, где на них
 //! считаются метрики.
+
+/// Словарь русских словоформ: форма (строчные, «ё» → «е», без знаков) → до трёх
+/// лемм, упакованных по 21 бит. Собран из словаря OpenCorpora (pymorphy3).
+pub struct Lexicon(fst::Map<Vec<u8>>);
+
+impl Lexicon {
+    pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
+        Self::from_bytes(std::fs::read(path)?)
+    }
+
+    pub fn from_bytes(bytes: Vec<u8>) -> anyhow::Result<Self> {
+        Ok(Self(fst::Map::new(bytes)?))
+    }
+
+    fn lemmas(&self, key: &str) -> Option<Vec<u64>> {
+        let mut v = self.0.get(key)?;
+        let mut ids = Vec::with_capacity(3);
+        while v > 0 {
+            ids.push(v & 0x1f_ffff);
+            v >>= 21;
+        }
+        Some(ids)
+    }
+
+    /// Можно ли заменить слово `raw` на `out`: незнакомое слово (вероятная ошибка
+    /// распознавания) — можно, словарное — только формой той же леммы.
+    fn allows(&self, raw: &str, out: &str) -> bool {
+        let (a, b) = (core(raw).replace('ё', "е"), core(out).replace('ё', "е"));
+        if a == b {
+            return true;
+        }
+        let Some(la) = self.lemmas(&a) else {
+            return true;
+        };
+        self.lemmas(&b)
+            .is_some_and(|lb| la.iter().any(|id| lb.contains(id)))
+    }
+}
 
 /// Сердцевина слова для сравнения: строчные буквы и цифры без знаков.
 fn core(word: &str) -> String {
@@ -260,7 +300,9 @@ fn split_end(s: &str) -> (&str, &str) {
 }
 
 /// Принимает из ответа модели `out` только безопасные правки исходного текста `raw`.
-pub fn merge(raw: &str, out: &str) -> String {
+/// `lex` — словарь для запрета подмен одного слова другим; без него действуют
+/// только остальные правила.
+pub fn merge(raw: &str, out: &str, lex: Option<&Lexicon>) -> String {
     if raw.trim().is_empty() {
         return raw.to_owned();
     }
@@ -306,7 +348,7 @@ pub fn merge(raw: &str, out: &str) -> String {
             }
             Op::Replace(a1, a2, b1, b2) if a2 - a1 == b2 - b1 => {
                 for (x, y) in a[a1..a2].iter().zip(&b[b1..b2]) {
-                    if similar(x, y) {
+                    if similar(x, y) && lex.is_none_or(|l| l.allows(x, y)) {
                         take(y, Some(x), &mut reverted, &mut words);
                     } else {
                         words.push((*x).to_owned());
@@ -386,7 +428,53 @@ fn with_case_of(raw: &str, word: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::merge;
+    use super::Lexicon;
+
+    fn merge(raw: &str, out: &str) -> String {
+        super::merge(raw, out, None)
+    }
+
+    fn lexicon(words: &[(&str, u64)]) -> Lexicon {
+        let mut words = words.to_vec();
+        words.sort();
+        let mut b = fst::MapBuilder::memory();
+        for (w, v) in words {
+            b.insert(w, v).unwrap();
+        }
+        Lexicon::from_bytes(b.into_inner().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn lexicon_blocks_replacing_known_word_with_another() {
+        // уменьшение/уменьшению — лемма 3; арбитр — 1, арбитраж — 2;
+        // «стали» — две леммы (сталь 4, стать 5), «стал» — стать.
+        let lex = lexicon(&[
+            ("арбитр", 1),
+            ("арбитраж", 2),
+            ("уменьшение", 3),
+            ("уменьшению", 3),
+            ("стали", (4 << 21) | 5),
+            ("стал", 5),
+            ("подключен", 6),
+        ]);
+        let m = |a, b| super::merge(a, b, Some(&lex));
+        assert_eq!(
+            m("Нужен просто арбитр.", "Нужен просто арбитраж."),
+            "Нужен просто арбитр."
+        );
+        assert_eq!(
+            m("Поможет уменьшение.", "Поможет уменьшению."),
+            "Поможет уменьшению."
+        );
+        assert_eq!(m("Мы стали.", "Мы стал."), "Мы стал.");
+        // незнакомое слово — вероятная ошибка распознавания, его чинить можно
+        assert_eq!(
+            m("Подключин в режиме.", "Подключен в режиме."),
+            "Подключен в режиме."
+        );
+        // регистр и «ё» словарь не трогает
+        assert_eq!(m("арбитр сказал", "Арбитр сказал"), "Арбитр сказал");
+    }
 
     #[test]
     fn keeps_punctuation_and_case_fixes() {

@@ -14,6 +14,7 @@ use tokenizers::Tokenizer;
 
 pub const ENCODER: &str = "encoder_model.int8.onnx";
 pub const DECODER: &str = "decoder_model.int8.onnx";
+pub const LEXICON: &str = "ru_lemmas.fst";
 
 const DECODER_START: i64 = 0;
 const EOS: u32 = 2;
@@ -27,6 +28,7 @@ pub struct Formatter {
     tokenizer: Tokenizer,
     encoder: Session,
     decoder: Session,
+    lexicon: crate::text_guard::Lexicon,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -49,6 +51,8 @@ impl Formatter {
             tokenizer,
             encoder: session(ENCODER)?,
             decoder: session(DECODER)?,
+            lexicon: crate::text_guard::Lexicon::load(&dir.join(LEXICON))
+                .context("словарь модели правки")?,
         })
     }
 
@@ -59,7 +63,11 @@ impl Formatter {
         let mut out = Vec::new();
         for chunk in chunks(text) {
             let fixed = self.correct(&chunk)?;
-            out.push(crate::text_guard::merge(&chunk, &fixed));
+            out.push(crate::text_guard::merge(
+                &chunk,
+                &fixed,
+                Some(&self.lexicon),
+            ));
         }
         Ok(out.join(" "))
     }
